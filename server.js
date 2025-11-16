@@ -258,71 +258,73 @@ app.use(cookieParser());
 
 // ==================== FICHIERS STATIQUES PUBLICS ====================
 // ✅ 1. FICHIERS FRONTEND PUBLICS (sans auth)
-// ==================== FICHIERS STATIQUES PUBLICS ====================
-const FRONTEND_DIR = path.join(__dirname, "../frontend");
-
-// ✅ SERVIR LE FRONTEND UNIQUEMENT EN DÉVELOPPEMENT/LOCAL
-if (process.env.NODE_ENV !== 'production') {
-  if (fs.existsSync(FRONTEND_DIR)) {
-    app.use(express.static(FRONTEND_DIR));
-    
-    // Assets publics
-    app.use("/css", express.static(path.join(FRONTEND_DIR, "app/css")));
-    app.use("/js", express.static(path.join(FRONTEND_DIR, "app/js")));
-    app.use("/fonts", express.static(path.join(FRONTEND_DIR, "app/fonts")));
-    app.use("/videos", express.static(path.join(FRONTEND_DIR, "app/videos")));
-    app.use("/images", express.static(path.join(FRONTEND_DIR, "app/images")));
-    
-    console.log('🎨 Frontend servi par le backend en mode DEV');
-  } else {
-    console.log('⚠️ Dossier frontend introuvable en DEV');
-  }
+if (isProduction) {
+  app.use(express.static(path.join(__dirname, "../frontend")));
 } else {
-  console.log('🚀 Mode PROD - Frontend servi par Vercel');
+  app.use(express.static(path.join(__dirname, "../frontend")));
 }
 
-// ✅ SERVIR /app UNIQUEMENT EN DEV
-if (process.env.NODE_ENV !== 'production' && fs.existsSync(FRONTEND_DIR)) {
-  app.use("/app/assets", express.static(path.join(FRONTEND_DIR, "app/assets")));
-  app.use("/app/images", express.static(path.join(FRONTEND_DIR, "app/images")));
-}
+// ==================== CONFIGURATION CORRIGÉE ====================
+
+// ✅ 1. ASSETS PUBLICS GÉNÉRIQUES (sans /app/)
+app.use("/css", express.static(path.join(__dirname, "../frontend/app/css")));
+app.use("/js", express.static(path.join(__dirname, "../frontend/app/js")));
+app.use("/fonts", express.static(path.join(__dirname, "../frontend/app/fonts")));
+app.use("/videos", express.static(path.join(__dirname, "../frontend/app/videos")));
+app.use("/images", express.static(path.join(__dirname, "../frontend/app/images")));
+
+// ✅ 2. PROTECTION GLOBALE POUR TOUT /app/*
+app.use("/app/*", (req, res, next) => {
+  // Autoriser les assets (CSS, JS, images) même dans /app/
+  if (req.path.match(/\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|mp4|webm)$/)) {
+    return next();
+
+
+    return next(); // → express.static s'en occupe
+  }
+  // Pour les HTML, APPLIQUER L'AUTH
+  return authenticateToken(req, res, next);
+});
+
+// ✅ 3. SERVIR /app APRÈS LA PROTECTION
+app.use("/app/assets", express.static(path.join(__dirname, "../frontend/app/assets")));
+app.use("/app/images", express.static(path.join(__dirname, "../frontend/app/images")));
+
 
 // ---------------------------
 // CONFIGURATION ESPACE MEMBRE
 // ---------------------------
 // ==================== CONFIGURATION DES ROUTES /app ====================
-if (process.env.NODE_ENV !== 'production' && fs.existsSync(FRONTEND_DIR)) {
-  app.get("/app/*", authenticateToken, (req, res) => {
-    const fullPath = req.params[0];
+app.get("/app/*", authenticateToken, (req, res) => {
+  const fullPath = req.params[0];
 
-    // ✅ REDIRECTION IMMÉDIATE POUR INDEX ET RACINE
-    if (fullPath === 'index.html' || fullPath === '' || fullPath === 'index' || fullPath === '/') {
-      return res.sendFile(path.join(FRONTEND_DIR, "app/choix_irl_digital.html"));
+  // ✅ REDIRECTION IMMÉDIATE POUR INDEX ET RACINE
+  if (fullPath === 'index.html' || fullPath === '' || fullPath === 'index' || fullPath === '/') {
+    return res.sendFile(path.join(__dirname, "../frontend/app/choix_irl_digital.html"));
+  }
+
+  // ✅ STRATÉGIE SIMPLIFIÉE POUR LES AUTRES PAGES
+  const searchPaths = [
+    path.join(__dirname, "../frontend/app", fullPath, fullPath + ".html"),
+    path.join(__dirname, "../frontend/app", fullPath),
+    path.join(__dirname, "../frontend/app", fullPath + ".html")
+  ];
+
+  let foundPath = null;
+  for (const searchPath of searchPaths) {
+    if (fs.existsSync(searchPath)) {
+      foundPath = searchPath;
+      break;
     }
+  }
 
-    // ✅ STRATÉGIE SIMPLIFIÉE POUR LES AUTRES PAGES
-    const searchPaths = [
-      path.join(FRONTEND_DIR, "app", fullPath, fullPath + ".html"),
-      path.join(FRONTEND_DIR, "app", fullPath),
-      path.join(FRONTEND_DIR, "app", fullPath + ".html")
-    ];
+  if (foundPath) {
+    return res.sendFile(foundPath);
+  }
 
-    let foundPath = null;
-    for (const searchPath of searchPaths) {
-      if (fs.existsSync(searchPath)) {
-        foundPath = searchPath;
-        break;
-      }
-    }
-
-    if (foundPath) {
-      return res.sendFile(foundPath);
-    }
-
-    // FALLBACK
-    return res.sendFile(path.join(FRONTEND_DIR, "app/choix_irl_digital.html"));
-  });
-}
+  // FALLBACK
+  return res.sendFile(path.join(__dirname, "../frontend/app/choix_irl_digital.html"));
+});
 
 
 
@@ -376,45 +378,12 @@ app.use(validateCSRF);
 //app.use('/api', profileRoutes);
 
 
-// ==================== ROUTES DES PAGES PUBLIQUES ====================
+// Routes principales
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "../frontend/index.html")));
+app.get("/login", (req, res) => res.sendFile(path.join(__dirname, "../frontend/login.html")));
+app.get("/app/choix_irl_digital.html", authenticateToken, (req, res) => res.sendFile(path.join(__dirname, "../frontend/app/choix_irl_digital.html")));
+app.get("/inscription", (req, res) => res.sendFile(path.join(__dirname, "../frontend/inscription.html")));
 
-// Route racine
-app.get("/", (req, res) => {
-  if (process.env.NODE_ENV !== 'production' && fs.existsSync(FRONTEND_DIR)) {
-    res.sendFile(path.join(FRONTEND_DIR, "index.html"));
-  } else {
-    res.json({ 
-      message: "API Server is running", 
-      frontend: "https://integora-frontend.vercel.app",
-      environment: process.env.NODE_ENV || 'development'
-    });
-  }
-});
-
-// Route login
-app.get("/login", (req, res) => {
-  if (process.env.NODE_ENV !== 'production' && fs.existsSync(FRONTEND_DIR)) {
-    res.sendFile(path.join(FRONTEND_DIR, "login.html"));
-  } else {
-    res.redirect('https://integora-frontend.vercel.app/login');
-  }
-});
-
-// Route inscription
-app.get("/inscription", (req, res) => {
-  if (process.env.NODE_ENV !== 'production' && fs.existsSync(FRONTEND_DIR)) {
-    res.sendFile(path.join(FRONTEND_DIR, "inscription.html"));
-  } else {
-    res.redirect('https://integora-frontend.vercel.app/inscription');
-  }
-});
-
-// Route app protégée (uniquement en dev)
-if (process.env.NODE_ENV !== 'production' && fs.existsSync(FRONTEND_DIR)) {
-  app.get("/app/choix_irl_digital.html", authenticateToken, (req, res) => {
-    res.sendFile(path.join(FRONTEND_DIR, "app/choix_irl_digital.html"));
-  });
-}
 
 
 // Gérer les erreurs CORS
@@ -443,68 +412,61 @@ const pageMappings = {
   'admin': { file: 'admin', public: false, auth: true, plans: ['premium'] }
 };
 
-// 🌐 ROUTE UNIVERSELLE - UNIQUEMENT EN DEV
-if (process.env.NODE_ENV !== 'production' && fs.existsSync(FRONTEND_DIR)) {
-  app.get("/:page", authenticateToken, async (req, res) => {
-    try {
-      const pageKey = req.params.page.replace('.html', '');
-      const pageConfig = pageMappings[pageKey];
+// 🌐 ROUTE UNIVERSELLE - ARCHITECTURE INVISIBLE
+app.get("/:page", authenticateToken, async (req, res) => {
+  try {
+    const pageKey = req.params.page.replace('.html', '');
+    const pageConfig = pageMappings[pageKey];
 
-      // 🚨 PAGE INCONNUE = 404 IDENTIQUE
-      if (!pageConfig) {
-        console.log(`🚨 Tentative accès page inconnue: ${pageKey}`);
-        return res.status(404).sendFile(path.join(FRONTEND_DIR, "404.html"));
-      }
-
-      const { file, public: isPublic, auth: requiresAuth, plans } = pageConfig;
-
-      // ✅ PAGE PUBLIQUE - ACCÈS DIRECT
-      if (isPublic) {
-        const filePath = path.join(FRONTEND_DIR, `${file}.html`);
-        return fs.existsSync(filePath)
-          ? res.sendFile(filePath)
-          : res.status(404).sendFile(path.join(FRONTEND_DIR, "404.html"));
-      }
-
-      // 🚨 PAGE PROTÉGÉE SANS AUTH
-      if (requiresAuth && !req.user) {
-        console.log(`🚨 Tentative accès non authentifié: ${pageKey}`);
-        return res.redirect(`/login?next=/${pageKey}`);
-      }
-
-      // 🚨 VERIFICATION ABONNEMENT
-      if (plans && !plans.includes(req.user.subscription_type)) {
-        console.log(`🚨 Plan insuffisant: ${pageKey} pour ${req.user.email}`);
-        return res.status(403).sendFile(path.join(FRONTEND_DIR, "403.html"));
-      }
-
-      // 🚨 ABONNEMENT INACTIF (sauf trial)
-      if (req.user.subscription_type !== 'trial' && !req.user.has_active_subscription) {
-        console.log(`🚨 Abonnement inactif: ${pageKey} pour ${req.user.email}`);
-        return res.status(403).sendFile(path.join(FRONTEND_DIR, "subscription-expired.html"));
-      }
-
-      // ✅ ACCÈS AUTORISÉ
-      const filePath = path.join(FRONTEND_DIR, `app/${file}.html`);
-      if (!fs.existsSync(filePath)) {
-        return res.status(404).sendFile(path.join(FRONTEND_DIR, "404.html"));
-      }
-
-      console.log(`✅ Accès autorisé: ${pageKey} pour ${req.user.email}`);
-      res.sendFile(filePath);
-
-    } catch (error) {
-      console.error('💥 Erreur route universelle:', error);
-      res.status(500).sendFile(path.join(FRONTEND_DIR, "500.html"));
+    // 🚨 PAGE INCONNUE = 404 IDENTIQUE
+    if (!pageConfig) {
+      console.log(`🚨 Tentative accès page inconnue: ${pageKey}`);
+      return res.status(404).sendFile(path.join(__dirname, "../frontend/404.html"));
     }
-  });
-} else {
-  // ✅ EN PROD - Rediriger vers Vercel pour les pages inconnues
-  app.get("/:page", (req, res) => {
-    const page = req.params.page;
-    res.redirect(`https://integora-frontend.vercel.app/${page}`);
-  });
-}
+
+    const { file, public: isPublic, auth: requiresAuth, plans } = pageConfig;
+
+    // ✅ PAGE PUBLIQUE - ACCÈS DIRECT
+    if (isPublic) {
+      const filePath = path.join(__dirname, `../frontend/${file}.html`);
+      return fs.existsSync(filePath)
+        ? res.sendFile(filePath)
+        : res.status(404).sendFile(path.join(__dirname, "../frontend/404.html"));
+    }
+
+    // 🚨 PAGE PROTÉGÉE SANS AUTH
+    if (requiresAuth && !req.user) {
+      console.log(`🚨 Tentative accès non authentifié: ${pageKey}`);
+      return res.redirect(`/login?next=/${pageKey}`);
+    }
+
+    // 🚨 VERIFICATION ABONNEMENT
+    if (plans && !plans.includes(req.user.subscription_type)) {
+      console.log(`🚨 Plan insuffisant: ${pageKey} pour ${req.user.email}`);
+      return res.status(403).sendFile(path.join(__dirname, "../frontend/403.html"));
+    }
+
+    // 🚨 ABONNEMENT INACTIF (sauf trial)
+    if (req.user.subscription_type !== 'trial' && !req.user.has_active_subscription) {
+      console.log(`🚨 Abonnement inactif: ${pageKey} pour ${req.user.email}`);
+      return res.status(403).sendFile(path.join(__dirname, "../frontend/subscription-expired.html"));
+    }
+
+    // ✅ ACCÈS AUTORISÉ
+    const filePath = path.join(__dirname, `../frontend/app/${file}.html`);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).sendFile(path.join(__dirname, "../frontend/404.html"));
+    }
+
+    console.log(`✅ Accès autorisé: ${pageKey} pour ${req.user.email}`);
+    res.sendFile(filePath);
+
+  } catch (error) {
+    console.error('💥 Erreur route universelle:', error);
+    res.status(500).sendFile(path.join(__dirname, "../frontend/500.html"));
+  }
+});
+
 
 
 

@@ -480,16 +480,23 @@ app.get("/:page", authenticateToken, async (req, res) => {
 // ---------------------------
 
 // server.js - AJOUTE CE MIDDLEWARE CORS COMPLET
-// ✅ CORRECTION CORS POUR LES COOKIES
+// ✅ CORRECTION CORS POUR PRODUCTION + LOCAL
 app.use((req, res, next) => {
-
-
-  // ✅ AUTORISER LOCALHOT:3000 EXPLICITEMENT
-  res.header('Access-Control-Allow-Origin', 'http://localhost:3000');
+  const allowedOrigins = [
+    'http://localhost:3000',
+    'https://integora-frontend.vercel.app',
+    'https://integora-frontend.vercel.app/'
+  ];
+  
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+  }
+  
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Credentials', 'true'); // ← CRITIQUE
-
+  res.header('Access-Control-Allow-Credentials', 'true');
+  
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }

@@ -1933,7 +1933,7 @@ app.post('/api/create-paid-checkout', async (req, res) => {
       customer_email: email,
       line_items: [{ price: priceId, quantity: 1 }],
       mode: 'subscription',
-      success_url: `${process.env.FRONTEND_URL || 'https://integora-frontend.vercel.app'}/success-paiement.html?session_id={CHECKOUT_SESSION_ID}`,
+      success_url: `${process.env.FRONTEND_URL || 'https://integora-frontend.vercel.app'}/email-sent-paiement.html?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_URL || 'https://integora-frontend.vercel.app'}/inscription.html`,
       metadata: {
         first_name, last_name, company_name, company_size, desired_plan, user_email: email

@@ -355,7 +355,7 @@ function ensureCsrfToken(req, res, next) {
 function validateCSRF(req, res, next) {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
 
-  const exempt = new Set(['/login', '/inscription', '/verify-token']);
+  const exempt = new Set(['/login', '/inscription', '/verify-token', '/api/create-paid-checkout']);
   if (exempt.has(req.path)) return next();
 
   const headerToken = req.headers['x-csrf-token'];
@@ -368,6 +368,7 @@ function validateCSRF(req, res, next) {
   next();
 }
 
+app.use(corsMiddleware);
 // ➕ Monte-les AVANT tes routes protégées
 app.use(ensureCsrfToken);
 app.use(validateCSRF);
@@ -480,12 +481,11 @@ app.get("/:page", authenticateToken, async (req, res) => {
 // ---------------------------
 
 // server.js - AJOUTE CE MIDDLEWARE CORS COMPLET
-// ✅ CORRECTION CORS POUR PRODUCTION + LOCAL
+// ✅ CORRECTION CORS COMPLÈTE POUR PRODUCTION
 app.use((req, res, next) => {
   const allowedOrigins = [
     'http://localhost:3000',
-    'https://integora-frontend.vercel.app',
-    'https://integora-frontend.vercel.app/'
+    'https://integora-frontend.vercel.app'
   ];
   
   const origin = req.headers.origin;
@@ -493,13 +493,15 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', origin);
   }
   
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, x-csrf-token');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Credentials', 'true');
   
+  // Répondre immédiatement aux preflight OPTIONS
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
+  
   next();
 });
 

@@ -1870,104 +1870,65 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // ✅ ENDPOINT PAIEMENT STRIPE POUR STANDARD/PREMIUM
 app.post('/api/create-paid-checkout', async (req, res) => {
-  console.log('💰 [Stripe Checkout] Début création session - Environnement:', process.env.NODE_ENV);
+  console.log('💰 [BACKEND] Stripe Checkout - Requête reçue');
+  console.log('📦 [BACKEND] Body reçu:', JSON.stringify(req.body, null, 2));
 
   try {
     const { email, first_name, last_name, company_name, company_size, desired_plan } = req.body;
 
-    // Validation des données
     if (!email || !desired_plan) {
-      return res.status(400).json({ 
-        error: 'Email et type d\'abonnement requis' 
-      });
+      console.log('❌ [BACKEND] Données manquantes');
+      return res.status(400).json({ error: 'Email et abonnement requis' });
     }
 
-    console.log('📋 [Stripe Checkout] Données reçues:', {
-      email,
-      first_name,
-      desired_plan,
-      company_name,
-      environment: process.env.NODE_ENV
-    });
+    console.log('🎯 [BACKEND] Plan demandé:', desired_plan);
 
-    // 🔧 MAPPING DES PLANS VERS LES PRIX STRIPE
+    // Mappage des plans
     const priceIds = {
       standard: 'price_1SIoYxPGbG6oFrATaa6wtYvX',
       premium: 'price_1SIoZGPGbG6oFrATq6020zVW',
     };
 
     const priceId = priceIds[desired_plan];
-    
     if (!priceId) {
-      return res.status(400).json({ 
-        error: 'Type d\'abonnement invalide' 
-      });
+      console.log('❌ [BACKEND] Price ID non trouvé pour:', desired_plan);
+      return res.status(400).json({ error: 'Plan invalide' });
     }
 
-    // 🎯 CONFIGURATION DYNAMIQUE DES URLS
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    const isProduction = process.env.NODE_ENV === 'production';
-    
-    console.log('🌐 [Stripe Checkout] Configuration URLs:', {
-      frontendUrl,
-      environment: isProduction ? 'PRODUCTION' : 'LOCAL'
-    });
+    console.log('🔑 [BACKEND] Price ID utilisé:', priceId);
 
-    // 🎯 CRÉATION DE LA SESSION STRIPE
+    // Création session Stripe
+    console.log('🔄 [BACKEND] Création session Stripe...');
     const session = await stripe.checkout.sessions.create({
       customer_email: email,
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
+      line_items: [{ price: priceId, quantity: 1 }],
       mode: 'subscription',
-      
-      // ✅ URLS DYNAMIQUES POUR LOCAL + PRODUCTION
-      success_url: `${frontendUrl}/success-paiement.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${frontendUrl}/inscription.html`,
-      
-      // 🎯 MÉTADONNÉES POUR LE WEBHOOK
+      success_url: `${process.env.FRONTEND_URL || 'https://integora-frontend.vercel.app'}/success-paiement.html?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL || 'https://integora-frontend.vercel.app'}/inscription.html`,
       metadata: {
-        first_name: first_name || '',
-        last_name: last_name || '',
-        company_name: company_name || '',
-        company_size: company_size || '',
-        desired_plan: desired_plan,
-        user_email: email,
-        environment: process.env.NODE_ENV || 'development',
-        timestamp: new Date().toISOString()
+        first_name, last_name, company_name, company_size, desired_plan, user_email: email
       }
     });
 
-    console.log('✅ [Stripe Checkout] Session créée:', {
-      sessionId: session.id,
-      checkoutUrl: session.url,
-      environment: process.env.NODE_ENV
-    });
+    console.log('✅ [BACKEND] Session Stripe créée:', session.id);
+    console.log('🔗 [BACKEND] URL Stripe:', session.url);
 
     res.json({ 
-      checkoutUrl: session.url,
+      checkoutUrl: session.url, 
       sessionId: session.id,
-      environment: process.env.NODE_ENV
+      debug: {
+        priceId: priceId,
+        plan: desired_plan
+      }
     });
 
   } catch (error) {
-    console.error('❌ [Stripe Checkout] Erreur:', {
-      message: error.message,
-      environment: process.env.NODE_ENV
-    });
+    console.error('❌ [BACKEND] Erreur Stripe:', error);
     res.status(500).json({ 
-      error: 'Erreur lors de la création du paiement',
-      details: process.env.NODE_ENV === 'development' ? error.message : 'Veuillez réessayer'
+      error: 'Erreur création paiement',
+      details: error.message 
     });
   }
-});
-
-// ✅ PAGE DE SUCCÈS PAIEMENT (optionnelle)
-app.get('/success-paiement.html', (req, res) => {
-  res.sendFile(path.join(__dirname, "../frontend/success-paiement.html"));
 });
 
 // ---------------------------

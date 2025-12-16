@@ -265,6 +265,8 @@ app.use(cookieParser());
 // ✅ 1. FICHIERS FRONTEND PUBLICS (sans auth)
 if (isProduction) {
   app.use(express.static(path.join(__dirname, "../frontend")));
+} else {
+  app.use(express.static(path.join(__dirname, "../frontend")));
 }
 
 // ==================== CONFIGURATION CORRIGÉE ====================

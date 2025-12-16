@@ -1774,42 +1774,89 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       return res.status(400).json({ error: "desired_plan invalide" });
     }
 
-    // 1) créer pending
-    const { data: pending, error: pendingErr } = await supabaseAdmin
+    // ✅ 0) S'il existe déjà un pending actif pour cet email, on le réutilise
+    //     (évite l’erreur unique constraint pending_one_active_per_email)
+    const { data: existingPending, error: existingErr } = await supabaseAdmin
       .from("pending_signups")
-      .insert([{
-        email: emailNorm,
-        first_name,
-        last_name,
-        company_name,
-        company_size,
-        desired_plan,
-        status: "pending"
-      }])
       .select("*")
-      .single();
+      .eq("email", emailNorm)
+      .in("status", ["pending", "invited"]) // adapte si tu as d’autres statuts
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    if (pendingErr || !pending) {
-      console.error("❌ pending_signups insert error:", pendingErr);
-      return res.status(500).json({ error: "Impossible de créer pending_signup" });
+    if (existingErr) {
+      console.error("❌ pending_signups select error:", existingErr);
+      return res.status(500).json({ error: "Erreur lecture pending_signups", details: existingErr.message });
     }
 
-    const pending_id = pending.id;
+    let pending_id;
 
-    // 2) price mapping
+    if (existingPending) {
+      pending_id = existingPending.id;
+
+      console.log("ℹ️ pending existant réutilisé:", pending_id);
+
+      // Optionnel mais utile : mettre à jour les infos du pending (si l'utilisateur a changé)
+      const { error: updErr } = await supabaseAdmin
+        .from("pending_signups")
+        .update({
+          first_name: first_name ?? existingPending.first_name,
+          last_name: last_name ?? existingPending.last_name,
+          company_name: company_name ?? existingPending.company_name,
+          company_size: company_size ?? existingPending.company_size,
+          desired_plan,
+          status: "pending",
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", pending_id);
+
+      if (updErr) {
+        console.error("❌ pending_signups update error:", updErr);
+        return res.status(500).json({ error: "Erreur update pending_signup", details: updErr.message });
+      }
+
+    } else {
+      // ✅ 1) Créer pending si aucun n'existe
+      const { data: pending, error: pendingErr } = await supabaseAdmin
+        .from("pending_signups")
+        .insert([{
+          email: emailNorm,
+          first_name: first_name ?? null,
+          last_name: last_name ?? null,
+          company_name: company_name ?? null,
+          company_size: company_size ?? null,
+          desired_plan,
+          status: "pending",
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }])
+        .select("*")
+        .single();
+
+      if (pendingErr || !pending) {
+        console.error("❌ pending_signups insert error:", pendingErr);
+        return res.status(500).json({ error: "Impossible de créer pending_signup", details: pendingErr?.message });
+      }
+
+      pending_id = pending.id;
+      console.log("✅ pending créé:", pending_id);
+    }
+
+    // ✅ 2) Price mapping (ENV)
     const priceIds = {
-  standard: process.env.STRIPE_PRICE_STANDARD,
-  premium: process.env.STRIPE_PRICE_PREMIUM
-};
-const priceId = priceIds[desired_plan];
+      standard: process.env.STRIPE_PRICE_STANDARD,
+      premium: process.env.STRIPE_PRICE_PREMIUM
+    };
+    const priceId = priceIds[desired_plan];
 
-if (!priceId) {
-  return res.status(500).json({
-    error: "PriceId Stripe manquant côté serveur (STRIPE_PRICE_STANDARD / STRIPE_PRICE_PREMIUM)"
-  });
-}
+    if (!priceId) {
+      return res.status(500).json({
+        error: "PriceId Stripe manquant côté serveur (STRIPE_PRICE_STANDARD / STRIPE_PRICE_PREMIUM)"
+      });
+    }
 
-    // 3) créer session Stripe (subscription)
+    // ✅ 3) Créer session Stripe (nouvelle session à chaque tentative)
     const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
 
     const session = await stripe.checkout.sessions.create({
@@ -1832,11 +1879,19 @@ if (!priceId) {
       }
     });
 
-    // 4) stocke stripe_session_id dans pending
-    await supabaseAdmin
+    // ✅ 4) Stocker stripe_session_id dans pending
+    const { error: sessUpdErr } = await supabaseAdmin
       .from("pending_signups")
-      .update({ stripe_session_id: session.id })
+      .update({
+        stripe_session_id: session.id,
+        updated_at: new Date().toISOString()
+      })
       .eq("id", pending_id);
+
+    if (sessUpdErr) {
+      console.error("❌ pending_signups update stripe_session_id error:", sessUpdErr);
+      return res.status(500).json({ error: "Erreur update stripe_session_id", details: sessUpdErr.message });
+    }
 
     return res.json({
       checkoutUrl: session.url,
@@ -1849,6 +1904,7 @@ if (!priceId) {
     return res.status(500).json({ error: "Erreur start-paid-checkout", details: e.message });
   }
 });
+
 
 
 app.post("/api/complete-signup", async (req, res) => {

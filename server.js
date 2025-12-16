@@ -248,9 +248,10 @@ const globalLimiter = rateLimit({
 });
 
 // 🔥 PROTECTION CONTRE LES ATTACKS CONNUES
+app.use(cookieParser());
 app.use(express.json({ limit: '10kb' })); // Limite taille JSON
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
-app.use(cookieParser());
+
 
 // Appliquer les limiteurs
 // app.use(globalLimiter);
@@ -339,51 +340,7 @@ app.get("/app/*", authenticateToken, (req, res) => {
 
 
 // → 1. S'assurer qu'un token existe en cookie lisible
-// 1) créer pending (avec expires_at + gestion d'un pending existant)
-const nowIso = new Date().toISOString();
-const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(); // 2h
 
-// Si un pending "encore valide" existe déjà pour cet email, on le réutilise
-const { data: existingPending } = await supabaseAdmin
-  .from("pending_signups")
-  .select("*")
-  .eq("email", emailNorm)
-  .eq("status", "pending")
-  .gt("expires_at", nowIso)
-  .order("created_at", { ascending: false })
-  .limit(1)
-  .maybeSingle();
-
-let pending = existingPending;
-
-if (!pending) {
-  const { data: created, error: pendingErr } = await supabaseAdmin
-    .from("pending_signups")
-    .insert([{
-      email: emailNorm,
-      first_name: first_name ?? null,
-      last_name: last_name ?? null,
-      company_name: company_name ?? null,
-      company_size: company_size ?? null,
-      desired_plan,
-      status: "pending",
-      expires_at: expiresAt
-    }])
-    .select("*")
-    .single();
-
-  if (pendingErr || !created) {
-    console.error("❌ pending_signups insert error:", pendingErr);
-    return res.status(500).json({
-      error: "Impossible de créer pending_signup",
-      details: pendingErr
-    });
-  }
-
-  pending = created;
-}
-
-const pending_id = pending.id;
 
 // → 2. Vérifier le token pour les méthodes mutantes
 function validateCSRF(req, res, next) {
@@ -441,6 +398,31 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+function ensureCsrfToken(req, res, next) {
+  try {
+    // Si déjà présent, on ne régénère pas
+    if (req.cookies && req.cookies["XSRF-TOKEN"]) return next();
+
+    const token = crypto.randomBytes(32).toString("hex");
+
+    // Render + Vercel = https => secure + SameSite=None
+    const isProd = process.env.NODE_ENV === "production";
+    res.cookie("XSRF-TOKEN", token, {
+      httpOnly: false,                 // doit être lisible par le frontend si besoin
+      secure: isProd,                  // true en prod (https), false en local
+      sameSite: isProd ? "none" : "lax",
+      path: "/"
+    });
+
+    return next();
+  } catch (e) {
+    console.error("❌ ensureCsrfToken error:", e);
+    return next();
+  }
+}
+
+
 
 // ➕ Monte-les AVANT tes routes protégées
 app.use(ensureCsrfToken);

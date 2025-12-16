@@ -263,12 +263,11 @@ app.use(cookieParser());
 
 // ==================== FICHIERS STATIQUES PUBLICS ====================
 // ✅ 1. FICHIERS FRONTEND PUBLICS (sans auth)
-if (!isProduction) {
-  // En local uniquement, si tu as vraiment un dossier ../frontend
+if (isProduction) {
+  app.use(express.static(path.join(__dirname, "../frontend")));
+} else {
   app.use(express.static(path.join(__dirname, "../frontend")));
 }
-
-
 
 // ==================== CONFIGURATION CORRIGÉE ====================
 
@@ -407,21 +406,10 @@ app.use(validateCSRF);
 
 
 // Routes principales
-const FRONTEND = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
-
-app.get("/", (req, res) => res.redirect(FRONTEND + "/"));
-app.get("/login", (req, res) => res.redirect(FRONTEND + "/login.html"));
-app.get("/inscription", (req, res) => res.redirect(FRONTEND + "/inscription.html"));
-
-
-// Toutes les routes non-API → frontend (évite les ENOENT)
-app.get("*", (req, res) => {
-  if (req.path.startsWith("/api") || req.path === "/verify-token" || req.path === "/login" || req.path === "/inscription") {
-    return res.status(404).json({ error: "Not found" });
-  }
-  const FRONTEND = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
-  return res.redirect(FRONTEND + req.originalUrl);
-});
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "../frontend/index.html")));
+app.get("/login", (req, res) => res.sendFile(path.join(__dirname, "../frontend/login.html")));
+app.get("/app/choix_irl_digital.html", authenticateToken, (req, res) => res.sendFile(path.join(__dirname, "../frontend/app/choix_irl_digital.html")));
+app.get("/inscription", (req, res) => res.sendFile(path.join(__dirname, "../frontend/inscription.html")));
 
 
 
@@ -1947,50 +1935,6 @@ console.log('🧾 [BACKEND] user_id reçu:', user_id);
     console.log('🔑 [BACKEND] Price ID utilisé:', priceId);
 
     
-// Création session Stripe
-console.log("🔄 [BACKEND] Création session Stripe...");
-
-// 🔒 Sécurité : Stripe ne doit JAMAIS recevoir undefined
-if (!user_id) throw new Error("user_id manquant");
-
-const payload = {
-  customer_email: email,
-  line_items: [{ price: priceId, quantity: 1 }],
-  mode: "subscription",
-  success_url: `${process.env.FRONTEND_URL || "https://integora-frontend.vercel.app"}/email-sent-paiement.html?session_id={CHECKOUT_SESSION_ID}`,
-  cancel_url: `${process.env.FRONTEND_URL || "https://integora-frontend.vercel.app"}/inscription.html`,
-
-  // ✅ lien Stripe -> Supabase
-  client_reference_id: String(user_id),
-
-  // ✅ debug + fallback
-  metadata: {
-    user_id: String(user_id),
-    desired_plan,
-    user_email: email,
-    first_name,
-    last_name,
-    company_name,
-    company_size
-  },
-
-  // ✅ CRITIQUE : metadata sur la subscription
-  subscription_data: {
-    metadata: {
-      user_id: String(user_id),
-      desired_plan
-    }
-  }
-};
-
-console.log("🧾 [BACKEND] Payload Stripe =", JSON.stringify(payload, null, 2));
-
-const session = await stripe.checkout.sessions.create(payload);
-
-console.log("✅ Stripe client_reference_id =", session.client_reference_id);
-console.log("✅ Stripe metadata =", session.metadata);
-console.log("✅ [BACKEND] Session Stripe créée:", session.id);
-console.log("🔗 [BACKEND] URL Stripe:", session.url);
 
 
 

@@ -1974,11 +1974,16 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
     // 2) price mapping
     const priceIds = {
-      standard: process.env.STRIPE_PRICE_STANDARD,
-      premium: process.env.STRIPE_PRICE_PREMIUM
-    };
-    const priceId = priceIds[desired_plan];
-    if (!priceId) return res.status(500).json({ error: "PriceId Stripe manquant (env)" });
+  standard: process.env.STRIPE_PRICE_STANDARD,
+  premium: process.env.STRIPE_PRICE_PREMIUM
+};
+const priceId = priceIds[desired_plan];
+
+if (!priceId) {
+  return res.status(500).json({
+    error: "PriceId Stripe manquant côté serveur (STRIPE_PRICE_STANDARD / STRIPE_PRICE_PREMIUM)"
+  });
+}
 
     // 3) créer session Stripe (subscription)
     const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
@@ -2244,107 +2249,7 @@ app.post("/api/resend-activation", async (req, res) => {
 });
 
 
-// ✅ FINALISATION COMPTE APRÈS PAIEMENT
-app.post("/api/complete-signup", async (req, res) => {
-  try {
-    const { pending_id, session_id, password } = req.body;
 
-    if (!pending_id || !session_id || !password) {
-      return res.status(400).json({ error: "pending_id, session_id, password requis" });
-    }
-
-    // 1) Charger pending
-    const { data: pending, error: pErr } = await supabase
-      .from("pending_signups")
-      .select("*")
-      .eq("id", pending_id)
-      .single();
-
-    if (pErr || !pending) return res.status(404).json({ error: "pending introuvable" });
-    if (pending.status === "completed") return res.status(200).json({ ok: true, message: "Déjà finalisé" });
-
-    // 2) Vérifier Stripe session => payée
-    const session = await stripe.checkout.sessions.retrieve(session_id);
-    if (!session || session.id !== pending.stripe_session_id) {
-      return res.status(400).json({ error: "Session Stripe non liée à ce pending" });
-    }
-
-    // IMPORTANT : checkout.session.completed arrive parfois avant que payment_status soit "paid" en test.
-    // En prod, on veut PAID, sinon on refuse.
-    if (session.payment_status !== "paid") {
-      return res.status(402).json({ error: "Paiement non confirmé", payment_status: session.payment_status });
-    }
-
-    const subscriptionId = session.subscription || null;
-    const customerId = session.customer || null;
-
-    // 3) Créer user Supabase (ADMIN) maintenant seulement
-    const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
-      email: pending.email,
-      password,
-      email_confirm: true,
-      user_metadata: {
-        first_name: pending.first_name,
-        last_name: pending.last_name,
-        company_name: pending.company_name,
-        company_size: pending.company_size,
-        desired_plan: pending.desired_plan
-      }
-    });
-
-    if (createErr || !created?.user) {
-      console.error("createUser error:", createErr);
-      return res.status(500).json({ error: "Impossible de créer l'utilisateur Supabase" });
-    }
-
-    const userId = created.user.id;
-
-    // 4) Créer company + profile (adapte selon tes tables)
-    // Ici je reprends l’esprit de ton code trial (profiles + subscriptions) :contentReference[oaicite:3]{index=3}
-    let companyId = null;
-    if (pending.company_name) {
-      const { data: cData } = await supabase
-        .from("companies")
-        .insert([{ name: pending.company_name, size: pending.company_size }])
-        .select("id")
-        .single();
-      companyId = cData?.id ?? null;
-    }
-
-    await supabase.from("profiles").insert([{
-      user_id: userId,
-      first_name: pending.first_name,
-      last_name: pending.last_name,
-      company_id: companyId,
-      created_at: new Date().toISOString()
-    }]);
-
-    // 5) Créer subscription “active” (car payé)
-    await supabase.from("subscriptions").upsert({
-      user_id: userId,
-      plan: pending.desired_plan,
-      status: "active",
-      stripe_customer_id: customerId,
-      stripe_subscription_id: subscriptionId,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    }, { onConflict: "user_id" });
-
-    // 6) Marquer pending completed
-    await supabase.from("pending_signups").update({
-      status: "completed",
-      stripe_customer_id: customerId,
-      stripe_subscription_id: subscriptionId,
-      updated_at: new Date().toISOString()
-    }).eq("id", pending_id);
-
-    return res.json({ ok: true, user_id: userId });
-
-  } catch (e) {
-    console.error("complete-signup error:", e);
-    return res.status(500).json({ error: "Erreur finalisation", details: e.message });
-  }
-});
 
 
 

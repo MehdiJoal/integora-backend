@@ -1,3 +1,5 @@
+//server//
+
 require('dotenv').config();
 
 // Vérification CRITIQUE - doit être fait immédiatement
@@ -8,6 +10,9 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.error("💡 Vérifie que ton fichier .env est dans le même dossier que server.js");
   process.exit(1);
 }
+
+
+
 
 console.log("✅ Variables d'environnement chargées avec succès");
 
@@ -374,16 +379,16 @@ app.use((req, res, next) => {
     'http://localhost:3000',
     'https://integora-frontend.vercel.app'
   ];
-  
+
   const origin = req.headers.origin;
   if (allowedOrigins.includes(origin)) {
     res.header('Access-Control-Allow-Origin', origin);
   }
-  
+
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, x-csrf-token');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Credentials', 'true');
-  
+
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
@@ -508,21 +513,21 @@ app.use((req, res, next) => {
     'http://localhost:3000',
     'https://integora-frontend.vercel.app'
   ];
-  
+
   const origin = req.headers.origin;
   if (allowedOrigins.includes(origin)) {
     res.header('Access-Control-Allow-Origin', origin);
   }
-  
+
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, x-csrf-token');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Credentials', 'true');
-  
+
   // Répondre immédiatement aux preflight OPTIONS
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
-  
+
   next();
 });
 
@@ -748,310 +753,310 @@ function requireSubscription(allowedPlans) {
 
 // ✅ ROUTE POUR RÉCUPÉRER L'ABONNEMENT UTILISATEUR
 app.get('/api/my-subscription', authenticateToken, async (req, res) => {
-    try {
-        console.log('📡 [SERVER] Récupération abonnement pour user:', req.user.id);
-        
-        const userId = req.user.id;
+  try {
+    console.log('📡 [SERVER] Récupération abonnement pour user:', req.user.id);
 
-        // Utiliser Supabase avec service role (pas de RLS)
-        const { data: subscription, error } = await supabaseAdmin
-            .from('subscriptions')
-            .select('*')
-            .eq('user_id', userId)
-            .single();
+    const userId = req.user.id;
 
-        if (error) {
-            if (error.code === 'PGRST116') { // Aucune ligne trouvée
-                console.log('📭 [SERVER] Aucun abonnement trouvé pour user:', userId);
-                return res.status(404).json({ 
-                    error: 'Aucun abonnement trouvé',
-                    user_id: userId 
-                });
-            }
-            console.error('❌ [SERVER] Erreur Supabase:', error);
-            return res.status(500).json({ error: 'Erreur base de données' });
-        }
+    // Utiliser Supabase avec service role (pas de RLS)
+    const { data: subscription, error } = await supabaseAdmin
+      .from('subscriptions')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
 
-        console.log('✅ [SERVER] Abonnement trouvé:', {
-            user_id: userId,
-            plan: subscription.plan,
-            status: subscription.status,
-            period_end: subscription.current_period_end
+    if (error) {
+      if (error.code === 'PGRST116') { // Aucune ligne trouvée
+        console.log('📭 [SERVER] Aucun abonnement trouvé pour user:', userId);
+        return res.status(404).json({
+          error: 'Aucun abonnement trouvé',
+          user_id: userId
         });
-
-        res.json(subscription);
-
-    } catch (error) {
-        console.error('❌ [SERVER] Erreur récupération abonnement:', error);
-        res.status(500).json({ error: 'Erreur serveur' });
+      }
+      console.error('❌ [SERVER] Erreur Supabase:', error);
+      return res.status(500).json({ error: 'Erreur base de données' });
     }
+
+    console.log('✅ [SERVER] Abonnement trouvé:', {
+      user_id: userId,
+      plan: subscription.plan,
+      status: subscription.status,
+      period_end: subscription.current_period_end
+    });
+
+    res.json(subscription);
+
+  } catch (error) {
+    console.error('❌ [SERVER] Erreur récupération abonnement:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
 });
 
 
 // ✅ ROUTE POUR DEMANDER LA SUPPRESSION
 app.post('/api/request-account-deletion', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const { email } = req.body;
+  try {
+    const userId = req.user.id;
+    const { email } = req.body;
 
-        console.log('📧 [SERVER] Demande suppression compte user:', userId);
+    console.log('📧 [SERVER] Demande suppression compte user:', userId);
 
-        // Vérifier l'email
-        if (email !== req.user.email) {
-            return res.status(400).json({ error: 'Email incorrect' });
-        }
-
-        // 🔥 GÉNÉRER UN TOKEN DE SUPPRESSION (valide 1h)
-        const deletionToken = jwt.sign(
-            { 
-                user_id: userId,
-                email: email,
-                action: 'delete_account'
-            },
-            process.env.JWT_SECRET,
-            { expiresIn: '1h' }
-        );
-
-        // 🔥 CONSTRUIRE LE LIEN DE CONFIRMATION
-        const confirmationLink = `${process.env.FRONTEND_URL}/confirm-deletion?token=${deletionToken}`;
-
-        // 🔥 ENVOYER L'EMAIL (à implémenter avec ton service d'email)
-        console.log('📧 [SERVER] Lien suppression généré:', confirmationLink);
-        
-        // TODO: Intégrer ton service d'email ici
-        // await sendDeletionEmail(email, confirmationLink);
-
-        res.json({ 
-            success: true, 
-            message: 'Email de confirmation envoyé',
-            link: confirmationLink // Pour les tests
-        });
-
-    } catch (error) {
-        console.error('❌ [SERVER] Erreur demande suppression:', error);
-        res.status(500).json({ error: 'Erreur lors de la demande' });
+    // Vérifier l'email
+    if (email !== req.user.email) {
+      return res.status(400).json({ error: 'Email incorrect' });
     }
+
+    // 🔥 GÉNÉRER UN TOKEN DE SUPPRESSION (valide 1h)
+    const deletionToken = jwt.sign(
+      {
+        user_id: userId,
+        email: email,
+        action: 'delete_account'
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    // 🔥 CONSTRUIRE LE LIEN DE CONFIRMATION
+    const confirmationLink = `${process.env.FRONTEND_URL}/confirm-deletion?token=${deletionToken}`;
+
+    // 🔥 ENVOYER L'EMAIL (à implémenter avec ton service d'email)
+    console.log('📧 [SERVER] Lien suppression généré:', confirmationLink);
+
+    // TODO: Intégrer ton service d'email ici
+    // await sendDeletionEmail(email, confirmationLink);
+
+    res.json({
+      success: true,
+      message: 'Email de confirmation envoyé',
+      link: confirmationLink // Pour les tests
+    });
+
+  } catch (error) {
+    console.error('❌ [SERVER] Erreur demande suppression:', error);
+    res.status(500).json({ error: 'Erreur lors de la demande' });
+  }
 });
 
 // ✅ ROUTE POUR CONFIRMER LA SUPPRESSION (via le lien email)
 // ✅ ROUTE POUR DEMANDER LA SUPPRESSION (VERSION AVEC EDGE FUNCTION)
 // Dans ta route /api/request-account-deletion
 app.post('/api/request-account-deletion', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const { email } = req.body;
+  try {
+    const userId = req.user.id;
+    const { email } = req.body;
 
-        console.log('📧 [SERVER] Demande suppression compte user:', userId);
+    console.log('📧 [SERVER] Demande suppression compte user:', userId);
 
-        // Vérifier l'email
-        if (email !== req.user.email) {
-            return res.status(400).json({ error: 'Email incorrect' });
-        }
-
-        // 🔥 GÉNÉRER UN TOKEN DE SUPPRESSION
-        const deletionToken = jwt.sign(
-            { 
-                user_id: userId,
-                email: email,
-                action: 'delete_account',
-                timestamp: Date.now()
-            },
-            process.env.JWT_SECRET,
-            { expiresIn: '1h' }
-        );
-
-        // 🔥 CONSTRUIRE LE LIEN DE CONFIRMATION
-        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-        const confirmationLink = `${frontendUrl}/confirm-deletion.html?token=${deletionToken}`;
-
-        console.log('🔗 [SERVER] Lien généré:', confirmationLink);
-
-        // 🔥 APPEL EDGE FUNCTION AVEC SERVICE ROLE KEY
-        console.log('📡 [SERVER] Appel Edge Function...');
-        
-        const edgeResponse = await fetch(`${process.env.SUPABASE_URL}/functions/v1/send-deletion-email`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, // ⚠️ SERVICE ROLE KEY
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                user_id: userId,
-                email: email,
-                confirmation_link: confirmationLink
-            })
-        });
-
-        console.log('📡 [SERVER] Réponse Edge Function status:', edgeResponse.status);
-        
-        const edgeResult = await edgeResponse.json();
-        console.log('📡 [SERVER] Réponse Edge Function:', edgeResult);
-
-        if (!edgeResponse.ok) {
-            console.error('❌ [SERVER] Erreur Edge Function:', edgeResult);
-            
-            // ⚠️ MODE SECOURS : Retourner le lien directement
-            return res.json({ 
-                success: true, 
-                message: 'Lien de suppression généré (mode secours)',
-                link: confirmationLink,
-                test_mode: true
-            });
-        }
-
-        console.log('✅ [SERVER] Email envoyé avec succès');
-
-        res.json({ 
-            success: true, 
-            message: 'Email de confirmation envoyé'
-        });
-
-    } catch (error) {
-        console.error('❌ [SERVER] Erreur demande suppression:', error);
-        
-        // ⚠️ MODE SECOURS EN CAS D'ERREUR
-        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-        const confirmationLink = `${frontendUrl}/confirm-deletion.html?token=fallback_${Date.now()}`;
-        
-        res.json({ 
-            success: true, 
-            message: 'Lien de suppression généré (mode erreur)',
-            link: confirmationLink,
-            test_mode: true,
-            error: error.message
-        });
+    // Vérifier l'email
+    if (email !== req.user.email) {
+      return res.status(400).json({ error: 'Email incorrect' });
     }
+
+    // 🔥 GÉNÉRER UN TOKEN DE SUPPRESSION
+    const deletionToken = jwt.sign(
+      {
+        user_id: userId,
+        email: email,
+        action: 'delete_account',
+        timestamp: Date.now()
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    // 🔥 CONSTRUIRE LE LIEN DE CONFIRMATION
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const confirmationLink = `${frontendUrl}/confirm-deletion.html?token=${deletionToken}`;
+
+    console.log('🔗 [SERVER] Lien généré:', confirmationLink);
+
+    // 🔥 APPEL EDGE FUNCTION AVEC SERVICE ROLE KEY
+    console.log('📡 [SERVER] Appel Edge Function...');
+
+    const edgeResponse = await fetch(`${process.env.SUPABASE_URL}/functions/v1/send-deletion-email`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, // ⚠️ SERVICE ROLE KEY
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        user_id: userId,
+        email: email,
+        confirmation_link: confirmationLink
+      })
+    });
+
+    console.log('📡 [SERVER] Réponse Edge Function status:', edgeResponse.status);
+
+    const edgeResult = await edgeResponse.json();
+    console.log('📡 [SERVER] Réponse Edge Function:', edgeResult);
+
+    if (!edgeResponse.ok) {
+      console.error('❌ [SERVER] Erreur Edge Function:', edgeResult);
+
+      // ⚠️ MODE SECOURS : Retourner le lien directement
+      return res.json({
+        success: true,
+        message: 'Lien de suppression généré (mode secours)',
+        link: confirmationLink,
+        test_mode: true
+      });
+    }
+
+    console.log('✅ [SERVER] Email envoyé avec succès');
+
+    res.json({
+      success: true,
+      message: 'Email de confirmation envoyé'
+    });
+
+  } catch (error) {
+    console.error('❌ [SERVER] Erreur demande suppression:', error);
+
+    // ⚠️ MODE SECOURS EN CAS D'ERREUR
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const confirmationLink = `${frontendUrl}/confirm-deletion.html?token=fallback_${Date.now()}`;
+
+    res.json({
+      success: true,
+      message: 'Lien de suppression généré (mode erreur)',
+      link: confirmationLink,
+      test_mode: true,
+      error: error.message
+    });
+  }
 });
 
 // ✅ ROUTE POUR CONFIRMER LA SUPPRESSION (AVEC ARCHIVAGE)
 // ✅ ROUTE POUR CONFIRMER LA SUPPRESSION (AVEC ARCHIVAGE COMPLET)
 app.post('/api/confirm-account-deletion', async (req, res) => {
-    try {
-        const { token } = req.body;
+  try {
+    const { token } = req.body;
 
-        if (!token) {
-            return res.status(400).json({ error: 'Token manquant' });
-        }
+    if (!token) {
+      return res.status(400).json({ error: 'Token manquant' });
+    }
 
-        // 🔥 VÉRIFIER LE TOKEN
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        
-        if (decoded.action !== 'delete_account') {
-            return res.status(400).json({ error: 'Token invalide' });
-        }
+    // 🔥 VÉRIFIER LE TOKEN
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-        const userId = decoded.user_id;
-        const userEmail = decoded.email;
+    if (decoded.action !== 'delete_account') {
+      return res.status(400).json({ error: 'Token invalide' });
+    }
 
-        console.log('🚨 [SERVER] Confirmation suppression user:', userId);
+    const userId = decoded.user_id;
+    const userEmail = decoded.email;
 
-        // 🔥 1. RÉCUPÉRER TOUTES LES DONNÉES POUR ARCHIVAGE
-        const { data: profileData } = await supabaseAdmin
-            .from('profiles')
-            .select(`
+    console.log('🚨 [SERVER] Confirmation suppression user:', userId);
+
+    // 🔥 1. RÉCUPÉRER TOUTES LES DONNÉES POUR ARCHIVAGE
+    const { data: profileData } = await supabaseAdmin
+      .from('profiles')
+      .select(`
                 *,
                 companies (*)
             `)
-            .eq('user_id', userId)
-            .single();
+      .eq('user_id', userId)
+      .single();
 
-        const { data: subscriptionData } = await supabaseAdmin
-            .from('subscriptions')
-            .select('*')
-            .eq('user_id', userId)
-            .single();
+    const { data: subscriptionData } = await supabaseAdmin
+      .from('subscriptions')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
 
-        const { data: companyData } = await supabaseAdmin
-            .from('companies')
-            .select('*')
-            .eq('owner_id', userId)
-            .single();
+    const { data: companyData } = await supabaseAdmin
+      .from('companies')
+      .select('*')
+      .eq('owner_id', userId)
+      .single();
 
-        // 🔥 2. ARCHIVAGE COMPLET
-        const { error: archiveError } = await supabaseAdmin
-            .from('deleted_users_archive')
-            .insert({
-                user_id: userId,
-                email: userEmail,
-                
-                // Données profil
-                profile_data: profileData,
-                first_name: profileData?.first_name,
-                last_name: profileData?.last_name,
-                phone: profileData?.phone,
-                avatar_url: profileData?.avatar_url,
-                company_id: profileData?.company_id,
-                
-                // Données entreprise
-                company_data: companyData,
-                company_legal_name: companyData?.legal_name,
-                company_display_name: companyData?.display_name,
-                
-                // Données abonnement
-                subscription_data: subscriptionData,
-                plan_type: subscriptionData?.plan,
-                subscription_status: subscriptionData?.status,
-                current_period_end: subscriptionData?.current_period_end,
-                stripe_customer_id: subscriptionData?.stripe_customer_id,
-                stripe_subscription_id: subscriptionData?.stripe_subscription_id
-            });
+    // 🔥 2. ARCHIVAGE COMPLET
+    const { error: archiveError } = await supabaseAdmin
+      .from('deleted_users_archive')
+      .insert({
+        user_id: userId,
+        email: userEmail,
 
-        if (archiveError) {
-            console.error('❌ [SERVER] Erreur archivage:', archiveError);
-        }
+        // Données profil
+        profile_data: profileData,
+        first_name: profileData?.first_name,
+        last_name: profileData?.last_name,
+        phone: profileData?.phone,
+        avatar_url: profileData?.avatar_url,
+        company_id: profileData?.company_id,
 
-        // 🔥 3. SUPPRIMER L'ABONNEMENT STRIPE
-        try {
-            if (subscriptionData && subscriptionData.stripe_subscription_id) {
-                await stripe.subscriptions.cancel(subscriptionData.stripe_subscription_id);
-                
-                if (subscriptionData.stripe_customer_id) {
-                    await stripe.customers.del(subscriptionData.stripe_customer_id);
-                }
-            }
-        } catch (stripeError) {
-            console.warn('⚠️ [SERVER] Erreur nettoyage Stripe:', stripeError);
-        }
+        // Données entreprise
+        company_data: companyData,
+        company_legal_name: companyData?.legal_name,
+        company_display_name: companyData?.display_name,
 
-        // 🔥 4. SUPPRESSION DES DONNÉES (dans l'ordre logique)
-        
-        // D'abord supprimer l'entreprise si elle existe
-        if (companyData) {
-            await supabaseAdmin.from('companies').delete().eq('owner_id', userId);
-        }
-        
-        // Puis les abonnements
-        await supabaseAdmin.from('subscriptions').delete().eq('user_id', userId);
-        
-        // Puis le profil
-        await supabaseAdmin.from('profiles').delete().eq('user_id', userId);
+        // Données abonnement
+        subscription_data: subscriptionData,
+        plan_type: subscriptionData?.plan,
+        subscription_status: subscriptionData?.status,
+        current_period_end: subscriptionData?.current_period_end,
+        stripe_customer_id: subscriptionData?.stripe_customer_id,
+        stripe_subscription_id: subscriptionData?.stripe_subscription_id
+      });
 
-        // 🔥 5. SUPPRIMER LE COMPTE AUTH
-        const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(userId);
-
-        if (deleteError) {
-            console.error('❌ [SERVER] Erreur suppression user auth:', deleteError);
-            return res.status(500).json({ error: 'Erreur suppression compte' });
-        }
-
-        console.log('✅ [SERVER] Compte archivé et supprimé user:', userId);
-
-        res.json({ 
-            success: true, 
-            message: 'Compte supprimé définitivement',
-            user_id: userId,
-            archived: true
-        });
-
-    } catch (error) {
-        console.error('❌ [SERVER] Erreur confirmation suppression:', error);
-        
-        if (error.name === 'TokenExpiredError') {
-            return res.status(400).json({ error: 'Lien expiré, veuillez refaire une demande' });
-        }
-        
-        res.status(500).json({ error: 'Erreur lors de la suppression' });
+    if (archiveError) {
+      console.error('❌ [SERVER] Erreur archivage:', archiveError);
     }
+
+    // 🔥 3. SUPPRIMER L'ABONNEMENT STRIPE
+    try {
+      if (subscriptionData && subscriptionData.stripe_subscription_id) {
+        await stripe.subscriptions.cancel(subscriptionData.stripe_subscription_id);
+
+        if (subscriptionData.stripe_customer_id) {
+          await stripe.customers.del(subscriptionData.stripe_customer_id);
+        }
+      }
+    } catch (stripeError) {
+      console.warn('⚠️ [SERVER] Erreur nettoyage Stripe:', stripeError);
+    }
+
+    // 🔥 4. SUPPRESSION DES DONNÉES (dans l'ordre logique)
+
+    // D'abord supprimer l'entreprise si elle existe
+    if (companyData) {
+      await supabaseAdmin.from('companies').delete().eq('owner_id', userId);
+    }
+
+    // Puis les abonnements
+    await supabaseAdmin.from('subscriptions').delete().eq('user_id', userId);
+
+    // Puis le profil
+    await supabaseAdmin.from('profiles').delete().eq('user_id', userId);
+
+    // 🔥 5. SUPPRIMER LE COMPTE AUTH
+    const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(userId);
+
+    if (deleteError) {
+      console.error('❌ [SERVER] Erreur suppression user auth:', deleteError);
+      return res.status(500).json({ error: 'Erreur suppression compte' });
+    }
+
+    console.log('✅ [SERVER] Compte archivé et supprimé user:', userId);
+
+    res.json({
+      success: true,
+      message: 'Compte supprimé définitivement',
+      user_id: userId,
+      archived: true
+    });
+
+  } catch (error) {
+    console.error('❌ [SERVER] Erreur confirmation suppression:', error);
+
+    if (error.name === 'TokenExpiredError') {
+      return res.status(400).json({ error: 'Lien expiré, veuillez refaire une demande' });
+    }
+
+    res.status(500).json({ error: 'Erreur lors de la suppression' });
+  }
 });
 
 // ✅ VÉRIFICATION SERVEUR RENFORCÉE
@@ -1059,7 +1064,6 @@ function extractPageName(fullPath) {
   const fileName = fullPath.split('/').pop() || 'index';
   return fileName.replace('.html', '');
 }
-
 
 
 // ---------------------------
@@ -1904,12 +1908,15 @@ app.post('/api/create-paid-checkout', async (req, res) => {
   console.log('📦 [BACKEND] Body reçu:', JSON.stringify(req.body, null, 2));
 
   try {
-    const { email, first_name, last_name, company_name, company_size, desired_plan } = req.body;
+const { user_id, email, first_name, last_name, company_name, company_size, desired_plan } = req.body;
 
-    if (!email || !desired_plan) {
-      console.log('❌ [BACKEND] Données manquantes');
-      return res.status(400).json({ error: 'Email et abonnement requis' });
-    }
+   if (!user_id || !email || !desired_plan) {
+  console.log('❌ [BACKEND] Données manquantes');
+  return res.status(400).json({ error: 'user_id, email et abonnement requis' });
+}
+console.log('🧾 [BACKEND] user_id reçu:', user_id);
+
+
 
     console.log('🎯 [BACKEND] Plan demandé:', desired_plan);
 
@@ -1927,24 +1934,58 @@ app.post('/api/create-paid-checkout', async (req, res) => {
 
     console.log('🔑 [BACKEND] Price ID utilisé:', priceId);
 
-    // Création session Stripe
-    console.log('🔄 [BACKEND] Création session Stripe...');
-    const session = await stripe.checkout.sessions.create({
-      customer_email: email,
-      line_items: [{ price: priceId, quantity: 1 }],
-      mode: 'subscription',
-      success_url: `${process.env.FRONTEND_URL || 'https://integora-frontend.vercel.app'}/email-sent-paiement.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL || 'https://integora-frontend.vercel.app'}/inscription.html`,
-      metadata: {
-        first_name, last_name, company_name, company_size, desired_plan, user_email: email
-      }
-    });
+    
+// Création session Stripe
+console.log("🔄 [BACKEND] Création session Stripe...");
 
-    console.log('✅ [BACKEND] Session Stripe créée:', session.id);
-    console.log('🔗 [BACKEND] URL Stripe:', session.url);
+// 🔒 Sécurité : Stripe ne doit JAMAIS recevoir undefined
+if (!user_id) throw new Error("user_id manquant");
 
-    res.json({ 
-      checkoutUrl: session.url, 
+const payload = {
+  customer_email: email,
+  line_items: [{ price: priceId, quantity: 1 }],
+  mode: "subscription",
+  success_url: `${process.env.FRONTEND_URL || "https://integora-frontend.vercel.app"}/email-sent-paiement.html?session_id={CHECKOUT_SESSION_ID}`,
+  cancel_url: `${process.env.FRONTEND_URL || "https://integora-frontend.vercel.app"}/inscription.html`,
+
+  // ✅ lien Stripe -> Supabase
+  client_reference_id: String(user_id),
+
+  // ✅ debug + fallback
+  metadata: {
+    user_id: String(user_id),
+    desired_plan,
+    user_email: email,
+    first_name,
+    last_name,
+    company_name,
+    company_size
+  },
+
+  // ✅ CRITIQUE : metadata sur la subscription
+  subscription_data: {
+    metadata: {
+      user_id: String(user_id),
+      desired_plan
+    }
+  }
+};
+
+console.log("🧾 [BACKEND] Payload Stripe =", JSON.stringify(payload, null, 2));
+
+const session = await stripe.checkout.sessions.create(payload);
+
+console.log("✅ Stripe client_reference_id =", session.client_reference_id);
+console.log("✅ Stripe metadata =", session.metadata);
+console.log("✅ [BACKEND] Session Stripe créée:", session.id);
+console.log("🔗 [BACKEND] URL Stripe:", session.url);
+
+
+
+
+
+    res.json({
+      checkoutUrl: session.url,
       sessionId: session.id,
       debug: {
         priceId: priceId,
@@ -1954,9 +1995,9 @@ app.post('/api/create-paid-checkout', async (req, res) => {
 
   } catch (error) {
     console.error('❌ [BACKEND] Erreur Stripe:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Erreur création paiement',
-      details: error.message 
+      details: error.message
     });
   }
 });

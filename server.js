@@ -263,11 +263,12 @@ app.use(cookieParser());
 
 // ==================== FICHIERS STATIQUES PUBLICS ====================
 // ✅ 1. FICHIERS FRONTEND PUBLICS (sans auth)
-if (isProduction) {
-  app.use(express.static(path.join(__dirname, "../frontend")));
-} else {
+if (!isProduction) {
+  // En local uniquement, si tu as vraiment un dossier ../frontend
   app.use(express.static(path.join(__dirname, "../frontend")));
 }
+
+
 
 // ==================== CONFIGURATION CORRIGÉE ====================
 
@@ -406,10 +407,21 @@ app.use(validateCSRF);
 
 
 // Routes principales
-app.get("/", (req, res) => res.sendFile(path.join(__dirname, "../frontend/index.html")));
-app.get("/login", (req, res) => res.sendFile(path.join(__dirname, "../frontend/login.html")));
-app.get("/app/choix_irl_digital.html", authenticateToken, (req, res) => res.sendFile(path.join(__dirname, "../frontend/app/choix_irl_digital.html")));
-app.get("/inscription", (req, res) => res.sendFile(path.join(__dirname, "../frontend/inscription.html")));
+const FRONTEND = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+
+app.get("/", (req, res) => res.redirect(FRONTEND + "/"));
+app.get("/login", (req, res) => res.redirect(FRONTEND + "/login.html"));
+app.get("/inscription", (req, res) => res.redirect(FRONTEND + "/inscription.html"));
+
+
+// Toutes les routes non-API → frontend (évite les ENOENT)
+app.get("*", (req, res) => {
+  if (req.path.startsWith("/api") || req.path === "/verify-token" || req.path === "/login" || req.path === "/inscription") {
+    return res.status(404).json({ error: "Not found" });
+  }
+  const FRONTEND = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+  return res.redirect(FRONTEND + req.originalUrl);
+});
 
 
 

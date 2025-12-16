@@ -1935,6 +1935,50 @@ console.log('🧾 [BACKEND] user_id reçu:', user_id);
     console.log('🔑 [BACKEND] Price ID utilisé:', priceId);
 
     
+// Création session Stripe
+console.log("🔄 [BACKEND] Création session Stripe...");
+
+// 🔒 Sécurité : Stripe ne doit JAMAIS recevoir undefined
+if (!user_id) throw new Error("user_id manquant");
+
+const payload = {
+  customer_email: email,
+  line_items: [{ price: priceId, quantity: 1 }],
+  mode: "subscription",
+  success_url: `${process.env.FRONTEND_URL || "https://integora-frontend.vercel.app"}/email-sent-paiement.html?session_id={CHECKOUT_SESSION_ID}`,
+  cancel_url: `${process.env.FRONTEND_URL || "https://integora-frontend.vercel.app"}/inscription.html`,
+
+  // ✅ lien Stripe -> Supabase
+  client_reference_id: String(user_id),
+
+  // ✅ debug + fallback
+  metadata: {
+    user_id: String(user_id),
+    desired_plan,
+    user_email: email,
+    first_name,
+    last_name,
+    company_name,
+    company_size
+  },
+
+  // ✅ CRITIQUE : metadata sur la subscription
+  subscription_data: {
+    metadata: {
+      user_id: String(user_id),
+      desired_plan
+    }
+  }
+};
+
+console.log("🧾 [BACKEND] Payload Stripe =", JSON.stringify(payload, null, 2));
+
+const session = await stripe.checkout.sessions.create(payload);
+
+console.log("✅ Stripe client_reference_id =", session.client_reference_id);
+console.log("✅ Stripe metadata =", session.metadata);
+console.log("✅ [BACKEND] Session Stripe créée:", session.id);
+console.log("🔗 [BACKEND] URL Stripe:", session.url);
 
 
 

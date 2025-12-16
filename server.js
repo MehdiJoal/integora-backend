@@ -339,22 +339,51 @@ app.get("/app/*", authenticateToken, (req, res) => {
 
 
 // → 1. S'assurer qu'un token existe en cookie lisible
-function ensureCsrfToken(req, res, next) {
-  if (!req.cookies['XSRF-TOKEN']) {
-    const token = generateCSRFToken();
-    res.cookie('XSRF-TOKEN', token, {
-      httpOnly: false,                 // lisible par le navigateur
-      sameSite: 'lax',
-      secure: process.env.NODE_ENV === 'production',
-      path: '/',
-      maxAge: 8 * 60 * 60 * 1000       // 8h
+// 1) créer pending (avec expires_at + gestion d'un pending existant)
+const nowIso = new Date().toISOString();
+const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(); // 2h
+
+// Si un pending "encore valide" existe déjà pour cet email, on le réutilise
+const { data: existingPending } = await supabaseAdmin
+  .from("pending_signups")
+  .select("*")
+  .eq("email", emailNorm)
+  .eq("status", "pending")
+  .gt("expires_at", nowIso)
+  .order("created_at", { ascending: false })
+  .limit(1)
+  .maybeSingle();
+
+let pending = existingPending;
+
+if (!pending) {
+  const { data: created, error: pendingErr } = await supabaseAdmin
+    .from("pending_signups")
+    .insert([{
+      email: emailNorm,
+      first_name: first_name ?? null,
+      last_name: last_name ?? null,
+      company_name: company_name ?? null,
+      company_size: company_size ?? null,
+      desired_plan,
+      status: "pending",
+      expires_at: expiresAt
+    }])
+    .select("*")
+    .single();
+
+  if (pendingErr || !created) {
+    console.error("❌ pending_signups insert error:", pendingErr);
+    return res.status(500).json({
+      error: "Impossible de créer pending_signup",
+      details: pendingErr
     });
-    res.setHeader('X-CSRF-Token', token);
-  } else {
-    res.setHeader('X-CSRF-Token', req.cookies['XSRF-TOKEN']);
   }
-  next();
+
+  pending = created;
 }
+
+const pending_id = pending.id;
 
 // → 2. Vérifier le token pour les méthodes mutantes
 function validateCSRF(req, res, next) {
@@ -531,29 +560,6 @@ app.get("/:page", authenticateToken, async (req, res) => {
 // ---------------------------
 
 // server.js - AJOUTE CE MIDDLEWARE CORS COMPLET
-// ✅ CORRECTION CORS COMPLÈTE POUR PRODUCTION
-app.use((req, res, next) => {
-  const allowedOrigins = [
-    'http://localhost:3000',
-    'https://integora-frontend.vercel.app'
-  ];
-
-  const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-  }
-
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, x-csrf-token');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Credentials', 'true');
-
-  // Répondre immédiatement aux preflight OPTIONS
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  next();
-});
 
 
 
@@ -817,53 +823,9 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
 });
 
 
-// ✅ ROUTE POUR DEMANDER LA SUPPRESSION
-app.post('/api/request-account-deletion', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { email } = req.body;
 
-    console.log('📧 [SERVER] Demande suppression compte user:', userId);
-
-    // Vérifier l'email
-    if (email !== req.user.email) {
-      return res.status(400).json({ error: 'Email incorrect' });
-    }
-
-    // 🔥 GÉNÉRER UN TOKEN DE SUPPRESSION (valide 1h)
-    const deletionToken = jwt.sign(
-      {
-        user_id: userId,
-        email: email,
-        action: 'delete_account'
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: '1h' }
-    );
-
-    // 🔥 CONSTRUIRE LE LIEN DE CONFIRMATION
-    const confirmationLink = `${process.env.FRONTEND_URL}/confirm-deletion?token=${deletionToken}`;
-
-    // 🔥 ENVOYER L'EMAIL (à implémenter avec ton service d'email)
-    console.log('📧 [SERVER] Lien suppression généré:', confirmationLink);
-
-    // TODO: Intégrer ton service d'email ici
-    // await sendDeletionEmail(email, confirmationLink);
-
-    res.json({
-      success: true,
-      message: 'Email de confirmation envoyé',
-      link: confirmationLink // Pour les tests
-    });
-
-  } catch (error) {
-    console.error('❌ [SERVER] Erreur demande suppression:', error);
-    res.status(500).json({ error: 'Erreur lors de la demande' });
-  }
-});
 
 // ✅ ROUTE POUR CONFIRMER LA SUPPRESSION (via le lien email)
-// ✅ ROUTE POUR DEMANDER LA SUPPRESSION (VERSION AVEC EDGE FUNCTION)
 // Dans ta route /api/request-account-deletion
 app.post('/api/request-account-deletion', authenticateToken, async (req, res) => {
   try {
@@ -1802,126 +1764,6 @@ app.get("/api/user-info", authenticateToken, (req, res) => {
   });
 });
 
-// ---------------------------
-// INSCRIPTION (via Supabase Auth)
-// ---------------------------
-// 📌 INSCRIPTION - Version CORRIGÉE
-app.post("/inscription", async (req, res) => {
-  // ✅ CORRECTION 1: Ajouter company_name et company_size
-  const { first_name, last_name, email, password, confirm_password, company_name, company_size } = req.body;
-
-  // ✅ CORRECTION 2: Valider company_name aussi
-  if (!first_name || !last_name || !email || !password || !company_name) {
-    return res.status(400).json({ error: "Tous les champs sont requis." });
-  }
-  if (password !== confirm_password) {
-    return res.status(400).json({ error: "Les mots de passe ne correspondent pas." });
-  }
-
-  try {
-    // 1. Créer l'utilisateur dans Supabase Auth
-    const { data: authData, error: authError } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: {
-          first_name,
-          last_name,
-          company_name, // ✅ Ces données vont dans les metadata Auth
-          company_size
-        }
-      }
-    });
-
-    if (authError) {
-      if (authError.message.includes("already registered")) {
-        return res.status(400).json({ error: "Cet email est déjà utilisé." });
-      }
-      return res.status(400).json({ error: authError.message });
-    }
-
-    if (!authData.user) {
-      return res.status(500).json({ error: "Erreur création utilisateur." });
-    }
-
-    // ✅ CORRECTION 3: Définir userId proprement
-    const userId = authData.user.id;
-
-    // ✅ 2. CRÉATION DE L'ENTREPRISE 
-    const { data: companyData, error: companyError } = await supabase
-      .from("companies")
-      .insert([
-        {
-          legal_name: company_name, // ✅ company_name est maintenant défini
-          display_name: company_name,
-          owner_id: userId, // ✅ userId est maintenant défini
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
-
-    let companyId = null;
-    if (companyError) {
-      console.error("❌ Erreur création entreprise:", companyError);
-      // On continue quand même, l'entreprise pourra être créée plus tard
-    } else {
-      companyId = companyData.id;
-      console.log("✅ Entreprise créée:", companyId);
-    }
-
-    // 3. Créer le profil dans la table profiles AVEC company_id
-    const { error: profileError } = await supabase
-      .from("profiles")
-      .insert([
-        {
-          user_id: userId,
-          first_name: first_name,
-          last_name: last_name,
-          company_id: companyId, // ✅ Lien vers l'entreprise
-          created_at: new Date().toISOString()
-        }
-      ]);
-
-    if (profileError) {
-      console.error("❌ Erreur création profil:", profileError);
-    } else {
-      console.log("✅ Profil créé avec company_id:", companyId);
-    }
-
-    // 4. Créer un abonnement trial
-    const { error: subscriptionError } = await supabase
-      .from("subscriptions")
-      .insert([
-        {
-          user_id: userId,
-          plan: 'trial',
-          status: 'trialing',
-          trial_end: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-          created_at: new Date().toISOString()
-        }
-      ]);
-
-    if (subscriptionError) {
-      console.error("❌ Erreur création abonnement:", subscriptionError);
-    } else {
-      console.log("✅ Abonnement trial créé");
-    }
-
-    res.status(200).json({
-      success: true,
-      redirect: "/app/choix_irl_digital.html",
-      message: "Inscription réussie ! Vérifiez votre email pour confirmer votre compte.",
-      user_id: userId,
-      company_id: companyId
-    });
-
-  } catch (error) {
-    console.error("💥 Erreur inscription:", error);
-    res.status(500).json({ error: "Erreur serveur lors de l'inscription." });
-  }
-});
 
 
 

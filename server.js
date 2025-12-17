@@ -1094,33 +1094,10 @@ app.post("/api/security/email-change-requested", authenticateToken, async (req, 
     if (!oldEmail) return res.status(400).json({ error: "Email actuel introuvable." });
     if (!newEmail) return res.status(400).json({ error: "newEmail manquant." });
 
-    const safeOld = escapeHtml(oldEmail);
-    const safeNew = escapeHtml(newEmail);
-
     const subject = "Sécurité INTEGORA — Demande de changement d’email";
-    const html = `
-      <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
-        <h2 style="margin:0 0 12px">Demande de changement d’email</h2>
-        <p>Une demande de changement d’email a été initiée sur votre compte INTEGORA.</p>
-        <p><b>Email actuel :</b> ${safeOld}<br/>
-           <b>Nouvel email demandé :</b> ${safeNew}</p>
-        <p style="margin-top:16px">
-          Si vous êtes à l’origine de cette demande, vous pouvez ignorer cet email.
-          <br/>
-          Si ce n’est pas vous, nous vous conseillons de <b>changer immédiatement votre mot de passe</b>.
-        </p>
-        <hr style="border:none;border-top:1px solid #eee;margin:18px 0" />
-        <p style="font-size:12px;color:#666;margin:0">
-          Email automatique — ne pas répondre.
-        </p>
-      </div>
-    `;
+    const html = buildEmailChangeRequestedHtml({ oldEmail, newEmail });
 
     await sendResendEmail({ to: oldEmail, subject, html });
-
-    // Optionnel : informer aussi la nouvelle adresse (si tu veux)
-    // await sendResendEmail({ to: newEmail, subject: "INTEGORA — Confirmation à venir", html: ... });
-
     return res.json({ ok: true });
   } catch (e) {
     console.error("❌ /api/security/email-change-requested:", e);
@@ -1128,37 +1105,115 @@ app.post("/api/security/email-change-requested", authenticateToken, async (req, 
   }
 });
 
-// ✅ Alerte : mot de passe modifié (envoie sur l'email actuel)
+// ✅ Alerte : mot de passe modifié (mail sécurité, SANS déconnexion)
 app.post("/api/security/password-changed", authenticateToken, async (req, res) => {
   try {
     const email = (req.user.email || "").toLowerCase();
     if (!email) return res.status(400).json({ error: "Email introuvable." });
 
     const subject = "Sécurité INTEGORA — Mot de passe modifié";
-    const html = `
-      <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
-        <h2 style="margin:0 0 12px">Mot de passe modifié</h2>
-        <p>Le mot de passe de votre compte INTEGORA vient d’être modifié.</p>
-        <p style="margin-top:16px">
-          Si vous êtes à l’origine de ce changement, vous pouvez ignorer cet email.
-          <br/>
-          Si ce n’est pas vous : <b>réinitialisez votre mot de passe immédiatement</b>.
-        </p>
-        <hr style="border:none;border-top:1px solid #eee;margin:18px 0" />
-        <p style="font-size:12px;color:#666;margin:0">
-          Email automatique — ne pas répondre.
-        </p>
-      </div>
-    `;
+    const html = buildPasswordChangedEmailHtml({
+      firstName: req.user.first_name,
+      ip: (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip,
+      userAgent: req.headers["user-agent"],
+    });
 
     await sendResendEmail({ to: email, subject, html });
-
     return res.json({ ok: true });
   } catch (e) {
     console.error("❌ /api/security/password-changed:", e);
     return res.status(500).json({ error: "Erreur envoi email sécurité", details: e.message });
   }
 });
+
+function buildEmailChangeRequestedHtml({ oldEmail, newEmail }) {
+  const safeOld = escapeHtml(oldEmail);
+  const safeNew = escapeHtml(newEmail);
+
+  const resetStartUrl = "https://integora.fr/app/forgot-password.html";
+  const supportUrl = "https://integora.fr/contact";
+
+  return `
+    <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
+      <h2 style="margin:0 0 12px">Sécurité INTEGORA — Demande de changement d’email</h2>
+
+      <p>Une demande de changement d’email a été initiée sur votre compte INTEGORA.</p>
+
+      <p>
+        <b>Email actuel :</b> ${safeOld}<br/>
+        <b>Nouvel email demandé :</b> ${safeNew}
+      </p>
+
+      <div style="margin:14px 0;padding:12px;border:1px solid #eee;border-radius:10px;background:#fafafa">
+        <p style="margin:0 0 6px"><b>Si c’est bien vous</b> : vous pouvez ignorer cet email.</p>
+        <p style="margin:0"><b>Si ce n’était pas vous</b> :</p>
+        <ol style="margin:8px 0 0 18px;padding:0">
+          <li>Réinitialisez votre mot de passe immédiatement</li>
+          <li>Contactez le support</li>
+        </ol>
+      </div>
+
+      <p style="margin:16px 0">
+        <a href="${resetStartUrl}"
+           style="display:inline-block;padding:12px 16px;background:#111;color:#fff;text-decoration:none;border-radius:10px">
+          Ce n’était pas moi → Réinitialiser mon mot de passe
+        </a>
+      </p>
+
+      <p style="margin:0 0 10px">
+        <a href="${supportUrl}">Contacter le support</a>
+      </p>
+
+      <hr style="border:none;border-top:1px solid #eee;margin:18px 0" />
+      <p style="font-size:12px;color:#666;margin:0">Email automatique — ne pas répondre.</p>
+    </div>
+  `;
+}
+
+function buildPasswordChangedEmailHtml({ firstName, ip, userAgent }) {
+  const safeName = escapeHtml(firstName || "");
+  const safeIp = escapeHtml(ip || "-");
+  const safeUa = escapeHtml(userAgent || "-");
+
+  const resetStartUrl = "https://integora.fr/app/forgot-password.html";
+  const supportUrl = "https://integora.fr/contact";
+
+  return `
+    <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
+      <h2 style="margin:0 0 12px">Sécurité INTEGORA — Mot de passe modifié</h2>
+
+      <p>Bonjour${safeName ? ` ${safeName}` : ""},</p>
+
+      <p>Le mot de passe de votre compte INTEGORA vient d’être modifié.</p>
+
+      <div style="margin:14px 0;padding:12px;border:1px solid #eee;border-radius:10px;background:#fafafa">
+        <p style="margin:0 0 6px"><b>Si c’est bien vous</b> : aucune action n’est nécessaire.</p>
+        <p style="margin:0"><b>Si ce n’était pas vous</b> :</p>
+        <ol style="margin:8px 0 0 18px;padding:0">
+          <li>Réinitialisez immédiatement votre mot de passe</li>
+          <li>Contactez le support si besoin</li>
+        </ol>
+      </div>
+
+      <p style="margin:16px 0">
+        <a href="${resetStartUrl}"
+           style="display:inline-block;padding:12px 16px;background:#111;color:#fff;text-decoration:none;border-radius:10px">
+          Ce n’était pas moi → Réinitialiser mon mot de passe
+        </a>
+      </p>
+
+      <p style="margin:0 0 10px">
+        <a href="${supportUrl}">Contacter le support</a>
+      </p>
+
+      <hr style="border:none;border-top:1px solid #eee;margin:18px 0" />
+      <p style="font-size:12px;color:#666;margin:0">
+        Détails (indicatifs) : IP ${safeIp} • ${safeUa}<br/>
+        Email automatique — ne pas répondre.
+      </p>
+    </div>
+  `;
+}
 
 
 // ✅ VÉRIFICATION SERVEUR RENFORCÉE

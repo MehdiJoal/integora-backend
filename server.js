@@ -34,6 +34,51 @@ const { createClient } = require('@supabase/supabase-js');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 
+
+// ==========================================
+// 📧 RESEND (emails sécurité)
+// ==========================================
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const RESEND_FROM = process.env.RESEND_FROM || "INTEGORA <noreply@integora.fr>";
+
+async function sendResendEmail({ to, subject, html }) {
+  if (!RESEND_API_KEY) {
+    console.warn("⚠️ RESEND_API_KEY manquante : email non envoyé.");
+    return { skipped: true, reason: "missing_resend_api_key" };
+  }
+
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM,
+      to: Array.isArray(to) ? to : [to],
+      subject,
+      html,
+    }),
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const msg = data?.message || data?.error || JSON.stringify(data);
+    throw new Error(`Resend error: ${resp.status} ${msg}`);
+  }
+  return data;
+}
+
+function escapeHtml(s = "") {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+
 // ==========================================
 // ⚙️ CONFIGURATION
 // ==========================================
@@ -1028,6 +1073,87 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
     res.status(500).json({ error: 'Erreur lors de la suppression' });
   }
 });
+
+
+// ==========================================
+// 🔐 SECURITY EMAILS (Resend)
+// ==========================================
+
+// ✅ Alerte : demande de changement d'email (envoie sur l'ancien email)
+app.post("/api/security/email-change-requested", authenticateToken, async (req, res) => {
+  try {
+    const oldEmail = (req.user.email || "").toLowerCase();
+    const newEmail = (req.body?.newEmail || "").trim().toLowerCase();
+
+    if (!oldEmail) return res.status(400).json({ error: "Email actuel introuvable." });
+    if (!newEmail) return res.status(400).json({ error: "newEmail manquant." });
+
+    const safeOld = escapeHtml(oldEmail);
+    const safeNew = escapeHtml(newEmail);
+
+    const subject = "Sécurité INTEGORA — Demande de changement d’email";
+    const html = `
+      <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
+        <h2 style="margin:0 0 12px">Demande de changement d’email</h2>
+        <p>Une demande de changement d’email a été initiée sur votre compte INTEGORA.</p>
+        <p><b>Email actuel :</b> ${safeOld}<br/>
+           <b>Nouvel email demandé :</b> ${safeNew}</p>
+        <p style="margin-top:16px">
+          Si vous êtes à l’origine de cette demande, vous pouvez ignorer cet email.
+          <br/>
+          Si ce n’est pas vous, nous vous conseillons de <b>changer immédiatement votre mot de passe</b>.
+        </p>
+        <hr style="border:none;border-top:1px solid #eee;margin:18px 0" />
+        <p style="font-size:12px;color:#666;margin:0">
+          Email automatique — ne pas répondre.
+        </p>
+      </div>
+    `;
+
+    await sendResendEmail({ to: oldEmail, subject, html });
+
+    // Optionnel : informer aussi la nouvelle adresse (si tu veux)
+    // await sendResendEmail({ to: newEmail, subject: "INTEGORA — Confirmation à venir", html: ... });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ /api/security/email-change-requested:", e);
+    return res.status(500).json({ error: "Erreur envoi email sécurité", details: e.message });
+  }
+});
+
+// ✅ Alerte : mot de passe modifié (envoie sur l'email actuel)
+app.post("/api/security/password-changed", authenticateToken, async (req, res) => {
+  try {
+    const email = (req.user.email || "").toLowerCase();
+    if (!email) return res.status(400).json({ error: "Email introuvable." });
+
+    const subject = "Sécurité INTEGORA — Mot de passe modifié";
+    const html = `
+      <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
+        <h2 style="margin:0 0 12px">Mot de passe modifié</h2>
+        <p>Le mot de passe de votre compte INTEGORA vient d’être modifié.</p>
+        <p style="margin-top:16px">
+          Si vous êtes à l’origine de ce changement, vous pouvez ignorer cet email.
+          <br/>
+          Si ce n’est pas vous : <b>réinitialisez votre mot de passe immédiatement</b>.
+        </p>
+        <hr style="border:none;border-top:1px solid #eee;margin:18px 0" />
+        <p style="font-size:12px;color:#666;margin:0">
+          Email automatique — ne pas répondre.
+        </p>
+      </div>
+    `;
+
+    await sendResendEmail({ to: email, subject, html });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ /api/security/password-changed:", e);
+    return res.status(500).json({ error: "Erreur envoi email sécurité", details: e.message });
+  }
+});
+
 
 // ✅ VÉRIFICATION SERVEUR RENFORCÉE
 function extractPageName(fullPath) {

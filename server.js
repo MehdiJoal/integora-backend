@@ -330,8 +330,6 @@ app.use("/app/*", (req, res, next) => {
   if (req.path.match(/\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|mp4|webm)$/)) {
     return next();
 
-
-    return next(); // → express.static s'en occupe
   }
   // Pour les HTML, APPLIQUER L'AUTH
   return authenticateToken(req, res, next);
@@ -675,72 +673,80 @@ async function getActiveSubscription(userId) {
 
 // Middleware d'authentification
 // server.js - NOUVELLE VERSION authenticateToken
-async function authenticateToken(req, res, next) {
-
-  // UNIQUEMENT le cookie
+async function resolveUserFromCookie(req) {
   const token = req.cookies?.auth_token;
+  if (!token) throw new Error("NO_TOKEN");
 
-  if (!token) {
-    return handleUnauthorized(req, res);
-  }
+  // 1) JWT
+  const decoded = jwt.verify(token, SECRET_KEY);
 
+  // 2) Session DB
+  const tokenHash = hashToken(token);
+
+  const { data: session, error: sessionError } = await supabaseAdmin
+    .from("token_sessions")
+    .select("user_id, expires_at, is_active, revoked_at")
+    .eq("token_hash", tokenHash)
+    .eq("user_id", decoded.id)
+    .eq("is_active", true)
+    .is("revoked_at", null)
+    .gt("expires_at", new Date().toISOString())
+    .single();
+
+  if (sessionError || !session) throw new Error("INVALID_SESSION");
+
+  // tracking (non bloquant)
+  supabaseAdmin
+    .from("token_sessions")
+    .update({ last_seen_at: new Date().toISOString() })
+    .eq("token_hash", tokenHash)
+    .eq("user_id", decoded.id)
+    .then(() => {})
+    .catch(() => {});
+
+  // 3) Profil + abo
+  const [profileResult, subscriptionResult] = await Promise.all([
+    supabase
+      .from("profiles")
+      .select("first_name, last_name, company_id, avatar_url")
+      .eq("user_id", decoded.id)
+      .single(),
+    getActiveSubscription(decoded.id),
+  ]);
+
+  if (profileResult.error || !profileResult.data) throw new Error("PROFILE_NOT_FOUND");
+
+  return {
+    id: decoded.id,
+    email: decoded.email,
+    first_name: profileResult.data.first_name,
+    last_name: profileResult.data.last_name,
+    company_id: profileResult.data.company_id,
+    avatar_url: profileResult.data.avatar_url,
+    subscription_type: subscriptionResult.plan,
+    has_active_subscription: subscriptionResult.hasActiveSubscription,
+  };
+}
+
+async function authenticateToken(req, res, next) {
   try {
-    // 1. VÉRIFICATION JWT EN PREMIER (signature + expiration)
-    const decoded = jwt.verify(token, SECRET_KEY);
+    req.user = await resolveUserFromCookie(req);
 
-    // 2. VÉRIFICATION SESSION EN BASE (liée au user_id du JWT)
-    const tokenHash = hashToken(token);
-    const { data: session, error: sessionError } = await supabase
-      .from("token_sessions")
-      .select("user_id, expires_at, is_active, revoked_at")
-      .eq("token_hash", tokenHash)
-      .eq("user_id", decoded.id) // ← CRITIQUE : lien direct JWT → Session
-      .eq("is_active", true)
-      .is("revoked_at", null)
-      .gt("expires_at", new Date().toISOString())
-      .single();
-
-    if (sessionError || !session) {
-      throw new Error("Session invalide");
-    }
-
-    // 3. RÉCUPÉRATION PROFIL + ABONNEMENT
-    const [profileResult, subscriptionResult] = await Promise.all([
-      supabase
-        .from("profiles")
-        .select("first_name, last_name, company_id, avatar_url")
-        .eq("user_id", decoded.id)
-        .single(),
-      getActiveSubscription(decoded.id)
-    ]);
-
-    if (profileResult.error) {
-      throw new Error("Profil non trouvé");
-    }
-
-    // 4. CONSTRUCTION USER OBJECT
-    req.user = {
-      id: decoded.id,
-      email: decoded.email,
-      first_name: profileResult.data.first_name,
-      last_name: profileResult.data.last_name,
-      company_id: profileResult.data.company_id,
-      avatar_url: profileResult.data.avatar_url,
-      subscription_type: subscriptionResult.plan, // ← Plan réel (standard/premium/trial)
-      has_active_subscription: subscriptionResult.hasActiveSubscription // ← Booléen séparé
-    };
-
-    console.log('✅ AUTH RÉUSSIE - User:', req.user.email,
-      'Plan:', req.user.subscription_type,
-      'Actif:', req.user.has_active_subscription);
-
+    console.log(
+      "✅ AUTH RÉUSSIE - User:",
+      req.user.email,
+      "Plan:",
+      req.user.subscription_type,
+      "Actif:",
+      req.user.has_active_subscription
+    );
 
     next();
-
   } catch (error) {
     handleAuthenticationError(req, res, error);
   }
 }
+
 
 // Fonctions utilitaires
 function handleUnauthorized(req, res) {
@@ -1277,13 +1283,13 @@ app.post("/login", async (req, res) => {
     // ✅ 5. COOKIE
     const isProd = process.env.NODE_ENV === "production";
 
-res.cookie("auth_token", token, {
-  httpOnly: true,
-  secure: isProd,                 // ✅ obligatoire si SameSite=None
-  sameSite: isProd ? "none" : "lax", // ✅ cross-site en prod
-  maxAge: 24 * 60 * 60 * 1000,
-  path: "/",
-});
+    res.cookie("auth_token", token, {
+      httpOnly: true,
+      secure: isProd,                 // ✅ obligatoire si SameSite=None
+      sameSite: isProd ? "none" : "lax", // ✅ cross-site en prod
+      maxAge: 24 * 60 * 60 * 1000,
+      path: "/",
+    });
 
 
     console.log('✅ Cookie set pour:', email);
@@ -1391,91 +1397,14 @@ app.post("/test-cookie", (req, res) => {
 // 📌 VÉRIFICATION DU TOKEN
 // server.js - NOUVELLE VERSION /verify-token
 app.post("/verify-token", async (req, res) => {
-
   try {
-    const token = req.cookies?.auth_token;
-
-
-    if (!token) {
-      console.log('❌ [Verify-Token] Aucun token trouvé');
-      return res.json({ valid: false });
-    }
-
-    // 1. Vérifier le JWT
-    const decoded = jwt.verify(token, SECRET_KEY);
-    console.log('✅ [Verify-Token] JWT valide pour:', decoded.email);
-
-    let user_id = decoded.id;
-    let sessionValid = false;
-
-    // 2. ESSAYER de vérifier la session (optionnel)
-    try {
-      const tokenHash = hashToken(token);
-      const { data: session, error: sessionError } = await supabase
-        .from("token_sessions")
-        .select("user_id, expires_at, is_active")
-        .eq("token_hash", tokenHash)
-        .eq("is_active", true)
-        .single();
-
-      if (!sessionError && session) {
-        // Vérifier l'expiration
-        const now = new Date();
-        const expiresAt = new Date(session.expires_at);
-        if (now <= expiresAt) {
-          user_id = session.user_id;
-          sessionValid = true;
-          console.log('✅ [Verify-Token] Session VALIDE');
-
-          // Mettre à jour last_seen_at
-          await supabase
-            .from("token_sessions")
-            .update({ last_seen_at: new Date().toISOString() })
-            .eq("token_hash", tokenHash);
-        } else {
-          console.log('⚠️ [Verify-Token] Session expirée');
-        }
-      } else {
-      }
-    } catch (sessionError) {
-    }
-
-    // 3. Récupérer le profil
-    const { data: profile, error: profileError } = await supabase
-      .from("profiles")
-      .select("first_name, last_name, company_id, avatar_url")
-      .eq("user_id", user_id)
-      .single();
-
-    if (profileError) {
-      console.log('❌ [Verify-Token] Profil non trouvé:', profileError.message);
-      return res.json({ valid: false });
-    }
-
-    // 4. Récupérer l'abonnement
-    const subscription = await getActiveSubscription(user_id);
-
-    console.log('✅ [Verify-Token] Auth VALIDE pour:', decoded.email, '- Session:', sessionValid);
-
-    res.json({
-      valid: true,
-      user: {
-        id: user_id,
-        email: decoded.email,
-        first_name: profile.first_name,
-        last_name: profile.last_name,
-        company_id: profile.company_id,
-        avatar_url: profile.avatar_url,
-        subscription_type: subscription.plan,
-        has_active_subscription: subscription.hasActiveSubscription
-      }
-    });
-
+    const user = await resolveUserFromCookie(req);
+    return res.json({ valid: true, user });
   } catch (error) {
-    console.log('❌ [Verify-Token] Erreur:', error.message);
-    res.json({ valid: false });
+    return res.json({ valid: false });
   }
 });
+
 
 // 🧪 TEST SERVICE ROLE
 app.get('/api/test-service-role', async (req, res) => {

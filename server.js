@@ -1227,8 +1227,8 @@ app.post("/login", async (req, res) => {
     console.log("🔐 /login OK", {
   userId: authData?.user?.id,
   email: authData?.user?.email,
-  sessionUserId: sessionData?.user_id,
 });
+
 
 
     if (authError) {

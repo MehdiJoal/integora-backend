@@ -701,8 +701,8 @@ async function resolveUserFromCookie(req) {
     .update({ last_seen_at: new Date().toISOString() })
     .eq("token_hash", tokenHash)
     .eq("user_id", decoded.id)
-    .then(() => {})
-    .catch(() => {});
+    .then(() => { })
+    .catch(() => { });
 
   // 3) Profil + abo
   const [profileResult, subscriptionResult] = await Promise.all([
@@ -1130,7 +1130,7 @@ function buildEmailChangeRequestedHtml({ oldEmail, newEmail }) {
   const safeOld = escapeHtml(oldEmail);
   const safeNew = escapeHtml(newEmail);
 
-const resetStartUrl ="https://integora-frontend.vercel.app/forgot-password.html";
+  const resetStartUrl = "https://integora-frontend.vercel.app/forgot-password.html";
   const supportUrl = "https://integora.fr/contact";
 
   return `
@@ -1175,8 +1175,8 @@ function buildPasswordChangedEmailHtml({ firstName, ip, userAgent }) {
   const safeIp = escapeHtml(ip || "-");
   const safeUa = escapeHtml(userAgent || "-");
 
-  
-const resetStartUrl ="https://integora-frontend.vercel.app/forgot-password.html";
+
+  const resetStartUrl = "https://integora-frontend.vercel.app/forgot-password.html";
   const supportUrl = "https://integora.fr/contact";
 
   return `
@@ -1207,8 +1207,8 @@ const resetStartUrl ="https://integora-frontend.vercel.app/forgot-password.html"
 
             <div style="color:#ffffff;font-weight:700;margin-bottom:6px;">Si ce n’était pas vous</div>
             <ol style="margin:0 0 0 18px;padding:0;">
-              <li>Réinitialisez immédiatement votre mot de passe</li>
-              <li>Contactez le support si besoin</li>
+              <li>Lancez immédiatement une demande de changement de mot de passe via votre adresse e-mail</li>
+              <li>Contactez notre support si vous observez une activité inhabituelle</li>
             </ol>
           </div>
 
@@ -1217,7 +1217,7 @@ const resetStartUrl ="https://integora-frontend.vercel.app/forgot-password.html"
               style="display:inline-block;padding:14px 18px;border-radius:999px;
                      background:linear-gradient(90deg,#7c3aed,#a855f7);
                      color:#ffffff;text-decoration:none;font-weight:800;">
-              🔒 Réinitialiser mon mot de passe
+              🔒 Sécuriser mon compte
             </a>
           </div>
 

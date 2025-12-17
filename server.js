@@ -297,44 +297,6 @@ app.use(cookieParser());
 app.use(express.json({ limit: '10kb' })); // Limite taille JSON
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
-app.use((req, res, next) => {
-  if (req.path === "/verify-token" || req.path.startsWith("/api")) {
-    const token = req.cookies?.auth_token;
-
-    console.log("🧪 Debug request", {
-      path: req.path,
-      hasAuthCookie: !!token,
-      cookieKeys: Object.keys(req.cookies || {}),
-      origin: req.headers.origin,
-      hasCookieHeader: !!req.headers.cookie,
-    });
-
-    if (token) {
-      try {
-        const decoded = jwt.verify(token, SECRET_KEY);
-        console.log("✅ token decoded", { userId: decoded?.id, email: decoded?.email });
-      } catch (e) {
-        console.log("❌ token invalid", e.message);
-      }
-    }
-  }
-
-  next();
-});
-
-
-
-app.use((req, res, next) => {
-  if (req.path.startsWith("/api") || req.path === "/verify-token" || req.path === "/login" || req.path === "/logout") {
-    console.log(`➡️ ${req.method} ${req.path}`, {
-      origin: req.headers.origin,
-      hasCookieHeader: !!req.headers.cookie,
-      cookieKeys: Object.keys(req.cookies || {}),
-    });
-  }
-  next();
-});
-
 
 // Appliquer les limiteurs
 // app.use(globalLimiter);
@@ -1223,13 +1185,6 @@ app.post("/login", async (req, res) => {
       email,
       password,
     });
-
-    console.log("🔐 /login OK", {
-  userId: authData?.user?.id,
-  email: authData?.user?.email,
-});
-
-
 
     if (authError) {
       console.log('❌ Erreur auth:', authError.message);

@@ -1130,7 +1130,7 @@ function buildEmailChangeRequestedHtml({ oldEmail, newEmail }) {
   const safeOld = escapeHtml(oldEmail);
   const safeNew = escapeHtml(newEmail);
 
-  const resetStartUrl = "https://integora.fr/app/forgot-password.html";
+const resetStartUrl = "https://integora.fr/forgot-password.html";
   const supportUrl = "https://integora.fr/contact";
 
   return `
@@ -1176,7 +1176,7 @@ function buildPasswordChangedEmailHtml({ firstName, ip, userAgent }) {
   const safeUa = escapeHtml(userAgent || "-");
 
   
-  const resetStartUrl = "https://integora.fr/app/forgot-password.html";
+const resetStartUrl = "https://integora.fr/forgot-password.html";
   const supportUrl = "https://integora.fr/contact";
 
   return `

@@ -858,6 +858,89 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
 });
 
 
+// ==========================================
+// 💳 STATUS MOYEN DE PAIEMENT (Stripe Truth)
+// Retourne hasPaymentMethod true/false
+// ==========================================
+app.get("/api/payment-method/status", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data: sub, error } = await supabaseAdmin
+      .from("subscriptions")
+      .select("stripe_customer_id, stripe_subscription_id")
+      .eq("user_id", userId)
+      .single();
+
+    if (error || !sub?.stripe_customer_id) {
+      return res.status(404).json({
+        hasPaymentMethod: false,
+        reason: "no_customer",
+      });
+    }
+
+    // Stripe truth
+    const customer = await stripe.customers.retrieve(sub.stripe_customer_id);
+
+    // Optionnel : regarde aussi la subscription (certaines configs mettent default PM au niveau subscription)
+    let subscriptionDefaultPm = null;
+    if (sub.stripe_subscription_id) {
+      const stripeSub = await stripe.subscriptions.retrieve(sub.stripe_subscription_id, {
+        expand: ["default_payment_method"],
+      });
+      subscriptionDefaultPm = stripeSub.default_payment_method ? true : false;
+    }
+
+    const customerDefaultPm =
+      customer?.invoice_settings?.default_payment_method ? true : false;
+
+    const hasPaymentMethod = customerDefaultPm || subscriptionDefaultPm;
+
+    return res.json({
+      hasPaymentMethod,
+      customerDefaultPm,
+      subscriptionDefaultPm,
+    });
+  } catch (e) {
+    console.error("❌ /api/payment-method/status:", e);
+    return res.status(500).json({ error: "Erreur status paiement" });
+  }
+});
+
+// ==========================================
+// 🔗 Billing Portal (ajout carte / gestion)
+// ==========================================
+app.post("/api/billing-portal/session", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data: sub, error } = await supabaseAdmin
+      .from("subscriptions")
+      .select("stripe_customer_id")
+      .eq("user_id", userId)
+      .single();
+
+    if (error || !sub?.stripe_customer_id) {
+      return res.status(400).json({ error: "Customer Stripe introuvable" });
+    }
+
+    const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: sub.stripe_customer_id,
+      return_url: `${FRONTEND_URL}/profile.html`,
+    });
+
+    return res.json({ url: session.url });
+  } catch (e) {
+    console.error("❌ /api/billing-portal/session:", e);
+    return res.status(500).json({ error: "Erreur Billing Portal" });
+  }
+});
+
+
+
+
 
 
 // ✅ ROUTE POUR CONFIRMER LA SUPPRESSION (via le lien email)
@@ -1133,30 +1216,52 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
     // =====================================================
     // ✅ UPGRADE : immédiat + prorata (fin inchangée)
     // =====================================================
-    if (isUpgrade) {
-  const updatedSub = await stripe.subscriptions.update(stripeSub.id, {
-    items: [{ id: currentItem.id, price: newPriceId }],
+   if (isUpgrade) {
+  // 1) Vérifier si un moyen de paiement est présent
+  const customer = await stripe.customers.retrieve(stripeSub.customer);
+  const customerHasPm = !!customer?.invoice_settings?.default_payment_method;
+
+  const subscriptionHasPm = !!stripeSub.default_payment_method;
+
+  const hasPaymentMethod = customerHasPm || subscriptionHasPm;
+
+  // 2) Si pas de carte => on redirige vers Billing Portal (ajout carte)
+  if (!hasPaymentMethod) {
+    const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: stripeSub.customer,
+      return_url: `${FRONTEND_URL}/profile.html`,
+    });
+
+    return res.json({
+      success: true,
+      mode: "upgrade_needs_payment_method",
+      redirectUrl: portal.url,
+      message: "Ajoute une carte pour finaliser l’upgrade (Stripe).",
+    });
+  }
+
+  // 3) Si carte OK => upgrade immédiat + prorata (comme tu voulais)
+  await stripe.subscriptions.update(stripeSub.id, {
+    items: [
+      {
+        id: currentItem.id,
+        price: newPriceId,
+      },
+    ],
     proration_behavior: "create_prorations",
     billing_cycle_anchor: "unchanged",
-    payment_behavior: "default_incomplete", // important pour gérer si paiement requis
-    expand: ["latest_invoice.payment_intent", "latest_invoice"],
   });
-
-  const invoice = updatedSub.latest_invoice;
-
-  // Si Stripe génère une facture à payer, on renvoie un lien hébergé
-  const redirectUrl =
-    invoice && typeof invoice === "object" && invoice.hosted_invoice_url
-      ? invoice.hosted_invoice_url
-      : null;
 
   return res.json({
     success: true,
     mode: "upgrade",
-    message: "Upgrade appliqué (prorata).",
-    redirectUrl, // <= frontend redirige si présent
+    message: "Upgrade appliqué immédiatement (prorata).",
   });
 }
+
+
 
 
     // =====================================================

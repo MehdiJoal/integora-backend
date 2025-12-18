@@ -1372,7 +1372,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       metadata: {
         action: "prepay_next_year",
         user_id: userId,
-        plan
+        plan: currentPlan
       }
     });
 

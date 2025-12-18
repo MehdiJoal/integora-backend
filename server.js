@@ -851,24 +851,28 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
 
     // ✅ info prépaiement (année suivante)
     const { data: prepaid, error: prepaidErr } = await supabaseAdmin
-      .from("subscription_prepayments")
-      .select("amount, currency, plan, created_at, checkout_session_id")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+  .from("subscription_prepayments")
+  .select("amount, currency, plan, created_at, checkout_session_id, effective_period_start")
+  .eq("user_id", userId)
+  .order("created_at", { ascending: false })
+  .limit(1)
+  .maybeSingle();
+
 
     if (prepaidErr) console.warn("⚠️ prepaid query:", prepaidErr);
 
     return res.json({
-      ...subscription,
-      hasPrepaidNextPeriod: !!prepaid,
-      prepaidAmount: prepaid?.amount ?? null,
-      prepaidCurrency: prepaid?.currency ?? null,
-      prepaidPlan: prepaid?.plan ?? null,
-      prepaidAt: prepaid?.created_at ?? null,
-      prepaidCheckoutSessionId: prepaid?.checkout_session_id ?? null
-    });
+  ...subscription,
+  hasPrepaidNextPeriod: !!prepaid,
+  prepaid: prepaid ? {
+    amount: prepaid.amount,
+    currency: prepaid.currency,
+    plan: prepaid.plan,
+    paidAt: prepaid.created_at,
+    checkoutSessionId: prepaid.checkout_session_id,
+    startsAt: prepaid.effective_period_start
+  } : null
+});
 
   } catch (error) {
     console.error('❌ [SERVER] Erreur récupération abonnement:', error);
@@ -926,23 +930,7 @@ app.get("/api/payment-method/status", authenticateToken, async (req, res) => {
   }
 });
 
-// ==========================================
-// Page profil paiement règle moins de 366 jours
-// ==========================================
-const endStr = sub.current_period_end || sub.trial_end;
-if (endStr) {
-  const end = new Date(endStr);
-  const now = new Date();
-  const ms = end.getTime() - now.getTime();
-  const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
 
-  if (daysRemaining > 366) {
-    return res.status(400).json({
-      error: "Le prépaiement est disponible uniquement à moins d’un an de l’échéance.",
-      daysRemaining
-    });
-  }
-}
 
 
 // ==========================================
@@ -1391,6 +1379,24 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     };
 
     const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+
+    // ==========================================
+// Page profil paiement règle moins de 366 jours
+// ==========================================
+const endStr = sub.current_period_end || sub.trial_end;
+if (endStr) {
+  const end = new Date(endStr);
+  const now = new Date();
+  const ms = end.getTime() - now.getTime();
+  const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
+
+  if (daysRemaining > 366) {
+    return res.status(400).json({
+      error: "Le prépaiement est disponible uniquement à moins d’un an de l’échéance.",
+      daysRemaining
+    });
+  }
+}
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",

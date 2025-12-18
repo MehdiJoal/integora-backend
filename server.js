@@ -1082,17 +1082,20 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
 
 // ==========================================
 // 🔁 CHANGEMENT D’OFFRE STRIPE (UPGRADE / DOWNGRADE)
+// - Upgrade : immédiat + prorata (date de fin inchangée)
+// - Downgrade : programmé au renouvellement (via Subscription Schedule)
 // ==========================================
 app.post('/api/change-plan', authenticateToken, async (req, res) => {
   try {
     const { newPlan } = req.body;
     const userId = req.user.id;
 
+    // 0) validation
     if (!['standard', 'premium'].includes(newPlan)) {
       return res.status(400).json({ error: 'Plan invalide' });
     }
 
-    // 1️⃣ Récupérer l’abonnement actuel
+    // 1) récupérer l’abonnement actuel (Supabase)
     const { data: sub, error } = await supabaseAdmin
       .from('subscriptions')
       .select('stripe_subscription_id, stripe_price_id, plan')
@@ -1103,44 +1106,180 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Aucun abonnement Stripe actif' });
     }
 
-    // 2️⃣ Mapping plan → price_id
+    // Si déjà sur ce plan -> rien à faire
+    if (newPlan === sub.plan) {
+      return res.json({ success: true, message: "Déjà sur ce plan" });
+    }
+
+    // 2) mapping plan -> price_id
     const PRICE_BY_PLAN = {
       standard: "price_1SIoYxPGbG6oFrATaa6wtYvX",
       premium: "price_1SIoZGPGbG6oFrATq6020zVW"
     };
-
     const newPriceId = PRICE_BY_PLAN[newPlan];
 
-    // 3️⃣ Récupérer la subscription Stripe
-    const stripeSub = await stripe.subscriptions.retrieve(
-      sub.stripe_subscription_id
-    );
-
+    // 3) récupérer la subscription Stripe actuelle
+    const stripeSub = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
     const currentItem = stripeSub.items.data[0];
 
-    // 4️⃣ UPGRADE → immédiat + prorata
-    if (newPlan !== sub.plan) {
+    if (!currentItem?.id) {
+      return res.status(400).json({ error: "Subscription Stripe invalide (item introuvable)." });
+    }
+
+    // 4) déterminer upgrade vs downgrade
+    const PLAN_ORDER = { standard: 1, premium: 2 };
+    const isUpgrade = PLAN_ORDER[newPlan] > PLAN_ORDER[sub.plan];
+
+    // =====================================================
+    // ✅ UPGRADE : immédiat + prorata (fin inchangée)
+    // =====================================================
+    if (isUpgrade) {
       await stripe.subscriptions.update(stripeSub.id, {
         items: [{
           id: currentItem.id,
-          price: newPriceId,
+          price: newPriceId
         }],
-        proration_behavior: "create_prorations"
+        proration_behavior: "create_prorations",
+        billing_cycle_anchor: "unchanged"
+      });
+
+      return res.json({
+        success: true,
+        mode: "upgrade",
+        message: "Upgrade appliqué immédiatement (prorata)."
       });
     }
 
-   
+    // =====================================================
+    // ✅ DOWNGRADE : programmé au renouvellement (schedule)
+    // =====================================================
+
+    // 1) recharger l’abonnement à jour (sécurité)
+    const freshSub = await stripe.subscriptions.retrieve(stripeSub.id);
+    const currentPeriodEnd = freshSub.current_period_end;   // unix seconds
+    const currentPeriodStart = freshSub.current_period_start;
+    const currentPriceId = freshSub.items.data[0]?.price?.id;
+
+    if (!currentPeriodEnd || !currentPeriodStart || !currentPriceId) {
+      return res.status(400).json({
+        error: "Impossible de déterminer la période Stripe (start/end) ou le price actuel."
+      });
+    }
+
+    // 2) créer ou récupérer un schedule
+    let schedule;
+    if (freshSub.schedule) {
+      schedule = await stripe.subscriptionSchedules.retrieve(freshSub.schedule);
+    } else {
+      schedule = await stripe.subscriptionSchedules.create({
+        from_subscription: freshSub.id
+      });
+    }
+
+    // 3) forcer 2 phases :
+    // - Phase 1 : plan actuel jusqu’à la fin de période
+    // - Phase 2 : nouveau plan à partir de la fin de période
+    const phase1Start = schedule.phases?.[0]?.start_date || currentPeriodStart;
+
+    await stripe.subscriptionSchedules.update(schedule.id, {
+      end_behavior: "release",
+      phases: [
+        {
+          start_date: phase1Start,
+          end_date: currentPeriodEnd,
+          items: [{ price: currentPriceId, quantity: 1 }]
+        },
+        {
+          start_date: currentPeriodEnd,
+          items: [{ price: newPriceId, quantity: 1 }]
+        }
+      ],
+      metadata: {
+        ...(schedule.metadata || {}),
+        pending_plan: newPlan,
+        user_id: userId
+      }
+    });
 
     return res.json({
       success: true,
-      message: "Changement d’offre en cours de traitement"
+      mode: "downgrade_scheduled",
+      message: "Downgrade programmé pour le renouvellement",
+      effective_date: new Date(currentPeriodEnd * 1000).toISOString()
     });
 
   } catch (err) {
     console.error("❌ change-plan error:", err);
-    res.status(500).json({ error: "Erreur changement d’offre" });
+    return res.status(500).json({ error: "Erreur changement d’offre" });
   }
 });
+
+
+// ==========================================
+// 🔁 TOGGLE RENOUVELLEMENT (cancel_at_period_end)
+// ==========================================
+app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { autoRenew } = req.body; // boolean
+
+    const { data: sub, error } = await supabaseAdmin
+      .from('subscriptions')
+      .select('stripe_subscription_id')
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !sub?.stripe_subscription_id) {
+      return res.status(400).json({ error: "Aucun abonnement Stripe actif" });
+    }
+
+    const updated = await stripe.subscriptions.update(sub.stripe_subscription_id, {
+      cancel_at_period_end: autoRenew ? false : true
+    });
+
+    return res.json({
+      success: true,
+      cancel_at_period_end: updated.cancel_at_period_end,
+      cancel_at: updated.cancel_at ? new Date(updated.cancel_at * 1000).toISOString() : null
+    });
+
+  } catch (err) {
+    console.error("❌ toggle-renewal error:", err);
+    res.status(500).json({ error: "Erreur renouvellement" });
+  }
+});
+
+// ==========================================
+// 🔁 ACTIVER / DÉSACTIVER RENOUVELLEMENT
+// ==========================================
+app.post('/api/toggle-renewal', authenticateToken, async (req, res) => {
+  try {
+    const { renew } = req.body;
+    const userId = req.user.id;
+
+    const { data: sub } = await supabaseAdmin
+      .from('subscriptions')
+      .select('stripe_subscription_id')
+      .eq('user_id', userId)
+      .single();
+
+    if (!sub?.stripe_subscription_id) {
+      return res.status(400).json({ error: "Aucun abonnement actif" });
+    }
+
+    await stripe.subscriptions.update(sub.stripe_subscription_id, {
+      cancel_at_period_end: !renew
+    });
+
+    return res.json({ success: true });
+
+  } catch (err) {
+    console.error("toggle-renewal error:", err);
+    res.status(500).json({ error: "Erreur renouvellement" });
+  }
+});
+
+
 
 
 

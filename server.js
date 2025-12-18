@@ -104,7 +104,7 @@ try {
   // ⚠️ CE DOIT ÊTRE LA SERVICE_ROLE_KEY
   supabase = createClient(
     process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY, // ← DOIT ÊTRE service_role, PAS anon
+    process.env.SUPABASE_SERVICE_ROLE_KEY, 
     {
       auth: {
         autoRefreshToken: false,
@@ -898,7 +898,7 @@ app.post('/api/request-account-deletion', authenticateToken, async (req, res) =>
     const edgeResponse = await fetch(`${process.env.SUPABASE_URL}/functions/v1/send-deletion-email`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, // ⚠️ SERVICE ROLE KEY
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, 
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -950,7 +950,6 @@ app.post('/api/request-account-deletion', authenticateToken, async (req, res) =>
 });
 
 // ✅ ROUTE POUR CONFIRMER LA SUPPRESSION (AVEC ARCHIVAGE)
-// ✅ ROUTE POUR CONFIRMER LA SUPPRESSION (AVEC ARCHIVAGE COMPLET)
 app.post('/api/confirm-account-deletion', async (req, res) => {
   try {
     const { token } = req.body;
@@ -1079,6 +1078,70 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
     res.status(500).json({ error: 'Erreur lors de la suppression' });
   }
 });
+
+
+// ==========================================
+// 🔁 CHANGEMENT D’OFFRE STRIPE (UPGRADE / DOWNGRADE)
+// ==========================================
+app.post('/api/change-plan', authenticateToken, async (req, res) => {
+  try {
+    const { newPlan } = req.body;
+    const userId = req.user.id;
+
+    if (!['standard', 'premium'].includes(newPlan)) {
+      return res.status(400).json({ error: 'Plan invalide' });
+    }
+
+    // 1️⃣ Récupérer l’abonnement actuel
+    const { data: sub, error } = await supabaseAdmin
+      .from('subscriptions')
+      .select('stripe_subscription_id, stripe_price_id, plan')
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !sub?.stripe_subscription_id) {
+      return res.status(400).json({ error: 'Aucun abonnement Stripe actif' });
+    }
+
+    // 2️⃣ Mapping plan → price_id
+    const PRICE_BY_PLAN = {
+      standard: "price_1SIoYxPGbG6oFrATaa6wtYvX",
+      premium: "price_1SIoZGPGbG6oFrATq6020zVW"
+    };
+
+    const newPriceId = PRICE_BY_PLAN[newPlan];
+
+    // 3️⃣ Récupérer la subscription Stripe
+    const stripeSub = await stripe.subscriptions.retrieve(
+      sub.stripe_subscription_id
+    );
+
+    const currentItem = stripeSub.items.data[0];
+
+    // 4️⃣ UPGRADE → immédiat + prorata
+    if (newPlan !== sub.plan) {
+      await stripe.subscriptions.update(stripeSub.id, {
+        items: [{
+          id: currentItem.id,
+          price: newPriceId,
+        }],
+        proration_behavior: "create_prorations"
+      });
+    }
+
+   
+
+    return res.json({
+      success: true,
+      message: "Changement d’offre en cours de traitement"
+    });
+
+  } catch (err) {
+    console.error("❌ change-plan error:", err);
+    res.status(500).json({ error: "Erreur changement d’offre" });
+  }
+});
+
 
 
 // ==========================================

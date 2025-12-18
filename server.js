@@ -104,7 +104,7 @@ try {
   // ⚠️ CE DOIT ÊTRE LA SERVICE_ROLE_KEY
   supabase = createClient(
     process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY, 
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
     {
       auth: {
         autoRefreshToken: false,
@@ -849,7 +849,26 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
       period_end: subscription.current_period_end
     });
 
-    res.json(subscription);
+    // ✅ info prépaiement (année suivante)
+    const { data: prepaid, error: prepaidErr } = await supabaseAdmin
+      .from("subscription_prepayments")
+      .select("amount, currency, plan, created_at, checkout_session_id")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (prepaidErr) console.warn("⚠️ prepaid query:", prepaidErr);
+
+    return res.json({
+      ...subscription,
+      hasPrepaidNextPeriod: !!prepaid,
+      prepaidAmount: prepaid?.amount ?? null,
+      prepaidCurrency: prepaid?.currency ?? null,
+      prepaidPlan: prepaid?.plan ?? null,
+      prepaidAt: prepaid?.created_at ?? null,
+      prepaidCheckoutSessionId: prepaid?.checkout_session_id ?? null
+    });
 
   } catch (error) {
     console.error('❌ [SERVER] Erreur récupération abonnement:', error);
@@ -906,6 +925,25 @@ app.get("/api/payment-method/status", authenticateToken, async (req, res) => {
     return res.status(500).json({ error: "Erreur status paiement" });
   }
 });
+
+// ==========================================
+// Page profil paiement règle moins de 366 jours
+// ==========================================
+const endStr = sub.current_period_end || sub.trial_end;
+if (endStr) {
+  const end = new Date(endStr);
+  const now = new Date();
+  const ms = end.getTime() - now.getTime();
+  const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
+
+  if (daysRemaining > 366) {
+    return res.status(400).json({
+      error: "Le prépaiement est disponible uniquement à moins d’un an de l’échéance.",
+      daysRemaining
+    });
+  }
+}
+
 
 // ==========================================
 // 🔗 Billing Portal (ajout carte / gestion)
@@ -981,7 +1019,7 @@ app.post('/api/request-account-deletion', authenticateToken, async (req, res) =>
     const edgeResponse = await fetch(`${process.env.SUPABASE_URL}/functions/v1/send-deletion-email`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`, 
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -1213,50 +1251,47 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
     const PLAN_ORDER = { standard: 1, premium: 2 };
     const isUpgrade = PLAN_ORDER[newPlan] > PLAN_ORDER[sub.plan];
 
-   // =====================================================
-// ✅ UPGRADE : immédiat + prorata (si carte) sinon Stripe Portal
-// =====================================================
-if (isUpgrade) {
-  // 0) détecter si un moyen de paiement existe
-  const customer = await stripe.customers.retrieve(stripeSub.customer);
+    // =====================================================
+    // ✅ UPGRADE : immédiat + prorata (si carte) sinon Stripe Portal
+    // =====================================================
+    if (isUpgrade) {
+      // ✅ détecter si un moyen de paiement existe
+      const customer = await stripe.customers.retrieve(stripeSub.customer);
 
-  const customerHasPm = !!customer?.invoice_settings?.default_payment_method;
-  const subscriptionHasPm = !!stripeSub?.default_payment_method;
-  const hasPaymentMethod = customerHasPm || subscriptionHasPm;
+      const customerHasPm = !!customer?.invoice_settings?.default_payment_method;
+      const subscriptionHasPm = !!stripeSub?.default_payment_method;
+      const hasPaymentMethod = customerHasPm || subscriptionHasPm;
 
-  // 1) si pas de carte -> rediriger vers Stripe (ajout carte)
-  if (!hasPaymentMethod) {
-    const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+      // ✅ si pas de carte → Billing Portal (ajouter carte) puis l’utilisateur reclique
+      if (!hasPaymentMethod) {
+        const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
-    const portal = await stripe.billingPortal.sessions.create({
-      customer: stripeSub.customer,
-      return_url: `${FRONTEND_URL}/profile.html`,
-    });
+        const portal = await stripe.billingPortal.sessions.create({
+          customer: stripeSub.customer,
+          return_url: `${FRONTEND_URL}/profile.html`,
+        });
 
-    return res.json({
-      success: true,
-      mode: "needs_payment_method",
-      redirectUrl: portal.url,
-      message: "Aucun moyen de paiement : redirection Stripe pour ajouter une carte.",
-    });
-  }
+        return res.json({
+          success: true,
+          mode: "needs_payment_method",
+          redirectUrl: portal.url,
+          message: "Aucun moyen de paiement : redirection Stripe pour ajouter une carte."
+        });
+      }
 
-  // 2) sinon -> upgrade direct + prorata (Stripe débitera automatiquement)
-  await stripe.subscriptions.update(stripeSub.id, {
-    items: [{
-      id: currentItem.id,
-      price: newPriceId
-    }],
-    proration_behavior: "create_prorations",
-    billing_cycle_anchor: "unchanged"
-  });
+      // ✅ sinon upgrade direct + prorata
+      await stripe.subscriptions.update(stripeSub.id, {
+        items: [{ id: currentItem.id, price: newPriceId }],
+        proration_behavior: "create_prorations",
+        billing_cycle_anchor: "unchanged"
+      });
 
-  return res.json({
-    success: true,
-    mode: "upgrade",
-    message: "Upgrade appliqué immédiatement (prorata)."
-  });
-}
+      return res.json({
+        success: true,
+        mode: "upgrade",
+        message: "Upgrade appliqué immédiatement (prorata)."
+      });
+    }
 
 
 
@@ -1306,10 +1341,11 @@ if (isUpgrade) {
         }
       ],
       metadata: {
-  ...(schedule.metadata || {}),
-  pending_plan: newPlan,
-  user_id: userId
-}
+        ...(schedule.metadata || {}),
+        pending_plan: newPlan,
+        user_id: userId
+      }
+
 
     });
 
@@ -1372,7 +1408,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       metadata: {
         action: "prepay_next_year",
         user_id: userId,
-        plan: currentPlan
+        plan: plan
       }
     });
 
@@ -1410,15 +1446,15 @@ app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res)
 
     // après: const updated = await stripe.subscriptions.update(...)
 
-const cancelAtIso = updated.cancel_at ? new Date(updated.cancel_at * 1000).toISOString() : null;
+    const cancelAtIso = updated.cancel_at ? new Date(updated.cancel_at * 1000).toISOString() : null;
 
-await supabaseAdmin
-  .from("subscriptions")
-  .update({
-    cancel_at: cancelAtIso,
-    updated_at: new Date().toISOString(),
-  })
-  .eq("user_id", userId);
+    await supabaseAdmin
+      .from("subscriptions")
+      .update({
+        cancel_at: cancelAtIso,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId);
 
 
     return res.json({
@@ -1516,7 +1552,7 @@ function buildEmailChangeRequestedHtml({ oldEmail, newEmail }) {
   const safeOld = escapeHtml(oldEmail);
   const safeNew = escapeHtml(newEmail);
 
-const resetStartUrl = "https://integora-frontend.vercel.app/forgot-password.html";
+  const resetStartUrl = "https://integora-frontend.vercel.app/forgot-password.html";
   const supportUrl = "https://integora.fr/contact";
 
   return `
@@ -1562,7 +1598,7 @@ function buildPasswordChangedEmailHtml({ firstName, ip, userAgent }) {
   const safeUa = escapeHtml(userAgent || "-");
 
 
-const resetStartUrl = "https://integora-frontend.vercel.app/forgot-password.html";
+  const resetStartUrl = "https://integora-frontend.vercel.app/forgot-password.html";
   const supportUrl = "https://integora.fr/contact";
 
   return `

@@ -1213,19 +1213,18 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
     const PLAN_ORDER = { standard: 1, premium: 2 };
     const isUpgrade = PLAN_ORDER[newPlan] > PLAN_ORDER[sub.plan];
 
-    // =====================================================
-    // ✅ UPGRADE : immédiat + prorata (fin inchangée)
-    // =====================================================
-   if (isUpgrade) {
-  // 1) Vérifier si un moyen de paiement est présent
+   // =====================================================
+// ✅ UPGRADE : immédiat + prorata (si carte) sinon Stripe Portal
+// =====================================================
+if (isUpgrade) {
+  // 0) détecter si un moyen de paiement existe
   const customer = await stripe.customers.retrieve(stripeSub.customer);
+
   const customerHasPm = !!customer?.invoice_settings?.default_payment_method;
-
-  const subscriptionHasPm = !!stripeSub.default_payment_method;
-
+  const subscriptionHasPm = !!stripeSub?.default_payment_method;
   const hasPaymentMethod = customerHasPm || subscriptionHasPm;
 
-  // 2) Si pas de carte => on redirige vers Billing Portal (ajout carte)
+  // 1) si pas de carte -> rediriger vers Stripe (ajout carte)
   if (!hasPaymentMethod) {
     const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
@@ -1236,28 +1235,26 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
 
     return res.json({
       success: true,
-      mode: "upgrade_needs_payment_method",
+      mode: "needs_payment_method",
       redirectUrl: portal.url,
-      message: "Ajoute une carte pour finaliser l’upgrade (Stripe).",
+      message: "Aucun moyen de paiement : redirection Stripe pour ajouter une carte.",
     });
   }
 
-  // 3) Si carte OK => upgrade immédiat + prorata (comme tu voulais)
+  // 2) sinon -> upgrade direct + prorata (Stripe débitera automatiquement)
   await stripe.subscriptions.update(stripeSub.id, {
-    items: [
-      {
-        id: currentItem.id,
-        price: newPriceId,
-      },
-    ],
+    items: [{
+      id: currentItem.id,
+      price: newPriceId
+    }],
     proration_behavior: "create_prorations",
-    billing_cycle_anchor: "unchanged",
+    billing_cycle_anchor: "unchanged"
   });
 
   return res.json({
     success: true,
     mode: "upgrade",
-    message: "Upgrade appliqué immédiatement (prorata).",
+    message: "Upgrade appliqué immédiatement (prorata)."
   });
 }
 
@@ -1328,6 +1325,65 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
     return res.status(500).json({ error: "Erreur changement d’offre" });
   }
 });
+
+
+// ==========================================
+// payer l’année suivante
+// ==========================================
+app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data: sub, error } = await supabaseAdmin
+      .from("subscriptions")
+      .select("plan, stripe_customer_id")
+      .eq("user_id", userId)
+      .single();
+
+    if (error || !sub?.stripe_customer_id) {
+      return res.status(400).json({ error: "Aucun customer Stripe" });
+    }
+
+    const plan = (req.body?.plan || sub.plan);
+    if (!["standard", "premium"].includes(plan)) {
+      return res.status(400).json({ error: "Plan invalide" });
+    }
+
+    const AMOUNT_BY_PLAN = {
+      standard: 12000, // centimes
+      premium: 18000
+    };
+
+    const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer: sub.stripe_customer_id,
+      line_items: [{
+        price_data: {
+          currency: "eur",
+          product_data: { name: `INTEGORA - Prépaiement année suivante (${plan})` },
+          unit_amount: AMOUNT_BY_PLAN[plan],
+        },
+        quantity: 1
+      }],
+      success_url: `${FRONTEND_URL}/profile.html?prepay=success`,
+      cancel_url: `${FRONTEND_URL}/profile.html?prepay=cancel`,
+      metadata: {
+        action: "prepay_next_year",
+        user_id: userId,
+        plan
+      }
+    });
+
+    return res.json({ url: session.url });
+
+  } catch (err) {
+    console.error("❌ prepay-next-year error:", err);
+    return res.status(500).json({ error: "Erreur création session Stripe" });
+  }
+});
+
 
 
 // ==========================================

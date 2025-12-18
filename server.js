@@ -1134,21 +1134,30 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
     // ✅ UPGRADE : immédiat + prorata (fin inchangée)
     // =====================================================
     if (isUpgrade) {
-      await stripe.subscriptions.update(stripeSub.id, {
-        items: [{
-          id: currentItem.id,
-          price: newPriceId
-        }],
-        proration_behavior: "create_prorations",
-        billing_cycle_anchor: "unchanged"
-      });
+  const updatedSub = await stripe.subscriptions.update(stripeSub.id, {
+    items: [{ id: currentItem.id, price: newPriceId }],
+    proration_behavior: "create_prorations",
+    billing_cycle_anchor: "unchanged",
+    payment_behavior: "default_incomplete", // important pour gérer si paiement requis
+    expand: ["latest_invoice.payment_intent", "latest_invoice"],
+  });
 
-      return res.json({
-        success: true,
-        mode: "upgrade",
-        message: "Upgrade appliqué immédiatement (prorata)."
-      });
-    }
+  const invoice = updatedSub.latest_invoice;
+
+  // Si Stripe génère une facture à payer, on renvoie un lien hébergé
+  const redirectUrl =
+    invoice && typeof invoice === "object" && invoice.hosted_invoice_url
+      ? invoice.hosted_invoice_url
+      : null;
+
+  return res.json({
+    success: true,
+    mode: "upgrade",
+    message: "Upgrade appliqué (prorata).",
+    redirectUrl, // <= frontend redirige si présent
+  });
+}
+
 
     // =====================================================
     // ✅ DOWNGRADE : programmé au renouvellement (schedule)
@@ -1195,10 +1204,11 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
         }
       ],
       metadata: {
-        ...(schedule.metadata || {}),
-        pending_plan: newPlan,
-        user_id: userId
-      }
+  ...(schedule.metadata || {}),
+  pending_plan: newPlan,
+  user_id: userId
+}
+
     });
 
     return res.json({
@@ -1236,6 +1246,19 @@ app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res)
     const updated = await stripe.subscriptions.update(sub.stripe_subscription_id, {
       cancel_at_period_end: autoRenew ? false : true
     });
+
+    // après: const updated = await stripe.subscriptions.update(...)
+
+const cancelAtIso = updated.cancel_at ? new Date(updated.cancel_at * 1000).toISOString() : null;
+
+await supabaseAdmin
+  .from("subscriptions")
+  .update({
+    cancel_at: cancelAtIso,
+    updated_at: new Date().toISOString(),
+  })
+  .eq("user_id", userId);
+
 
     return res.json({
       success: true,

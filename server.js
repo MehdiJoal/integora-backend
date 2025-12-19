@@ -339,8 +339,6 @@ app.use("/app/*", (req, res, next) => {
 app.use("/app/assets", express.static(path.join(__dirname, "../frontend/app/assets")));
 app.use("/app/images", express.static(path.join(__dirname, "../frontend/app/images")));
 
-//protection injection token exterieur//
-app.use(ensureCsrfToken);
 
 // ---------------------------
 // CONFIGURATION ESPACE MEMBRE
@@ -851,28 +849,34 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
 
     // ✅ info prépaiement (année suivante)
     const { data: prepaid, error: prepaidErr } = await supabaseAdmin
-  .from("subscription_prepayments")
-  .select("amount, currency, plan, created_at, checkout_session_id, effective_period_start")
-  .eq("user_id", userId)
-  .order("created_at", { ascending: false })
-  .limit(1)
-  .maybeSingle();
+      .from("subscription_prepayments")
+      .select("amount, currency, plan, created_at, checkout_session_id, effective_period_start, effective_period_end")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
 
     if (prepaidErr) console.warn("⚠️ prepaid query:", prepaidErr);
 
+    const period_end = subscription.current_period_end || subscription.trial_end || null;
+
+    
     return res.json({
-  ...subscription,
-  hasPrepaidNextPeriod: !!prepaid,
-  prepaid: prepaid ? {
-    amount: prepaid.amount,
-    currency: prepaid.currency,
-    plan: prepaid.plan,
-    paidAt: prepaid.created_at,
-    checkoutSessionId: prepaid.checkout_session_id,
-    startsAt: prepaid.effective_period_start
-  } : null
-});
+      ...subscription,
+      period_end,
+      hasPrepaidNextPeriod: !!prepaid,
+      prepaid: prepaid ? {
+        amount: prepaid.amount,
+        currency: prepaid.currency,
+        plan: prepaid.plan,
+        paidAt: prepaid.created_at,
+        checkoutSessionId: prepaid.checkout_session_id,
+        startsAt: prepaid.effective_period_start,
+        endsAt: prepaid.effective_period_end ?? null
+
+      } : null
+    });
 
   } catch (error) {
     console.error('❌ [SERVER] Erreur récupération abonnement:', error);
@@ -927,40 +931,6 @@ app.get("/api/payment-method/status", authenticateToken, async (req, res) => {
   } catch (e) {
     console.error("❌ /api/payment-method/status:", e);
     return res.status(500).json({ error: "Erreur status paiement" });
-  }
-});
-
-
-
-
-// ==========================================
-// 🔗 Billing Portal (ajout carte / gestion)
-// ==========================================
-app.post("/api/billing-portal/session", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-
-    const { data: sub, error } = await supabaseAdmin
-      .from("subscriptions")
-      .select("stripe_customer_id")
-      .eq("user_id", userId)
-      .single();
-
-    if (error || !sub?.stripe_customer_id) {
-      return res.status(400).json({ error: "Customer Stripe introuvable" });
-    }
-
-    const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
-
-    const session = await stripe.billingPortal.sessions.create({
-      customer: sub.stripe_customer_id,
-      return_url: `${FRONTEND_URL}/profile.html`,
-    });
-
-    return res.json({ url: session.url });
-  } catch (e) {
-    console.error("❌ /api/billing-portal/session:", e);
-    return res.status(500).json({ error: "Erreur Billing Portal" });
   }
 });
 
@@ -1192,7 +1162,7 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
 // ==========================================
 // 🔁 CHANGEMENT D’OFFRE STRIPE (UPGRADE / DOWNGRADE)
 // - Upgrade : immédiat + prorata (date de fin inchangée)
-// - Downgrade : programmé au renouvellement (via Subscription Schedule)
+// - Downgrade : interdit en cours d’année
 // ==========================================
 app.post('/api/change-plan', authenticateToken, async (req, res) => {
   try {
@@ -1204,7 +1174,7 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Plan invalide' });
     }
 
-    // 1) récupérer l’abonnement actuel (Supabase)
+    // 1) abonnement actuel (Supabase)
     const { data: sub, error } = await supabaseAdmin
       .from('subscriptions')
       .select('stripe_subscription_id, stripe_price_id, plan')
@@ -1215,9 +1185,16 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Aucun abonnement Stripe actif' });
     }
 
-    // Si déjà sur ce plan -> rien à faire
+    // déjà sur ce plan
     if (newPlan === sub.plan) {
-      return res.json({ success: true, message: "Déjà sur ce plan" });
+      return res.json({ ok: true, message: "Déjà sur ce plan" });
+    }
+
+    // downgrade interdit
+    if (sub.plan === 'premium' && newPlan === 'standard') {
+      return res.status(400).json({
+        error: "Le passage en Standard est possible uniquement au renouvellement."
+      });
     }
 
     // 2) mapping plan -> price_id
@@ -1226,129 +1203,52 @@ app.post('/api/change-plan', authenticateToken, async (req, res) => {
       premium: "price_1SIoZGPGbG6oFrATq6020zVW"
     };
     const newPriceId = PRICE_BY_PLAN[newPlan];
+    if (!newPriceId) {
+      return res.status(500).json({ error: "PriceId Stripe manquant" });
+    }
 
-    // 3) récupérer la subscription Stripe actuelle
+    // 3) déterminer upgrade vs downgrade
+    const PLAN_ORDER = { standard: 1, premium: 2 };
+    const isUpgrade = PLAN_ORDER[newPlan] > PLAN_ORDER[sub.plan];
+
+    if (!isUpgrade) {
+      // (normalement déjà bloqué au-dessus, mais on sécurise)
+      return res.status(400).json({ error: "Downgrade interdit en cours d’année." });
+    }
+
+    // 4) récupérer la subscription Stripe UNE SEULE FOIS + item
     const stripeSub = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
-    const currentItem = stripeSub.items.data[0];
+    const currentItem = stripeSub?.items?.data?.[0];
 
     if (!currentItem?.id) {
       return res.status(400).json({ error: "Subscription Stripe invalide (item introuvable)." });
     }
 
-    // 4) déterminer upgrade vs downgrade
-    const PLAN_ORDER = { standard: 1, premium: 2 };
-    const isUpgrade = PLAN_ORDER[newPlan] > PLAN_ORDER[sub.plan];
-
-    // =====================================================
-    // ✅ UPGRADE : immédiat + prorata (si carte) sinon Stripe Portal
-    // =====================================================
-    if (isUpgrade) {
-      // ✅ détecter si un moyen de paiement existe
-      const customer = await stripe.customers.retrieve(stripeSub.customer);
-
-      const customerHasPm = !!customer?.invoice_settings?.default_payment_method;
-      const subscriptionHasPm = !!stripeSub?.default_payment_method;
-      const hasPaymentMethod = customerHasPm || subscriptionHasPm;
-
-      // ✅ si pas de carte → Billing Portal (ajouter carte) puis l’utilisateur reclique
-      if (!hasPaymentMethod) {
-        const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
-
-        const portal = await stripe.billingPortal.sessions.create({
-          customer: stripeSub.customer,
-          return_url: `${FRONTEND_URL}/profile.html`,
-        });
-
-        return res.json({
-          success: true,
-          mode: "needs_payment_method",
-          redirectUrl: portal.url,
-          message: "Aucun moyen de paiement : redirection Stripe pour ajouter une carte."
-        });
-      }
-
-      // ✅ sinon upgrade direct + prorata
-      await stripe.subscriptions.update(stripeSub.id, {
-        items: [{ id: currentItem.id, price: newPriceId }],
-        proration_behavior: "create_prorations",
-        billing_cycle_anchor: "unchanged"
-      });
-
-      return res.json({
-        success: true,
-        mode: "upgrade",
-        message: "Upgrade appliqué immédiatement (prorata)."
-      });
-    }
-
-
-
-
-    // =====================================================
-    // ✅ DOWNGRADE : programmé au renouvellement (schedule)
-    // =====================================================
-
-    // 1) recharger l’abonnement à jour (sécurité)
-    const freshSub = await stripe.subscriptions.retrieve(stripeSub.id);
-    const currentPeriodEnd = freshSub.current_period_end;   // unix seconds
-    const currentPeriodStart = freshSub.current_period_start;
-    const currentPriceId = freshSub.items.data[0]?.price?.id;
-
-    if (!currentPeriodEnd || !currentPeriodStart || !currentPriceId) {
-      return res.status(400).json({
-        error: "Impossible de déterminer la période Stripe (start/end) ou le price actuel."
-      });
-    }
-
-    // 2) créer ou récupérer un schedule
-    let schedule;
-    if (freshSub.schedule) {
-      schedule = await stripe.subscriptionSchedules.retrieve(freshSub.schedule);
-    } else {
-      schedule = await stripe.subscriptionSchedules.create({
-        from_subscription: freshSub.id
-      });
-    }
-
-    // 3) forcer 2 phases :
-    // - Phase 1 : plan actuel jusqu’à la fin de période
-    // - Phase 2 : nouveau plan à partir de la fin de période
-    const phase1Start = schedule.phases?.[0]?.start_date || currentPeriodStart;
-
-    await stripe.subscriptionSchedules.update(schedule.id, {
-      end_behavior: "release",
-      phases: [
-        {
-          start_date: phase1Start,
-          end_date: currentPeriodEnd,
-          items: [{ price: currentPriceId, quantity: 1 }]
-        },
-        {
-          start_date: currentPeriodEnd,
-          items: [{ price: newPriceId, quantity: 1 }]
-        }
-      ],
+    // 5) upgrade proratisé (Option A : pas de checkout)
+    await stripe.subscriptions.update(sub.stripe_subscription_id, {
+      items: [{ id: currentItem.id, price: newPriceId }],
+      proration_behavior: "create_prorations",
       metadata: {
-        ...(schedule.metadata || {}),
-        pending_plan: newPlan,
-        user_id: userId
+        action: "upgrade_prorated",
+        user_id: userId,
+        from_plan: sub.plan,
+        to_plan: newPlan
       }
-
-
     });
 
-    return res.json({
-      success: true,
-      mode: "downgrade_scheduled",
-      message: "Downgrade programmé pour le renouvellement",
-      effective_date: new Date(currentPeriodEnd * 1000).toISOString()
-    });
+    // 👉 le webhook resync Supabase (subscription.updated / invoice.paid)
+    return res.json({ ok: true });
 
   } catch (err) {
-    console.error("❌ change-plan error:", err);
-    return res.status(500).json({ error: "Erreur changement d’offre" });
+    console.error("❌ change-plan error:", err?.raw?.message || err);
+    return res.status(500).json({
+      error: "Erreur changement d’offre",
+      details: err?.raw?.message || err.message
+    });
   }
 });
+
+
 
 
 // ==========================================
@@ -1360,13 +1260,33 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
 
     const { data: sub, error } = await supabaseAdmin
       .from("subscriptions")
-      .select("plan, stripe_customer_id")
+      .select("plan, stripe_customer_id, current_period_end, trial_end")
       .eq("user_id", userId)
       .single();
 
     if (error || !sub?.stripe_customer_id) {
       return res.status(400).json({ error: "Aucun customer Stripe" });
     }
+
+    // ✅ empêcher un 2e prépaiement en attente
+    const { data: pendingPrepay, error: prepayErr } = await supabaseAdmin
+      .from("subscription_prepayments")
+      .select("amount, currency, plan, created_at, checkout_session_id, effective_period_start, effective_period_end, consumed_at")
+      .eq("user_id", userId)
+      .is("consumed_at", null)              // si tu n'as pas encore la colonne, retire cette ligne
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (prepayErr) console.warn("⚠️ prepay check:", prepayErr);
+
+    if (pendingPrepay?.id) {
+      return res.status(409).json({
+        error: "Vous avez déjà prépayé la prochaine période.",
+        startsAt: pendingPrepay.effective_period_start ?? null
+      });
+    }
+
 
     const plan = (req.body?.plan || sub.plan);
     if (!["standard", "premium"].includes(plan)) {
@@ -1381,22 +1301,22 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
     // ==========================================
-// Page profil paiement règle moins de 366 jours
-// ==========================================
-const endStr = sub.current_period_end || sub.trial_end;
-if (endStr) {
-  const end = new Date(endStr);
-  const now = new Date();
-  const ms = end.getTime() - now.getTime();
-  const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
+    // Page profil paiement règle moins de 366 jours
+    // ==========================================
+    const endStr = sub.current_period_end || sub.trial_end;
+    if (endStr) {
+      const end = new Date(endStr);
+      const now = new Date();
+      const ms = end.getTime() - now.getTime();
+      const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
 
-  if (daysRemaining > 366) {
-    return res.status(400).json({
-      error: "Le prépaiement est disponible uniquement à moins d’un an de l’échéance.",
-      daysRemaining
-    });
-  }
-}
+      if (daysRemaining > 366) {
+        return res.status(400).json({
+          error: "Le prépaiement est disponible uniquement à moins d’un an de l’échéance.",
+          daysRemaining
+        });
+      }
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
@@ -1504,6 +1424,100 @@ app.post('/api/toggle-renewal', authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Erreur renouvellement" });
   }
 });
+
+
+// ==========================================
+// ✅ TRIAL -> PAID : créer une nouvelle subscription Stripe via Checkout
+// ==========================================
+app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const desiredPlan = req.body?.plan;
+
+    if (!["standard", "premium"].includes(desiredPlan)) {
+      return res.status(400).json({ error: "Plan invalide" });
+    }
+
+    // 1) récupérer infos locales (customer existant ?)
+    const { data: subRow } = await supabaseAdmin
+      .from("subscriptions")
+      .select("stripe_customer_id, stripe_subscription_id, plan")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    // Si déjà une subscription Stripe -> on ne passe pas ici
+    if (subRow?.stripe_subscription_id) {
+      return res.status(400).json({
+        error: "Abonnement Stripe déjà actif, utilise change-plan."
+      });
+    }
+
+    // 2) price mapping
+    const PRICE_BY_PLAN = {
+      standard: process.env.STRIPE_PRICE_STANDARD || "price_1SIoYxPGbG6oFrATaa6wtYvX",
+      premium: process.env.STRIPE_PRICE_PREMIUM || "price_1SIoZGPGbG6oFrATq6020zVW",
+    };
+    const priceId = PRICE_BY_PLAN[desiredPlan];
+    if (!priceId) return res.status(500).json({ error: "PriceId Stripe manquant" });
+
+    const FRONTEND_URL = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+
+    // 3) s'assurer d'avoir un customer Stripe
+    let customerId = subRow?.stripe_customer_id || null;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: req.user.email,
+        metadata: { user_id: userId }
+      });
+      customerId = customer.id;
+
+      await supabaseAdmin
+        .from("subscriptions")
+        .upsert({ user_id: userId, stripe_customer_id: customerId }, { onConflict: "user_id" });
+    }
+
+    // 4) créer Checkout Session subscription (PARAMS STRIPE VALIDES)
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: customerId,
+
+      line_items: [{ price: priceId, quantity: 1 }],
+
+      success_url: `${FRONTEND_URL}/profile.html?checkout=success`,
+      cancel_url: `${FRONTEND_URL}/profile.html?checkout=cancel`,
+
+      metadata: {
+        action: "subscribe_paid",
+        user_id: userId,
+        plan: desiredPlan
+      },
+
+      subscription_data: {
+        metadata: {
+          action: "subscribe_paid",
+          user_id: userId,
+          plan: desiredPlan
+        },
+        
+      },
+
+      // ✅ si tu veux forcer la saisie d’un moyen de paiement à l’achat
+      payment_method_collection: "always",
+
+    });
+
+    return res.json({ url: session.url });
+
+  } catch (e) {
+    console.error("❌ /api/subscribe/session:", e?.raw?.message || e);
+    return res.status(500).json({
+      error: "Erreur création session Stripe",
+      details: e?.raw?.message || e.message
+    });
+  }
+});
+
+
 
 
 
@@ -2439,16 +2453,28 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       customer_email: emailNorm,
+
+      // ✅ force la création d’un Customer Stripe (important pour cohérence)
+      customer_creation: "always",
+
       mode: "subscription",
+
+      // ✅ empêche la sauvegarde automatique du moyen de paiement
+      payment_method_collection: "always",
+
       line_items: [{ price: priceId, quantity: 1 }],
+
       success_url: `${FRONT}/email-sent-paiement.html?session_id={CHECKOUT_SESSION_ID}&pending_id=${pending_id}`,
       cancel_url: `${FRONT}/inscription.html?canceled=1`,
+
       metadata: {
         pending_id,
         desired_plan,
         user_email: emailNorm
       },
+
       subscription_data: {
+
         metadata: {
           pending_id,
           desired_plan,
@@ -2456,6 +2482,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
         }
       }
     });
+
 
     // ✅ 4) Stocker stripe_session_id dans pending
     const { error: sessUpdErr } = await supabaseAdmin
@@ -2631,27 +2658,75 @@ app.post("/api/start-trial-invite", async (req, res) => {
     const emailNorm = (email || "").trim().toLowerCase();
     if (!emailNorm) return res.status(400).json({ error: "email requis" });
 
-    // 1) pending
-    const { data: pending, error: pendingErr } = await supabaseAdmin
-      .from("pending_signups")
-      .insert([{
-        email: emailNorm,
-        first_name,
-        last_name,
-        company_name,
-        company_size,
-        desired_plan: "trial",
-        status: "pending"
-      }])
-      .select("*")
-      .single();
+    // 1) pending (réutiliser si déjà existant)
+let pending_id = null;
 
-    if (pendingErr || !pending) {
-      console.error("❌ pending_signups insert error:", pendingErr);
-      return res.status(500).json({ error: "Impossible de créer pending_signup trial" });
-    }
+// 1a) chercher un pending existant (évite l'erreur de contrainte unique)
+const { data: existingPending, error: existingErr } = await supabaseAdmin
+  .from("pending_signups")
+  .select("id, first_name, last_name, company_name, company_size, status")
+  .eq("email", emailNorm)
+  .in("status", ["pending", "invited"])
+  .order("created_at", { ascending: false })
+  .limit(1)
+  .maybeSingle();
 
-    const pending_id = pending.id;
+if (existingErr) {
+  console.error("❌ pending_signups select error:", existingErr);
+  return res.status(500).json({ error: "Erreur lecture pending_signups", details: existingErr.message });
+}
+
+if (existingPending) {
+  pending_id = existingPending.id;
+
+  // 1b) update (optionnel mais propre : tu mets à jour les infos si elles ont changé)
+  const { error: updErr } = await supabaseAdmin
+    .from("pending_signups")
+    .update({
+      first_name: first_name ?? existingPending.first_name,
+      last_name: last_name ?? existingPending.last_name,
+      company_name: company_name ?? existingPending.company_name,
+      company_size: company_size ?? existingPending.company_size,
+      desired_plan: "trial",
+      status: "pending",
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", pending_id);
+
+  if (updErr) {
+    console.error("❌ pending_signups update error:", updErr);
+    return res.status(500).json({ error: "Erreur update pending_signup trial", details: updErr.message });
+  }
+
+} else {
+  // 1c) sinon : insert normal
+  const { data: pending, error: pendingErr } = await supabaseAdmin
+    .from("pending_signups")
+    .insert([{
+      email: emailNorm,
+      first_name,
+      last_name,
+      company_name,
+      company_size,
+      desired_plan: "trial",
+      status: "pending",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }])
+    .select("id")
+    .single();
+
+  if (pendingErr || !pending) {
+    console.error("❌ pending_signups insert error:", pendingErr);
+    return res.status(500).json({
+      error: "Impossible de créer pending_signup trial",
+      details: pendingErr?.message
+    });
+  }
+
+  pending_id = pending.id;
+}
+
 
     // 2) invite email
     const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";

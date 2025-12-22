@@ -1160,93 +1160,71 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
 
 
 // ==========================================
-// 🔁 CHANGEMENT D’OFFRE STRIPE (UPGRADE / DOWNGRADE)
-// - Upgrade : immédiat + prorata (date de fin inchangée)
-// - Downgrade : interdit en cours d’année
+// 🔁 UPGRADE STANDARD → PREMIUM (MANUEL + PRORATA)
+// ✅ Stripe calcule le prorata
+// ✅ l’utilisateur voit le montant
+// ✅ paiement manuel dans Stripe
+// ✅ aucune update silencieuse côté serveur
 // ==========================================
-app.post('/api/change-plan', authenticateToken, async (req, res) => {
+app.post("/api/change-plan", authenticateToken, async (req, res) => {
   try {
-    const { newPlan } = req.body;
     const userId = req.user.id;
+    const { newPlan } = req.body;
 
-    // 0) validation
-    if (!['standard', 'premium'].includes(newPlan)) {
-      return res.status(400).json({ error: 'Plan invalide' });
+    // ✅ Upgrade uniquement standard -> premium
+    if (newPlan !== "premium") {
+      return res.status(400).json({ error: "Upgrade autorisé uniquement vers Premium" });
     }
 
-    // 1) abonnement actuel (Supabase)
+    // 1) Abonnement actuel (Supabase = vérité applicative)
     const { data: sub, error } = await supabaseAdmin
-      .from('subscriptions')
-      .select('stripe_subscription_id, stripe_price_id, plan')
-      .eq('user_id', userId)
+      .from("subscriptions")
+      .select("stripe_subscription_id, stripe_customer_id, plan")
+      .eq("user_id", userId)
       .single();
 
-    if (error || !sub?.stripe_subscription_id) {
-      return res.status(400).json({ error: 'Aucun abonnement Stripe actif' });
+    if (error || !sub?.stripe_subscription_id || !sub?.stripe_customer_id) {
+      return res.status(400).json({ error: "Aucun abonnement Stripe actif" });
     }
 
-    // déjà sur ce plan
-    if (newPlan === sub.plan) {
-      return res.json({ ok: true, message: "Déjà sur ce plan" });
+    if (sub.plan !== "standard") {
+      return res.status(400).json({ error: "Upgrade possible uniquement depuis Standard" });
     }
 
-    // downgrade interdit
-    if (sub.plan === 'premium' && newPlan === 'standard') {
-      return res.status(400).json({
-        error: "Le passage en Standard est possible uniquement au renouvellement."
-      });
-    }
+    const PREMIUM_PRICE_ID =
+      process.env.STRIPE_PRICE_PREMIUM || "price_1SIoZGPGbG6oFrATq6020zVW";
 
-    // 2) mapping plan -> price_id
-    const PRICE_BY_PLAN = {
-      standard: "price_1SIoYxPGbG6oFrATaa6wtYvX",
-      premium: "price_1SIoZGPGbG6oFrATq6020zVW"
-    };
-    const newPriceId = PRICE_BY_PLAN[newPlan];
-    if (!newPriceId) {
-      return res.status(500).json({ error: "PriceId Stripe manquant" });
-    }
+    const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
-    // 3) déterminer upgrade vs downgrade
-    const PLAN_ORDER = { standard: 1, premium: 2 };
-    const isUpgrade = PLAN_ORDER[newPlan] > PLAN_ORDER[sub.plan];
-
-    if (!isUpgrade) {
-      // (normalement déjà bloqué au-dessus, mais on sécurise)
-      return res.status(400).json({ error: "Downgrade interdit en cours d’année." });
-    }
-
-    // 4) récupérer la subscription Stripe UNE SEULE FOIS + item
+    // 2) Récupérer l’item id de la subscription Stripe (obligatoire pour update_confirm)
     const stripeSub = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
-    const currentItem = stripeSub?.items?.data?.[0];
+    const itemId = stripeSub?.items?.data?.[0]?.id;
 
-    if (!currentItem?.id) {
-      return res.status(400).json({ error: "Subscription Stripe invalide (item introuvable)." });
+    if (!itemId) {
+      return res.status(400).json({ error: "Subscription Stripe invalide (item manquant)" });
     }
 
-    // 5) upgrade proratisé (Option A : pas de checkout)
-    await stripe.subscriptions.update(sub.stripe_subscription_id, {
-      items: [{ id: currentItem.id, price: newPriceId }],
-      proration_behavior: "create_prorations",
-      metadata: {
-        action: "upgrade_prorated",
-        user_id: userId,
-        from_plan: sub.plan,
-        to_plan: newPlan
-      }
+    // 3) Billing Portal : Stripe calcule prorata + affiche + paiement manuel
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: sub.stripe_customer_id,
+      return_url: `${FRONTEND_URL}/profile.html?upgrade=return`,
+      flow_data: {
+        type: "subscription_update_confirm",
+        subscription_update_confirm: {
+          subscription: sub.stripe_subscription_id,
+          items: [{ id: itemId, price: PREMIUM_PRICE_ID, quantity: 1 }],
+        },
+      },
     });
 
-    // 👉 le webhook resync Supabase (subscription.updated / invoice.paid)
-    return res.json({ ok: true });
-
+    return res.json({ url: portalSession.url }); // ✅ garde "url" pour ton frontend actuel
   } catch (err) {
-    console.error("❌ change-plan error:", err?.raw?.message || err);
-    return res.status(500).json({
-      error: "Erreur changement d’offre",
-      details: err?.raw?.message || err.message
-    });
+    console.error("❌ change-plan portal error:", err?.raw?.message || err);
+    return res.status(500).json({ error: "Erreur upgrade" });
   }
 });
+
+
 
 
 

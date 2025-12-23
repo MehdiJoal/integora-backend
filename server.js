@@ -307,73 +307,71 @@ app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
 
 
-// ==================== FICHIERS STATIQUES PUBLICS ====================
-// ✅ 1. FICHIERS FRONTEND PUBLICS (sans auth)
-if (isProduction) {
-  app.use(express.static(path.join(__dirname, "../frontend")));
-} else {
-  app.use(express.static(path.join(__dirname, "../frontend")));
-}
+// ==================== STATIC PUBLIC / STATIC APP (PROPRE) ====================
+const FRONTEND_DIR = path.join(__dirname, "../frontend");
+const APP_DIR = path.join(FRONTEND_DIR, "app");
 
-// ==================== CONFIGURATION CORRIGÉE ====================
+// ✅ Public: tout le frontend SAUF /app/*
+const publicStatic = express.static(FRONTEND_DIR, { index: false });
 
-// ✅ 1. ASSETS PUBLICS GÉNÉRIQUES (sans /app/)
-app.use("/css", express.static(path.join(__dirname, "../frontend/app/css")));
-app.use("/js", express.static(path.join(__dirname, "../frontend/app/js")));
-app.use("/fonts", express.static(path.join(__dirname, "../frontend/app/fonts")));
-app.use("/videos", express.static(path.join(__dirname, "../frontend/app/videos")));
-app.use("/images", express.static(path.join(__dirname, "../frontend/app/images")));
-
-// ✅ 2. PROTECTION GLOBALE POUR TOUT /app/*
-app.use("/app/*", (req, res, next) => {
-  // Autoriser les assets (CSS, JS, images) même dans /app/
-  if (req.path.match(/\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|mp4|webm)$/)) {
-    return next();
-
-  }
-  // Pour les HTML, APPLIQUER L'AUTH
-  return authenticateToken(req, res, next);
+app.use((req, res, next) => {
+  if (req.path === "/app" || req.path.startsWith("/app/")) return next();
+  return publicStatic(req, res, next);
 });
 
-// ✅ 3. SERVIR /app APRÈS LA PROTECTION
-app.use("/app/assets", express.static(path.join(__dirname, "../frontend/app/assets")));
-app.use("/app/images", express.static(path.join(__dirname, "../frontend/app/images")));
+// ✅ Assets /app/* (css/js/images/fonts/videos)
+app.use("/app/css",    express.static(path.join(APP_DIR, "css")));
+app.use("/app/js",     express.static(path.join(APP_DIR, "js")));
+app.use("/app/images", express.static(path.join(APP_DIR, "images")));
+app.use("/app/assets", express.static(path.join(APP_DIR, "assets")));
+app.use("/app/fonts",  express.static(path.join(APP_DIR, "fonts")));
+app.use("/app/videos", express.static(path.join(APP_DIR, "videos")));
 
+// ✅ Gate /app : protège UNIQUEMENT les pages HTML
+app.use("/app", (req, res, next) => {
+  const isAsset = /\.[a-z0-9]+$/i.test(req.path) && !req.path.endsWith(".html");
+  if (isAsset) return next(); // les assets passent
 
-// ---------------------------
-// CONFIGURATION ESPACE MEMBRE
-// ---------------------------
-// ==================== CONFIGURATION DES ROUTES /app ====================
-app.get("/app/*", authenticateToken, (req, res) => {
-  const fullPath = req.params[0];
+  return authenticateToken(req, res, () => {
+    if (!req.user?.has_active_subscription) {
+      console.log("🚨 /app bloqué : abonnement expiré pour", req.user?.email);
+      return res
+        .status(403)
+        .sendFile(path.join(FRONTEND_DIR, "subscription-expired.html"));
+    }
+    return next();
+  });
+});
 
-  // ✅ REDIRECTION IMMÉDIATE POUR INDEX ET RACINE
-  if (fullPath === 'index.html' || fullPath === '' || fullPath === 'index' || fullPath === '/') {
-    return res.sendFile(path.join(__dirname, "../frontend/app/choix_irl_digital.html"));
+// ✅ Pages /app (sert les .html après gate)
+app.get("/app/*", (req, res) => {
+  const fullPath = req.params[0] || "";
+
+  // si quelqu’un demande un asset et qu’il arrive ici => 404 (évite fallback html)
+  if (/\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|mp4|webm)$/i.test(fullPath)) {
+    return res.status(404).end();
   }
 
-  // ✅ STRATÉGIE SIMPLIFIÉE POUR LES AUTRES PAGES
-  const searchPaths = [
-    path.join(__dirname, "../frontend/app", fullPath, fullPath + ".html"),
-    path.join(__dirname, "../frontend/app", fullPath),
-    path.join(__dirname, "../frontend/app", fullPath + ".html")
+  // racine /app => page d’accueil app
+  if (fullPath === "" || fullPath === "/" || fullPath === "index" || fullPath === "index.html") {
+    return res.sendFile(path.join(APP_DIR, "choix_irl_digital.html"));
+  }
+
+  // candidates
+  const candidates = [
+    path.join(APP_DIR, fullPath),
+    path.join(APP_DIR, fullPath + ".html"),
+    path.join(APP_DIR, fullPath, fullPath + ".html"),
   ];
 
-  let foundPath = null;
-  for (const searchPath of searchPaths) {
-    if (fs.existsSync(searchPath)) {
-      foundPath = searchPath;
-      break;
-    }
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return res.sendFile(p);
   }
 
-  if (foundPath) {
-    return res.sendFile(foundPath);
-  }
-
-  // FALLBACK
-  return res.sendFile(path.join(__dirname, "../frontend/app/choix_irl_digital.html"));
+  // fallback app
+  return res.sendFile(path.join(APP_DIR, "choix_irl_digital.html"));
 });
+
 
 
 
@@ -487,14 +485,18 @@ app.use(validateCSRF);
 // Routes principales
 const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
 
-app.get("/", (req, res) => res.redirect(FRONT));
-app.get("/login", (req, res) => res.redirect(`${FRONT}/login.html`));
-app.get("/inscription", (req, res) => res.redirect(`${FRONT}/inscription.html`));
-
-const frontDir = path.join(__dirname, "../frontend");
-if (fs.existsSync(frontDir)) {
-  app.use(express.static(frontDir));
+if (process.env.NODE_ENV === "production") {
+  // En prod: backend => redirect vers le vrai front (Vercel)
+  app.get("/", (req, res) => res.redirect(FRONT));
+  app.get("/login", (req, res) => res.redirect(`${FRONT}/login.html`));
+  app.get("/inscription", (req, res) => res.redirect(`${FRONT}/inscription.html`));
+} else {
+  // En local: on sert les pages depuis ../frontend
+  app.get("/", (req, res) => res.sendFile(path.join(FRONTEND_DIR, "index.html")));
+  app.get("/login", (req, res) => res.sendFile(path.join(FRONTEND_DIR, "login.html")));
+  app.get("/inscription", (req, res) => res.sendFile(path.join(FRONTEND_DIR, "inscription.html")));
 }
+
 
 
 
@@ -601,7 +603,6 @@ function hashToken(token) {
 }
 
 // Vérifie si un abonnement est actif et valide
-// ✅ VERSION CORRIGÉE - Gestion trial_end NULL et période N+1
 async function getActiveSubscription(userId) {
 
   const { data: sub, error } = await supabase
@@ -676,6 +677,31 @@ async function getActiveSubscription(userId) {
   return result;
 }
 
+// Automatisation expiration abonnement verification si il est renouvelé 
+async function applyPendingPrepaymentIfNeeded(userId) {
+  try {
+    const { data, error } = await supabaseAdmin.rpc("apply_pending_prepayment", {
+      p_user_id: userId,
+    });
+
+    if (error) {
+      console.warn("⚠️ apply_pending_prepayment error:", error.message);
+      return { ok: false, reason: "rpc_error" };
+    }
+
+    if (data?.ok) {
+      console.log("✅ Prépayment appliqué automatiquement:", data);
+    }
+
+    return data ?? { ok: false, reason: "no_data" };
+  } catch (e) {
+    console.warn("⚠️ applyPendingPrepaymentIfNeeded exception:", e);
+    return { ok: false, reason: "exception" };
+  }
+}
+
+
+
 // Middleware d'authentification
 // server.js - NOUVELLE VERSION authenticateToken
 async function resolveUserFromCookie(req) {
@@ -684,6 +710,7 @@ async function resolveUserFromCookie(req) {
 
   // 1) JWT
   const decoded = jwt.verify(token, SECRET_KEY);
+await applyPendingPrepaymentIfNeeded(decoded.id);
 
   // 2) Session DB
   const tokenHash = hashToken(token);
@@ -784,6 +811,8 @@ function handleAuthenticationError(req, res, error) {
     code: "INVALID_TOKEN"
   });
 }
+
+
 
 function generateCSRFToken() {
   return require('crypto').randomBytes(32).toString('hex');
@@ -1289,11 +1318,12 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     // Page profil paiement règle moins de 366 jours
     // ==========================================
     const endStr = sub.current_period_end || sub.trial_end;
-    if (endStr) {
-      const end = new Date(endStr);
-      const now = new Date();
-      const ms = end.getTime() - now.getTime();
-      const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
+if (endStr) {
+  const end = new Date(endStr);
+  const now = new Date();
+  const ms = end.getTime() - now.getTime();
+  const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
+
 
       if (daysRemaining > 366) {
         return res.status(400).json({

@@ -320,11 +320,11 @@ app.use((req, res, next) => {
 });
 
 // ✅ Assets /app/* (css/js/images/fonts/videos)
-app.use("/app/css",    express.static(path.join(APP_DIR, "css")));
-app.use("/app/js",     express.static(path.join(APP_DIR, "js")));
+app.use("/app/css", express.static(path.join(APP_DIR, "css")));
+app.use("/app/js", express.static(path.join(APP_DIR, "js")));
 app.use("/app/images", express.static(path.join(APP_DIR, "images")));
 app.use("/app/assets", express.static(path.join(APP_DIR, "assets")));
-app.use("/app/fonts",  express.static(path.join(APP_DIR, "fonts")));
+app.use("/app/fonts", express.static(path.join(APP_DIR, "fonts")));
 app.use("/app/videos", express.static(path.join(APP_DIR, "videos")));
 
 // ✅ Gate /app : protège UNIQUEMENT les pages HTML
@@ -401,7 +401,10 @@ function validateCSRF(req, res, next) {
     '/api/resend-activation',
 
     // (optionnel) si tu gardes encore l’ancienne route quelque part
-    '/api/create-paid-checkout'
+    '/api/create-paid-checkout',
+
+    // ✅ PUBLIC CONTACT 
+    '/api/contact/ticket'
   ]);
 
   if (exempt.has(req.path)) return next();
@@ -584,18 +587,45 @@ app.get("/:page", authenticateToken, async (req, res) => {
 
 
 
-
-
-
-
-
 // ---------------------------
 // FONCTIONS UTILITAIRES
 // ---------------------------
+//Helper 1 — texte “strict” (entreprise, fonction)
+function cleanTextStrict(v, { max, allowEmpty = false } = {}) {
+  if (typeof v !== "string") return allowEmpty ? null : "";
+  const s = v.trim();
+  if (!s) return allowEmpty ? null : "";
+  if (s.length > max) return s.slice(0, max);
+
+  if (/[<>]/.test(s) || /[\r\n\t]/.test(s)) return "";
+  if (/(https?:\/\/|www\.)/i.test(s)) return "";
+
+  const ok = /^[A-Za-zÀ-ÖØ-öø-ÿ0-9][A-Za-zÀ-ÖØ-öø-ÿ0-9\s.,&'()\/-]*$/.test(s);
+  return ok ? s : "";
+}
+
+//Helper 2 — nom/prénom (lettres + tiret)
+function cleanPersonName(v, { max } = {}) {
+  if (typeof v !== "string") return "";
+  const s = v.trim();
+  if (!s) return "";
+  if (s.length > max) return s.slice(0, max);
+
+  const ok = /^[A-Za-zÀ-ÖØ-öø-ÿ-]+$/.test(s);
+  return ok ? s : "";
+}
+
+//Helper 3 — message (libre mais safe)
+function cleanMessage(v, { max } = {}) {
+  if (typeof v !== "string") return "";
+  const s = v.trim();
+  if (!s) return "";
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+
 
 // server.js - AJOUTE CE MIDDLEWARE CORS COMPLET
-
-
 
 
 function hashToken(token) {
@@ -710,7 +740,7 @@ async function resolveUserFromCookie(req) {
 
   // 1) JWT
   const decoded = jwt.verify(token, SECRET_KEY);
-await applyPendingPrepaymentIfNeeded(decoded.id);
+  await applyPendingPrepaymentIfNeeded(decoded.id);
 
   // 2) Session DB
   const tokenHash = hashToken(token);
@@ -897,7 +927,7 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
 
     const period_end = subscription.current_period_end || subscription.trial_end || null;
 
-    
+
     return res.json({
       ...subscription,
       period_end,
@@ -1318,11 +1348,11 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     // Page profil paiement règle moins de 366 jours
     // ==========================================
     const endStr = sub.current_period_end || sub.trial_end;
-if (endStr) {
-  const end = new Date(endStr);
-  const now = new Date();
-  const ms = end.getTime() - now.getTime();
-  const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
+    if (endStr) {
+      const end = new Date(endStr);
+      const now = new Date();
+      const ms = end.getTime() - now.getTime();
+      const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
 
 
       if (daysRemaining > 366) {
@@ -1513,7 +1543,7 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
           user_id: userId,
           plan: desiredPlan
         },
-        
+
       },
 
       // ✅ si tu veux forcer la saisie d’un moyen de paiement à l’achat
@@ -2235,6 +2265,24 @@ app.post('/api/upload-avatar', authenticateToken, upload.single('avatar'), async
   }
 });
 
+/* Upload fichier support pour la platefor */
+const uploadSupport = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB / fichier
+  fileFilter: (req, file, cb) => {
+    const allowed = new Set([
+      "application/pdf",
+      "application/msword",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "image/jpeg",
+      "image/png",
+    ]);
+    if (allowed.has(file.mimetype)) return cb(null, true);
+    cb(new Error("Format de fichier non autorisé"), false);
+  },
+});
+
+
 
 // ==================== GESTION DES ASSETS SUPABASE ====================
 
@@ -2674,73 +2722,73 @@ app.post("/api/start-trial-invite", async (req, res) => {
     if (!emailNorm) return res.status(400).json({ error: "email requis" });
 
     // 1) pending (réutiliser si déjà existant)
-let pending_id = null;
+    let pending_id = null;
 
-// 1a) chercher un pending existant (évite l'erreur de contrainte unique)
-const { data: existingPending, error: existingErr } = await supabaseAdmin
-  .from("pending_signups")
-  .select("id, first_name, last_name, company_name, company_size, status")
-  .eq("email", emailNorm)
-  .in("status", ["pending", "invited"])
-  .order("created_at", { ascending: false })
-  .limit(1)
-  .maybeSingle();
+    // 1a) chercher un pending existant (évite l'erreur de contrainte unique)
+    const { data: existingPending, error: existingErr } = await supabaseAdmin
+      .from("pending_signups")
+      .select("id, first_name, last_name, company_name, company_size, status")
+      .eq("email", emailNorm)
+      .in("status", ["pending", "invited"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-if (existingErr) {
-  console.error("❌ pending_signups select error:", existingErr);
-  return res.status(500).json({ error: "Erreur lecture pending_signups", details: existingErr.message });
-}
+    if (existingErr) {
+      console.error("❌ pending_signups select error:", existingErr);
+      return res.status(500).json({ error: "Erreur lecture pending_signups", details: existingErr.message });
+    }
 
-if (existingPending) {
-  pending_id = existingPending.id;
+    if (existingPending) {
+      pending_id = existingPending.id;
 
-  // 1b) update (optionnel mais propre : tu mets à jour les infos si elles ont changé)
-  const { error: updErr } = await supabaseAdmin
-    .from("pending_signups")
-    .update({
-      first_name: first_name ?? existingPending.first_name,
-      last_name: last_name ?? existingPending.last_name,
-      company_name: company_name ?? existingPending.company_name,
-      company_size: company_size ?? existingPending.company_size,
-      desired_plan: "trial",
-      status: "pending",
-      updated_at: new Date().toISOString()
-    })
-    .eq("id", pending_id);
+      // 1b) update (optionnel mais propre : tu mets à jour les infos si elles ont changé)
+      const { error: updErr } = await supabaseAdmin
+        .from("pending_signups")
+        .update({
+          first_name: first_name ?? existingPending.first_name,
+          last_name: last_name ?? existingPending.last_name,
+          company_name: company_name ?? existingPending.company_name,
+          company_size: company_size ?? existingPending.company_size,
+          desired_plan: "trial",
+          status: "pending",
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", pending_id);
 
-  if (updErr) {
-    console.error("❌ pending_signups update error:", updErr);
-    return res.status(500).json({ error: "Erreur update pending_signup trial", details: updErr.message });
-  }
+      if (updErr) {
+        console.error("❌ pending_signups update error:", updErr);
+        return res.status(500).json({ error: "Erreur update pending_signup trial", details: updErr.message });
+      }
 
-} else {
-  // 1c) sinon : insert normal
-  const { data: pending, error: pendingErr } = await supabaseAdmin
-    .from("pending_signups")
-    .insert([{
-      email: emailNorm,
-      first_name,
-      last_name,
-      company_name,
-      company_size,
-      desired_plan: "trial",
-      status: "pending",
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    }])
-    .select("id")
-    .single();
+    } else {
+      // 1c) sinon : insert normal
+      const { data: pending, error: pendingErr } = await supabaseAdmin
+        .from("pending_signups")
+        .insert([{
+          email: emailNorm,
+          first_name,
+          last_name,
+          company_name,
+          company_size,
+          desired_plan: "trial",
+          status: "pending",
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }])
+        .select("id")
+        .single();
 
-  if (pendingErr || !pending) {
-    console.error("❌ pending_signups insert error:", pendingErr);
-    return res.status(500).json({
-      error: "Impossible de créer pending_signup trial",
-      details: pendingErr?.message
-    });
-  }
+      if (pendingErr || !pending) {
+        console.error("❌ pending_signups insert error:", pendingErr);
+        return res.status(500).json({
+          error: "Impossible de créer pending_signup trial",
+          details: pendingErr?.message
+        });
+      }
 
-  pending_id = pending.id;
-}
+      pending_id = pending.id;
+    }
 
 
     // 2) invite email
@@ -2876,7 +2924,515 @@ app.post("/api/resend-activation", async (req, res) => {
 });
 
 
+// ---------------------------
+// Traitement mail plateforme via support.html
+// ---------------------------
 
+// ✅ Middleware d'erreurs Multer dédié au support (10MB/fichier)
+function handleSupportMulterError(err, req, res, next) {
+  if (!err) return next();
+
+  // Erreurs Multer natives
+  if (err.name === "MulterError") {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({ error: "Fichier trop volumineux (max 5 Mo par fichier)." });
+    }
+    if (err.code === "LIMIT_UNEXPECTED_FILE") {
+      return res.status(400).json({ error: "Trop de fichiers (max 2)." });
+    }
+    return res.status(400).json({ error: `Erreur upload: ${err.code}` });
+  }
+
+  // Erreurs custom (fileFilter etc.)
+  return res.status(400).json({ error: err.message || "Erreur upload fichier." });
+}
+
+// ✅ Support V1 (sans PJ) — protégé par cookie auth + CSRF
+app.post(
+  "/api/support/ticket",
+  authenticateToken,
+  uploadSupport.array("attachments", 2),
+  handleSupportMulterError,
+  async (req, res) => {
+    try {
+      // champs form-data
+      const source = (req.body.source || "app").trim();
+      const type = (req.body.type || "support").trim();
+      const subject = (req.body.subject || "").trim();
+      const message = (req.body.message || "").trim();
+      const pageUrl = (req.body.pageUrl || "").trim();
+
+      if (!subject) return res.status(400).json({ error: "Objet manquant." });
+      if (!message || message.length < 20) return res.status(400).json({ error: "Message trop court (min 20 caractères)." });
+      if (message.length > 1200) return res.status(400).json({ error: "Message trop long (max 1200 caractères)." });
+
+      // infos user depuis le token (source of truth)
+      const userId = req.user.id;
+      const userEmail = req.user.email;
+      const userFirstName = req.user.first_name || null;
+      const userLastName = req.user.last_name || null;
+      const userPlan = req.user.subscription_type || null;
+
+      // si tu as company dans req.user : récupère, sinon laisse null
+      const companyName = req.user.company_display_name || req.user.company_name || null;
+
+      // 1) insert ticket
+      const { data: ticket, error: ticketErr } = await supabaseAdmin
+        .from("support_tickets")
+        .insert({
+          source,
+          type,
+          subject,
+          message,
+          page_url: pageUrl,
+          user_id: userId,
+          user_email: userEmail,
+          user_first_name: userFirstName,
+          user_last_name: userLastName,
+          user_plan: userPlan,
+          company_name: companyName, // ajoute la colonne si tu ne l’as pas
+          status: "open",
+        })
+        .select("*")
+        .single();
+
+      if (ticketErr) {
+        // Log complet côté serveur uniquement
+        console.error("❌ support_tickets insert error:", ticketErr);
+
+        // Message générique côté client (anti fuite SQL / schéma)
+        return res.status(500).json({
+          error: "Erreur technique lors de la création du ticket."
+        });
+      }
+
+      // 2) upload PJ (si présentes)
+      const files = req.files || [];
+      const totalBytes = files.reduce((sum, f) => sum + (f.size || 0), 0);
+      const MAX_TOTAL = 5 * 1024 * 1024; // 5MB total
+
+      if (totalBytes > MAX_TOTAL) {
+        return res.status(400).json({
+          error: "Pièces jointes trop volumineuses (max 5 Mo au total)."
+        });
+      }
+
+      const signedLinks = [];
+
+      for (const f of files) {
+        const ext = (f.originalname.split(".").pop() || "bin").toLowerCase();
+        const safeName = f.originalname.replace(/[^\w.\-() ]+/g, "_");
+        const storagePath = `tickets/${ticket.id}/${Date.now()}_${safeName}`;
+
+        const { error: upErr } = await supabaseAdmin
+          .storage
+          .from("support_attachments")
+          .upload(storagePath, f.buffer, { contentType: f.mimetype, upsert: false });
+
+        if (upErr) {
+          console.warn("PJ upload error:", upErr.message);
+          continue;
+        }
+
+        // enregistre metadata (si table)
+        await supabaseAdmin.from("support_ticket_attachments").insert({
+          ticket_id: ticket.id,
+          path: storagePath,
+          original_name: f.originalname,
+          mime: f.mimetype,
+          size: f.size,
+        });
+
+        // lien signé (ex: 14 jours)
+        const { data: signed, error: signErr } = await supabaseAdmin
+          .storage
+          .from("support_attachments")
+          .createSignedUrl(storagePath, 60 * 60 * 24 * 14);
+
+        if (!signErr && signed?.signedUrl) {
+          signedLinks.push({ name: f.originalname, url: signed.signedUrl });
+        }
+      }
+
+      // 3) email support (FR)
+      const supportTo = "support@integora.fr";
+      const subjectMail = `🎫 Support INTEGORA — ${ticket.subject} (#${ticket.id})`;
+
+      const prettySubject = escapeHtml(ticket.subject);
+      const prettyPlan = escapeHtml(ticket.user_plan || "-");
+      const prettySource = escapeHtml(`${ticket.source || "-"} / ${ticket.type || "-"}`);
+      const prettyPage = escapeHtml(ticket.page_url || "-");
+      const prettyEmail = escapeHtml(ticket.user_email || "-");
+      const prettyFirst = escapeHtml(ticket.user_first_name || "");
+      const prettyLast = escapeHtml(ticket.user_last_name || "");
+      const prettyUser = `${prettyFirst} ${prettyLast}`.trim() || "-";
+      const prettyCompany = escapeHtml(ticket.company_name || "—");
+      const prettyIdShort = String(ticket.id).slice(0, 8);
+      const prettyDate = new Date(ticket.created_at || Date.now()).toLocaleString("fr-FR");
+
+      const subjectBadges = {
+        access: { label: "Accès / Connexion", bg: "#E6F3FF", bd: "#66B7FF", tx: "#0B4A7A" },
+        bug: { label: "Bug", bg: "#FFECEC", bd: "#FF8A8A", tx: "#7A0B0B" },
+        billing: { label: "Facturation", bg: "#FFF4E5", bd: "#FFB84D", tx: "#7A4A0B" },
+        usage: { label: "Utilisation", bg: "#EAF7EE", bd: "#7FE0A0", tx: "#0B5A2A" },
+        feature: { label: "Suggestion", bg: "#F1ECFF", bd: "#B49BFF", tx: "#3A1A7A" },
+        other: { label: "Autre", bg: "#EEF2F7", bd: "#AAB4C3", tx: "#223048" },
+      };
+      const badge = subjectBadges[ticket.subject] || { label: prettySubject, bg: "#EEF2F7", bd: "#AAB4C3", tx: "#223048" };
+      const planBadge = (ticket.user_plan || "").toLowerCase() === "premium"
+        ? { label: "Plan premium", bg: "#FFF4E5", bd: "#FFB84D", tx: "#7A4A0B" }
+        : (ticket.user_plan || "").toLowerCase() === "standard"
+          ? { label: "Plan standard", bg: "#EAF7EE", bd: "#7FE0A0", tx: "#0B5A2A" }
+          : { label: `Plan ${prettyPlan}`, bg: "#EEF2F7", bd: "#AAB4C3", tx: "#223048" };
+
+      const html = `
+  <div style="margin:0;padding:0;background:#f4f6fb;">
+    <div style="max-width:760px;margin:0 auto;padding:28px 14px;font-family:Arial,sans-serif;color:#0f172a;">
+      
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+        <span style="display:inline-block;width:10px;height:10px;border-radius:999px;background:#22c55e;"></span>
+        <div style="font-weight:800;font-size:16px;">INTEGORA — Nouveau ticket Support</div>
+      </div>
+
+      <div style="background:#ffffff;border:1px solid #e6eaf2;border-radius:18px;box-shadow:0 10px 28px rgba(2,6,23,0.06);padding:18px 18px 16px;">
+        
+        <!-- BADGES -->
+        <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;">
+          <span style="display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid ${badge.bd};background:${badge.bg};color:${badge.tx};font-weight:700;font-size:13px;">
+            ${badge.label}
+          </span>
+
+          <span style="display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid #cbd5e1;background:#eef2ff;color:#1e293b;font-weight:700;font-size:13px;">
+            Ticket ${escapeHtml(prettyIdShort)}
+          </span>
+
+          <span style="display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid ${planBadge.bd};background:${planBadge.bg};color:${planBadge.tx};font-weight:800;font-size:13px;">
+            ${planBadge.label}
+          </span>
+        </div>
+
+        <!-- INFOS -->
+        <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.5;">
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;width:160px;">Date</td>
+            <td style="padding:4px 0;color:#0f172a;">${escapeHtml(prettyDate)}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Source</td>
+            <td style="padding:4px 0;color:#0f172a;">${prettySource}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Page</td>
+            <td style="padding:4px 0;color:#0f172a;">${prettyPage}</td>
+          </tr>
+
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Prénom</td>
+            <td style="padding:4px 0;color:#0f172a;">${escapeHtml(ticket.user_first_name || "—")}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Nom</td>
+            <td style="padding:4px 0;color:#0f172a;">${escapeHtml(ticket.user_last_name || "—")}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Email</td>
+            <td style="padding:4px 0;color:#0f172a;">${prettyEmail}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Entreprise</td>
+            <td style="padding:4px 0;color:#0f172a;">${prettyCompany}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">User ID</td>
+            <td style="padding:4px 0;color:#0f172a;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;font-size:12.5px;">
+              ${escapeHtml(ticket.user_id || "—")}
+            </td>
+          </tr>
+        </table>
+
+        <!-- MESSAGE -->
+        <div style="margin-top:14px;border:1px solid #e6eaf2;border-radius:14px;background:#f8fafc;padding:14px;">
+          <div style="font-weight:800;margin-bottom:8px;color:#0f172a;">Message</div>
+          <div style="white-space:pre-wrap;color:#0f172a;">${escapeHtml(ticket.message)}</div>
+        </div>
+
+        <!-- PJ -->
+        <div style="margin-top:16px;">
+          <div style="font-weight:900;font-size:16px;margin-bottom:8px;">Pièces jointes</div>
+          ${signedLinks.length
+          ? `<ul style="margin:0;padding-left:18px;">
+                  ${signedLinks
+            .map(
+              (x) => `
+                      <li style="margin:6px 0;">
+                        <a href="${x.url}" style="color:#2563eb;text-decoration:underline;font-weight:700;">
+                          ${escapeHtml(x.name)}
+                        </a>
+                      </li>`
+            )
+            .join("")}
+                </ul>
+                <div style="margin-top:8px;color:#64748b;font-size:12px;">
+                  Liens signés (expirent automatiquement).
+                </div>`
+          : `<div style="color:#64748b;">Aucune pièce jointe.</div>`
+        }
+        </div>
+
+        <div style="text-align:center;margin-top:14px;color:#94a3b8;font-size:12px;">
+          INTEGORA • Ticket ${escapeHtml(prettyIdShort)}
+        </div>
+      </div>
+    </div>
+  </div>
+`;
+
+
+      await sendResendEmail({ to: supportTo, subject: subjectMail, html });
+
+      // 4) accusé de réception user (noreply)
+      const ackSubject = "INTEGORA — Demande reçue ✅";
+      const ackHtml = `
+        <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
+          <h2 style="margin:0 0 10px">Nous avons bien reçu votre demande</h2>
+          <p>Votre ticket a été créé avec succès.</p>
+          <p><b>Référence :</b> ${ticket.id}</p>
+          <p style="color:#666;font-size:12px">Cet email est envoyé automatiquement. Vous pouvez répondre à cet email si vous le souhaites, ou passer par la page Support.</p>
+        </div>
+      `;
+      await sendResendEmail({ to: userEmail, subject: ackSubject, html: ackHtml });
+
+      return res.json({ ok: true, ticket_id: ticket.id });
+
+    } catch (e) {
+      console.error("❌ /api/support/ticket:", e);
+      return res.status(500).json({ error: "Erreur serveur" });
+    }
+  }
+);
+
+
+
+// ---------------------------
+// CONTACT PUBLIC (contact.html) 
+// ---------------------------
+
+// ✅ Rate limit plus strict (public)
+const contactPublicLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 min
+  max: 10, // 10 requêtes / 10 min / IP
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// helper email
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
+}
+
+app.post("/api/contact/ticket", contactPublicLimiter, async (req, res) => {
+  try {
+    // Si tu n'as pas déjà app.use(express.json()) plus haut, garde bodyParser
+    const subject = String(req.body?.subject || "").trim();
+    const message = cleanMessage(req.body?.message, { max: 1200 });
+    const pageUrl = String(req.body?.pageUrl || "").trim() || null;
+
+    const firstName = cleanPersonName(req.body?.firstName, { max: 30 });
+    const lastName = cleanPersonName(req.body?.lastName, { max: 40 });
+
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const companyName = cleanTextStrict(req.body?.companyName, { max: 60, allowEmpty: true });
+    const position = cleanTextStrict(req.body?.position, { max: 60, allowEmpty: false });
+    const phoneRaw = req.body?.phone;
+    let phone = null;
+    if (typeof phoneRaw === "string") {
+      const v = phoneRaw.trim();
+      phone = v ? v : null;
+    } else {
+      phone = null;
+    }
+
+
+    // ✅ Honeypot simple (optionnel mais recommandé)
+    // (côté HTML tu mets un input caché name="website")
+    const honeypot = String(req.body?.website || "").trim();
+    if (honeypot) return res.status(200).json({ ok: true }); // on "fait comme si" pour tromper les bots
+
+    // ✅ Validations
+    if (!subject) return res.status(400).json({ error: "Objet manquant." });
+    if (!firstName) return res.status(400).json({ error: "Prénom manquant." });
+    if (!lastName) return res.status(400).json({ error: "Nom manquant." });
+    if (!position) return res.status(400).json({ error: "Fonction / Poste manquant." });
+    if (position.length > 60) return res.status(400).json({ error: "Fonction / Poste trop long (max 60 caractères)." });
+
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ error: "Adresse email invalide." });
+    }
+    if (!message || message.length < 20) {
+      return res.status(400).json({ error: "Message trop court (min 20 caractères)." });
+    }
+    if (message.length > 1200) {
+      return res.status(400).json({ error: "Message trop long (max 1200 caractères)." });
+    }
+
+    // 1) insert DB (table dédiée)
+    const { data: ticket, error: ticketErr } = await supabaseAdmin
+      .from("contact_tickets")
+      .insert({
+        subject,
+        message,
+        page_url: pageUrl,
+        first_name: firstName,
+        last_name: lastName,
+        email,
+        company_name: companyName,
+        position,
+        phone,
+        status: "open",
+      })
+      .select("*")
+      .single();
+
+    if (ticketErr) {
+      console.error("❌ contact_tickets insert error:", ticketErr);
+      return res.status(500).json({ error: "Erreur technique lors de l'envoi." });
+    }
+
+    // 2) email interne => contact@integora.fr
+    const contactTo = "contact@integora.fr";
+    const subjectMail = `📩 Contact INTEGORA — ${ticket.subject} (#${ticket.id})`;
+
+    // ✅ mêmes codes couleurs / mêmes pills que Support, mais adapté au Contact public
+    const prettySubject = escapeHtml(ticket.subject);
+    const prettySource = "public / contact";
+    const prettyPage = escapeHtml(ticket.page_url || "—");
+    const prettyEmail = escapeHtml(ticket.email || "—");
+    const prettyCompany = escapeHtml(ticket.company_name || "—");
+    const prettyIdShort = String(ticket.id).slice(0, 8);
+    const prettyDate = new Date(ticket.created_at || Date.now()).toLocaleString("fr-FR");
+
+    // Mapping "nature" (contact) -> label + couleurs (tu peux ajuster si tu veux)
+    const subjectBadges = {
+      general: { label: "Demande générale", bg: "#EEF2F7", bd: "#AAB4C3", tx: "#223048" },
+      demo: { label: "Demande de démonstration", bg: "#E6F3FF", bd: "#66B7FF", tx: "#0B4A7A" },
+      commercial: { label: "Demande commerciale", bg: "#FFF4E5", bd: "#FFB84D", tx: "#7A4A0B" },
+      support: { label: "Support / assistance", bg: "#E6F3FF", bd: "#66B7FF", tx: "#0B4A7A", },
+      partnership: { label: "Partenariat", bg: "#F1ECFF", bd: "#B49BFF", tx: "#3A1A7A" },
+      other: { label: "Autre demande", bg: "#EEF2F7", bd: "#AAB4C3", tx: "#223048" },
+    };
+
+    const badge = subjectBadges[ticket.subject] || { label: prettySubject, bg: "#EEF2F7", bd: "#AAB4C3", tx: "#223048" };
+
+    // Badge "CONTACT" (remplace le badge Plan du support)
+    const contactBadge = { label: "Contact public", bg: "#ecfeff", bd: "#67e8f9", tx: "#155e75" };
+
+    const html = `
+  <div style="margin:0;padding:0;background:#f4f6fb;">
+    <div style="max-width:760px;margin:0 auto;padding:28px 14px;font-family:Arial,sans-serif;color:#0f172a;">
+      
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+        <span style="display:inline-block;width:10px;height:10px;border-radius:999px;background:#22c55e;"></span>
+        <div style="font-weight:800;font-size:16px;">INTEGORA — Nouveau message Contact</div>
+      </div>
+
+      <div style="background:#ffffff;border:1px solid #e6eaf2;border-radius:18px;box-shadow:0 10px 28px rgba(2,6,23,0.06);padding:18px 18px 16px;">
+        
+        <!-- BADGES -->
+        <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;">
+          <span style="display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid ${badge.bd};background:${badge.bg};color:${badge.tx};font-weight:700;font-size:13px;">
+            ${badge.label}
+          </span>
+
+          <span style="display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid #cbd5e1;background:#eef2ff;color:#1e293b;font-weight:700;font-size:13px;">
+            Ticket ${escapeHtml(prettyIdShort)}
+          </span>
+
+          <span style="display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid ${contactBadge.bd};background:${contactBadge.bg};color:${contactBadge.tx};font-weight:800;font-size:13px;">
+            ${contactBadge.label}
+          </span>
+        </div>
+
+        <!-- INFOS -->
+        <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.5;">
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;width:160px;">Date</td>
+            <td style="padding:4px 0;color:#0f172a;">${escapeHtml(prettyDate)}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Source</td>
+            <td style="padding:4px 0;color:#0f172a;">${escapeHtml(prettySource)}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Page</td>
+            <td style="padding:4px 0;color:#0f172a;">${prettyPage}</td>
+          </tr>
+
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Prénom</td>
+            <td style="padding:4px 0;color:#0f172a;">${escapeHtml(ticket.first_name || "—")}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Nom</td>
+            <td style="padding:4px 0;color:#0f172a;">${escapeHtml(ticket.last_name || "—")}</td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Email</td>
+            <td style="padding:4px 0;color:#0f172a;">${prettyEmail}</td>
+          </tr>
+          ${ticket.phone ? `
+          <tr>
+             <td style="padding:4px 0;color:#64748b;font-weight:700;">Téléphone</td>
+             <td style="padding:4px 0;color:#0f172a;">${escapeHtml(ticket.phone)}</td>
+           </tr> `
+        : ""}
+          <tr>
+            <td style="padding:4px 0;color:#64748b;font-weight:700;">Entreprise</td>
+            <td style="padding:4px 0;color:#0f172a;">${prettyCompany}</td>
+          </tr>
+        </table>
+
+        <!-- MESSAGE -->
+        <div style="margin-top:14px;border:1px solid #e6eaf2;border-radius:14px;background:#f8fafc;padding:14px;">
+          <div style="font-weight:800;margin-bottom:8px;color:#0f172a;">Message</div>
+          <div style="white-space:pre-wrap;color:#0f172a;">${escapeHtml(ticket.message)}</div>
+        </div>
+
+        <!-- PJ -->
+        <div style="margin-top:16px;">
+          <div style="font-weight:900;font-size:16px;margin-bottom:8px;">Pièces jointes</div>
+          <div style="color:#64748b;">Aucune (formulaire Contact public).</div>
+        </div>
+
+        <div style="text-align:center;margin-top:14px;color:#94a3b8;font-size:12px;">
+          INTEGORA • Ticket ${escapeHtml(prettyIdShort)}
+        </div>
+      </div>
+    </div>
+  </div>
+`;
+
+
+    await sendResendEmail({ to: contactTo, subject: subjectMail, html });
+
+    // 3) accusé de réception (public)
+    const ackSubject = "INTEGORA — Message reçu ✅";
+    const ackHtml = `
+      <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
+        <h2 style="margin:0 0 10px">Nous avons bien reçu votre message</h2>
+        <p>Merci, votre demande a été transmise à notre équipe.</p>
+        <p><b>Référence :</b> ${escapeHtml(String(ticket.id))}</p>
+        <p style="color:#666;font-size:12px">Email automatique — vous pouvez répondre à ce message si nécessaire.</p>
+      </div>
+    `;
+    await sendResendEmail({ to: email, subject: ackSubject, html: ackHtml });
+
+    return res.json({ ok: true, ticket_id: ticket.id });
+
+  } catch (e) {
+    console.error("❌ /api/contact/ticket:", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
 
 
 

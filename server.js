@@ -272,13 +272,25 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 
-// 🔥 RATE LIMITING AGGRESSIF
-//   windowMs: 15 * 60 * 1000, // 15 minutes
-//   max: 5, // 5 tentatives max
-//   message: { error: 'Trop de tentatives. Réessayez dans 15 minutes.' },
-//   standardHeaders: true,
-//   legacyHeaders: false
-// });
+// 🔥 RATE LIMITING AGGRESSIF (auth)
+const { ipKeyGenerator } = require("express-rate-limit");
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: "Trop de tentatives. Réessayez dans 15 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  keyGenerator: (req, res) => {
+    const email = (req.body?.email || "").toString().trim().toLowerCase();
+    return `${ipKeyGenerator(req, res)}:${email}`;
+  },
+});
+
+
+
+
 
 
 const globalLimiter = rateLimit({
@@ -299,10 +311,10 @@ app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
 
 // Appliquer les limiteurs
-// app.use(globalLimiter);
-//app.use('/login', authLimiter);
-//app.use('/inscription', authLimiter);
-//app.use('/api/verify-token', authLimiter);
+app.use(globalLimiter);
+app.use('/login', authLimiter);
+app.use('/inscription', authLimiter);
+app.use('/api/verify-token', authLimiter);
 
 
 

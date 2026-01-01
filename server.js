@@ -36,7 +36,7 @@ const helmet = require('helmet');
 
 
 // ==========================================
-// 📧 RESEND (emails sécurité)
+// 📧 RESEND 
 // ==========================================
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const RESEND_FROM = process.env.RESEND_FROM || "INTEGORA <noreply@integora.fr>";
@@ -512,6 +512,37 @@ if (process.env.NODE_ENV === "production") {
   app.get("/inscription", (req, res) => res.sendFile(path.join(FRONTEND_DIR, "inscription.html")));
 }
 
+if (process.env.NODE_ENV !== "production") {
+  app.get("/dev/recovery-link", async (req, res) => {
+    try {
+      const email = String(req.query.email || "").trim().toLowerCase();
+      if (!email) return res.status(400).json({ error: "email manquant" });
+
+      // ⚠️ Optionnel mais recommandé : un secret pour éviter qu’un voisin sur le réseau l’utilise
+      const secret = req.headers["x-dev-secret"];
+      if (process.env.DEV_TOOLS_SECRET && secret !== process.env.DEV_TOOLS_SECRET) {
+        return res.status(403).json({ error: "forbidden" });
+      }
+
+      const redirectTo = "http://localhost:3000/reset-password.html";
+
+      const { data, error } = await supabase.auth.admin.generateLink({
+        type: "recovery",
+        email,
+        options: { redirectTo }
+      });
+
+      if (error) throw error;
+
+      // data.properties.action_link = lien magique complet
+      return res.json({ action_link: data.properties.action_link });
+    } catch (e) {
+      return res.status(500).json({ error: e?.message || "error" });
+    }
+  });
+}
+
+
 
 
 
@@ -521,6 +552,27 @@ app.use((error, req, res, next) => {
     return res.status(403).json({ error: 'CORS non autorisé' });
   }
   next(error);
+});
+
+
+// ✅ CONFIG FRONT 
+app.get("/config.js", (req, res) => {
+  const url = process.env.SUPABASE_URL;
+  const anon = process.env.SUPABASE_ANON_KEY;
+
+  if (!url || !anon) {
+    return res.status(500).type("text/plain").send("Missing SUPABASE_URL or SUPABASE_ANON_KEY");
+  }
+
+  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+
+  return res.send(
+    `window.APP_CONFIG=${JSON.stringify({
+      SUPABASE_URL: url,
+      SUPABASE_ANON_KEY: anon,
+    })};`
+  );
 });
 
 
@@ -1580,170 +1632,6 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
 
 
 
-// ==========================================
-// 🔐 SECURITY EMAILS (Resend)
-// ==========================================
-
-// ✅ Alerte : demande de changement d'email (envoie sur l'ancien email)
-app.post("/api/security/email-change-requested", authenticateToken, async (req, res) => {
-  try {
-    const oldEmail = (req.user.email || "").toLowerCase();
-    const newEmail = (req.body?.newEmail || "").trim().toLowerCase();
-
-    if (!oldEmail) return res.status(400).json({ error: "Email actuel introuvable." });
-    if (!newEmail) return res.status(400).json({ error: "newEmail manquant." });
-
-    const subject = "Sécurité INTEGORA — Demande de changement d’email";
-    const html = buildEmailChangeRequestedHtml({ oldEmail, newEmail });
-
-    await sendResendEmail({ to: oldEmail, subject, html });
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("❌ /api/security/email-change-requested:", e);
-    return res.status(500).json({ error: "Erreur envoi email sécurité", details: e.message });
-  }
-});
-
-// ✅ Alerte : mot de passe modifié (mail sécurité, SANS déconnexion)
-app.post("/api/security/password-changed", authenticateToken, async (req, res) => {
-  try {
-    const email = (req.user.email || "").toLowerCase();
-    if (!email) return res.status(400).json({ error: "Email introuvable." });
-
-    const subject = "Sécurité INTEGORA — Mot de passe modifié";
-    const html = buildPasswordChangedEmailHtml({
-      firstName: req.user.first_name,
-      ip: (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip,
-      userAgent: req.headers["user-agent"],
-    });
-
-    await sendResendEmail({ to: email, subject, html });
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("❌ /api/security/password-changed:", e);
-    return res.status(500).json({ error: "Erreur envoi email sécurité", details: e.message });
-  }
-});
-
-function buildEmailChangeRequestedHtml({ oldEmail, newEmail }) {
-  const safeOld = escapeHtml(oldEmail);
-  const safeNew = escapeHtml(newEmail);
-
-  const resetStartUrl = "https://integora-frontend.vercel.app/forgot-password.html";
-  const supportUrl = "https://integora.fr/contact";
-
-  return `
-    <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
-      <h2 style="margin:0 0 12px">Sécurité INTEGORA — Demande de changement d’email</h2>
-
-      <p>Une demande de changement d’email a été initiée sur votre compte INTEGORA.</p>
-
-      <p>
-        <b>Email actuel :</b> ${safeOld}<br/>
-        <b>Nouvel email demandé :</b> ${safeNew}
-      </p>
-
-      <div style="margin:14px 0;padding:12px;border:1px solid #eee;border-radius:10px;background:#fafafa">
-        <p style="margin:0 0 6px"><b>Si c’est bien vous</b> : vous pouvez ignorer cet email.</p>
-        <p style="margin:0"><b>Si ce n’était pas vous</b> :</p>
-        <ol style="margin:8px 0 0 18px;padding:0">
-          <li>Réinitialisez votre mot de passe immédiatement</li>
-          <li>Contactez le support</li>
-        </ol>
-      </div>
-
-      <p style="margin:16px 0">
-        <a href="${resetStartUrl}"
-           style="display:inline-block;padding:12px 16px;background:#111;color:#fff;text-decoration:none;border-radius:10px">
-          Ce n’était pas moi → Réinitialiser mon mot de passe
-        </a>
-      </p>
-
-      <p style="margin:0 0 10px">
-        <a href="${supportUrl}">Contacter le support</a>
-      </p>
-
-      <hr style="border:none;border-top:1px solid #eee;margin:18px 0" />
-      <p style="font-size:12px;color:#666;margin:0">Email automatique — ne pas répondre.</p>
-    </div>
-  `;
-}
-
-function buildPasswordChangedEmailHtml({ firstName, ip, userAgent }) {
-  const safeName = escapeHtml(firstName || "");
-  const safeIp = escapeHtml(ip || "-");
-  const safeUa = escapeHtml(userAgent || "-");
-
-
-  const resetStartUrl = "https://integora-frontend.vercel.app/forgot-password.html";
-  const supportUrl = "https://integora.fr/contact";
-
-  return `
-  <div style="margin:0;padding:0;background:#070B12;">
-    <div style="max-width:680px;margin:0 auto;padding:28px 16px;background:#070B12;">
-      
-      <div style="border:1px solid rgba(0,255,170,0.25);border-radius:18px;padding:28px;background:linear-gradient(180deg, rgba(16,24,39,0.96), rgba(7,11,18,0.96));">
-        
-        <div style="text-align:center;margin-bottom:18px;">
-          <div style="font-size:28px;font-weight:800;letter-spacing:2px;color:#00ffb2;">
-            INTEGORA
-          </div>
-          <div style="margin-top:10px;font-size:20px;font-weight:700;color:#ffffff;">
-            Sécurité — Mot de passe modifié
-          </div>
-        </div>
-
-        <div style="font-family:Arial,sans-serif;color:#cbd5e1;font-size:15px;line-height:1.55;">
-          <p style="margin:0 0 10px;">Bonjour${safeName ? ` ${safeName}` : ""},</p>
-
-          <p style="margin:0 0 14px;">
-            Le mot de passe de votre compte INTEGORA vient d’être modifié.
-          </p>
-
-          <div style="margin:14px 0;padding:14px;border:1px solid rgba(255,255,255,0.08);border-radius:14px;background:rgba(255,255,255,0.03);">
-            <div style="color:#ffffff;font-weight:700;margin-bottom:6px;">Si c’est bien vous</div>
-            <div style="margin-bottom:10px;">Aucune action n’est nécessaire.</div>
-
-            <div style="color:#ffffff;font-weight:700;margin-bottom:6px;">Si ce n’était pas vous</div>
-            <ol style="margin:0 0 0 18px;padding:0;">
-              <li>Lancez immédiatement une demande de changement de mot de passe via votre adresse e-mail</li>
-              <li>Contactez notre support si vous observez une activité inhabituelle</li>
-            </ol>
-          </div>
-
-          <div style="text-align:center;margin:18px 0 10px;">
-            <a href="${resetStartUrl}"
-              style="display:inline-block;padding:14px 18px;border-radius:999px;
-                     background:linear-gradient(90deg,#7c3aed,#a855f7);
-                     color:#ffffff;text-decoration:none;font-weight:800;">
-              🔒 Sécuriser mon compte
-            </a>
-          </div>
-
-          <div style="text-align:center;margin:8px 0 0;">
-            <a href="${supportUrl}" style="color:#8ab4ff;text-decoration:underline;">
-              Contacter le support
-            </a>
-          </div>
-
-          <div style="margin-top:18px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px;">
-            <div style="font-size:12px;color:#94a3b8;">
-              Détails (indicatifs) : IP ${safeIp} • ${safeUa}<br/>
-              Email automatique — ne pas répondre.
-            </div>
-          </div>
-
-        </div>
-      </div>
-
-      <div style="text-align:center;color:#64748b;font-family:Arial,sans-serif;font-size:12px;margin-top:12px;">
-        © INTEGORA — Tous droits réservés
-      </div>
-
-    </div>
-  </div>
-  `;
-}
 
 
 

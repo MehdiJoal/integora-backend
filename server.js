@@ -1371,7 +1371,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
     // 3) Billing Portal : Stripe calcule prorata + affiche + paiement manuel
     const portalSession = await stripe.billingPortal.sessions.create({
       customer: sub.stripe_customer_id,
-      return_url: `${FRONTEND_URL}/profile.html?upgrade=return`,
+      return_url: `${FRONTEND_URL}/app/profile.html?upgrade=return`,
       flow_data: {
         type: "subscription_update_confirm",
         subscription_update_confirm: {
@@ -1472,8 +1472,8 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
         },
         quantity: 1
       }],
-      success_url: `${FRONTEND_URL}/profile.html?prepay=success`,
-      cancel_url: `${FRONTEND_URL}/profile.html?prepay=cancel`,
+      success_url: `${FRONTEND_URL}/app/profile.html?prepay=success`,
+      cancel_url: `${FRONTEND_URL}/app/profile.html?prepay=cancel`,
       metadata: {
         action: "prepay_next_year",
         user_id: userId,
@@ -1626,8 +1626,8 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
 
       line_items: [{ price: priceId, quantity: 1 }],
 
-      success_url: `${FRONTEND_URL}/profile.html?checkout=success`,
-      cancel_url: `${FRONTEND_URL}/profile.html?checkout=cancel`,
+      success_url: `${FRONTEND_URL}/app/profile.html?checkout=success`,
+      cancel_url: `${FRONTEND_URL}/app/profile.html?checkout=cancel`,
 
       metadata: {
         action: "subscribe_paid",

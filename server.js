@@ -328,6 +328,10 @@ app.use(globalLimiter);
 app.use('/login', authLimiter);
 app.use('/inscription', authLimiter);
 app.use('/api/verify-token', authLimiter);
+app.use('/api/start-trial-invite', authLimiter);
+app.use('/api/start-paid-checkout', authLimiter);
+app.use('/api/resend-activation', authLimiter);
+
 
 
 
@@ -1300,6 +1304,23 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
     res.status(500).json({ error: 'Erreur lors de la suppression' });
   }
 });
+
+
+// ==========================================
+// ✅ Validation serveur stricte
+// ==========================================
+// ✅ Whitelist stricte (doit matcher inscription.html)
+const ALLOWED_COMPANY_SIZES = new Set(["1-10", "11-50", "51-200", "201-500", "501+"]);
+const ALLOWED_PLANS = new Set(["trial", "standard", "premium"]);
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
+}
+
 
 
 // ==========================================
@@ -2324,23 +2345,26 @@ app.post("/api/start-paid-checkout", async (req, res) => {
   console.log("🟡 [START-PAID] Reçu:", JSON.stringify(req.body, null, 2));
 
   try {
-    const {
-      email,
-      first_name,
-      last_name,
-      company_name,
-      company_size,
-      desired_plan
-    } = req.body;
+    const emailNorm = normalizeEmail(req.body?.email);
+    if (!emailNorm) return res.status(400).json({ error: "email requis" });
+    if (!isValidEmail(emailNorm)) return res.status(400).json({ error: "email invalide" });
+    if (emailNorm.length > 254) return res.status(400).json({ error: "email trop long" });
 
-    const emailNorm = (email || "").trim().toLowerCase();
-
-    if (!emailNorm || !desired_plan) {
-      return res.status(400).json({ error: "email + desired_plan requis" });
-    }
+    const desired_plan = String(req.body?.desired_plan || "").trim();
     if (!["standard", "premium"].includes(desired_plan)) {
       return res.status(400).json({ error: "desired_plan invalide" });
     }
+
+    const first_name = cleanPersonName(req.body?.first_name, { max: 50 });
+    const last_name = cleanPersonName(req.body?.last_name, { max: 50 });
+    const company_name = cleanTextStrict(req.body?.company_name, { max: 120, allowEmpty: false });
+    const company_size = String(req.body?.company_size || "").trim();
+
+    if (!first_name || first_name.length < 2) return res.status(400).json({ error: "first_name invalide" });
+    if (!last_name || last_name.length < 2) return res.status(400).json({ error: "last_name invalide" });
+    if (!company_name || company_name.length < 2) return res.status(400).json({ error: "company_name invalide" });
+    if (!ALLOWED_COMPANY_SIZES.has(company_size)) return res.status(400).json({ error: "company_size invalide" });
+
 
     // ✅ 0) S'il existe déjà un pending actif pour cet email, on le réutilise
     //     (évite l’erreur unique constraint pending_one_active_per_email)
@@ -2623,16 +2647,23 @@ app.post("/api/start-trial-invite", async (req, res) => {
   console.log("🟣 [TRIAL] Reçu:", JSON.stringify(req.body, null, 2));
 
   try {
-    const {
-      email,
-      first_name,
-      last_name,
-      company_name,
-      company_size
-    } = req.body;
-
-    const emailNorm = (email || "").trim().toLowerCase();
+    const emailNorm = normalizeEmail(req.body?.email);
     if (!emailNorm) return res.status(400).json({ error: "email requis" });
+    if (!isValidEmail(emailNorm)) return res.status(400).json({ error: "email invalide" });
+    if (emailNorm.length > 254) return res.status(400).json({ error: "email trop long" });
+
+    const first_name = cleanPersonName(req.body?.first_name, { max: 50 });
+    const last_name = cleanPersonName(req.body?.last_name, { max: 50 });
+    const company_name = cleanTextStrict(req.body?.company_name, { max: 120, allowEmpty: false });
+    const company_size = String(req.body?.company_size || "").trim();
+
+    if (!first_name || first_name.length < 2) return res.status(400).json({ error: "first_name invalide" });
+    if (!last_name || last_name.length < 2) return res.status(400).json({ error: "last_name invalide" });
+    if (!company_name || company_name.length < 2) return res.status(400).json({ error: "company_name invalide" });
+    if (!ALLOWED_COMPANY_SIZES.has(company_size)) return res.status(400).json({ error: "company_size invalide" });
+
+    const desired_plan = "trial";
+
 
     // 1) pending (réutiliser si déjà existant)
     let pending_id = null;
@@ -2885,21 +2916,21 @@ app.post(
 
 
       // ✅ anti doublon (5 min) — À METTRE DANS LA ROUTE
-const dup = await findRecentDuplicateSupport({
-  userId: req.user.id,
-  subject,
-  message,
-  minutes: 5
-});
+      const dup = await findRecentDuplicateSupport({
+        userId: req.user.id,
+        subject,
+        message,
+        minutes: 5
+      });
 
-if (dup) {
-  return res.status(200).json({
-    ok: true,
-    skipped: true,
-    reason: "duplicate_recent",
-    ticket_id: dup.id
-  });
-}
+      if (dup) {
+        return res.status(200).json({
+          ok: true,
+          skipped: true,
+          reason: "duplicate_recent",
+          ticket_id: dup.id
+        });
+      }
 
       // infos user depuis le token (source of truth)
       const userId = req.user.id;
@@ -3145,28 +3176,28 @@ if (dup) {
     }
 
     async function findRecentDuplicateSupport({ userId, subject, message, minutes = 5 }) {
-  try {
-    const since = new Date(Date.now() - minutes * 60 * 1000).toISOString();
-    const { data, error } = await supabaseAdmin
-      .from("support_tickets")
-      .select("id, created_at")
-      .eq("user_id", userId)
-      .eq("subject", subject)
-      .eq("message", message)
-      .gte("created_at", since)
-      .order("created_at", { ascending: false })
-      .limit(1);
+      try {
+        const since = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+        const { data, error } = await supabaseAdmin
+          .from("support_tickets")
+          .select("id, created_at")
+          .eq("user_id", userId)
+          .eq("subject", subject)
+          .eq("message", message)
+          .gte("created_at", since)
+          .order("created_at", { ascending: false })
+          .limit(1);
 
-    if (error) return null;
-    return data?.[0] || null;
-  } catch {
-    return null;
+        if (error) return null;
+        return data?.[0] || null;
+      } catch {
+        return null;
+      }
+    }
+
   }
-}
 
-  }
 
-  
 );
 
 
@@ -3219,10 +3250,10 @@ app.post("/api/contact/ticket", contactPublicLimiter, async (req, res) => {
     }
 
     const dup = await findRecentDuplicateContact({ email, subject, message, minutes: 10 });
-if (dup) {
-  // ✅ On "fait comme si c'était OK" MAIS on évite tout envoi email
-  return res.status(200).json({ ok: true, ticket_id: dup.id, duplicate: true });
-}
+    if (dup) {
+      // ✅ On "fait comme si c'était OK" MAIS on évite tout envoi email
+      return res.status(200).json({ ok: true, ticket_id: dup.id, duplicate: true });
+    }
 
 
 

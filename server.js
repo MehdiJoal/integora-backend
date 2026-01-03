@@ -288,6 +288,19 @@ const authLimiter = rateLimit({
   },
 });
 
+// rate limite formulaire contact
+const supportLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req, res) => {
+    const uid = req.user?.id || "anon";
+    return `${uid}:${ipKeyGenerator(req, res)}`;
+  },
+});
+
+
 
 
 
@@ -2847,10 +2860,14 @@ function handleSupportMulterError(err, req, res, next) {
   return res.status(400).json({ error: err.message || "Erreur upload fichier." });
 }
 
+
+
+
 // ✅ Support V1 (sans PJ) — protégé par cookie auth + CSRF
 app.post(
   "/api/support/ticket",
   authenticateToken,
+  supportLimiter,
   uploadSupport.array("attachments", 2),
   handleSupportMulterError,
   async (req, res) => {
@@ -2865,6 +2882,24 @@ app.post(
       if (!subject) return res.status(400).json({ error: "Objet manquant." });
       if (!message || message.length < 20) return res.status(400).json({ error: "Message trop court (min 20 caractères)." });
       if (message.length > 1200) return res.status(400).json({ error: "Message trop long (max 1200 caractères)." });
+
+
+      // ✅ anti doublon (5 min) — À METTRE DANS LA ROUTE
+const dup = await findRecentDuplicateSupport({
+  userId: req.user.id,
+  subject,
+  message,
+  minutes: 5
+});
+
+if (dup) {
+  return res.status(200).json({
+    ok: true,
+    skipped: true,
+    reason: "duplicate_recent",
+    ticket_id: dup.id
+  });
+}
 
       // infos user depuis le token (source of truth)
       const userId = req.user.id;
@@ -3108,7 +3143,30 @@ app.post(
       console.error("❌ /api/support/ticket:", e);
       return res.status(500).json({ error: "Erreur serveur" });
     }
+
+    async function findRecentDuplicateSupport({ userId, subject, message, minutes = 5 }) {
+  try {
+    const since = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+    const { data, error } = await supabaseAdmin
+      .from("support_tickets")
+      .select("id, created_at")
+      .eq("user_id", userId)
+      .eq("subject", subject)
+      .eq("message", message)
+      .gte("created_at", since)
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    if (error) return null;
+    return data?.[0] || null;
+  } catch {
+    return null;
   }
+}
+
+  }
+
+  
 );
 
 
@@ -3117,13 +3175,21 @@ app.post(
 // CONTACT PUBLIC (contact.html) 
 // ---------------------------
 
-// ✅ Rate limit plus strict (public)
+// ✅ Rate limit plus strict (public) — IP + EMAIL
 const contactPublicLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000, // 10 min
-  max: 10, // 10 requêtes / 10 min / IP
+  windowMs: 10 * 60 * 1000,
+  max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req, res) => {
+    const email = (req.body?.email || "").toString().trim().toLowerCase();
+    return `${ipKeyGenerator(req, res)}:${email}`;
+  },
 });
+
+
+
+
 
 // helper email
 function isValidEmail(email) {
@@ -3151,6 +3217,13 @@ app.post("/api/contact/ticket", contactPublicLimiter, async (req, res) => {
     } else {
       phone = null;
     }
+
+    const dup = await findRecentDuplicateContact({ email, subject, message, minutes: 10 });
+if (dup) {
+  // ✅ On "fait comme si c'était OK" MAIS on évite tout envoi email
+  return res.status(200).json({ ok: true, ticket_id: dup.id, duplicate: true });
+}
+
 
 
     // ✅ Honeypot simple (optionnel mais recommandé)

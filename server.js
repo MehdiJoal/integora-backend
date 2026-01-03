@@ -2452,12 +2452,11 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
 
     const session = await stripe.checkout.sessions.create({
-      customer_email: emailNorm,
 
       // ✅ force la création d’un Customer Stripe (important pour cohérence)
-      customer_creation: "always",
-
       mode: "subscription",
+      customer_email: emailNorm,
+
 
       // ✅ empêche la sauvegarde automatique du moyen de paiement
       payment_method_collection: "always",

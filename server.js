@@ -254,7 +254,9 @@ app.use(helmet({
         "https://m.stripe.network",
         "https://r.stripe.com",
         // Resend
-        "https://api.resend.com"
+        "https://api.resend.com",
+        "https://integora-backend.onrender.com"
+
       ],
       frameSrc: [
         "'self'",

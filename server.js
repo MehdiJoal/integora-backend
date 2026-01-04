@@ -2582,38 +2582,7 @@ app.post("/api/complete-signup", async (req, res) => {
 
     const user_id = inviteData?.user?.id || null;
 
-    // ✅ 3bis) UPSERT subscriptions (PAYANT)
-    if (user_id) {
-      const sub = session.subscription; // grâce au expand
-
-      const stripe_price_id = sub?.items?.data?.[0]?.price?.id || null;
-
-      const payload = {
-        user_id,
-        plan: pending.desired_plan, // "standard" | "premium"
-        status: (sub?.status || "active"),
-
-        stripe_customer_id: sub?.customer || session.customer || stripe_customer_id || null,
-        stripe_subscription_id: sub?.id || stripe_subscription_id || null,
-        stripe_price_id,
-
-        current_period_start: toIsoFromStripeTs(sub?.current_period_start),
-        current_period_end: toIsoFromStripeTs(sub?.current_period_end),
-        started_at: toIsoFromStripeTs(sub?.start_date) || new Date().toISOString(),
-        trial_end: toIsoFromStripeTs(sub?.trial_end),
-        cancel_at: toIsoFromStripeTs(sub?.cancel_at),
-      };
-
-      const { error: upErr } = await supabaseAdmin
-        .from("subscriptions")
-        .upsert(payload, { onConflict: "user_id" });
-
-      if (upErr) {
-        console.error("❌ subscriptions upsert (PAID) error:", upErr);
-        return res.status(500).json({ error: upErr.message });
-      }
-    }
-
+   
 
 
 
@@ -2760,30 +2729,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
 
     const user_id = inviteData?.user?.id || null;
 
-    // ✅ 2bis) UPSERT subscriptions (TRIAL 7 jours)
-    if (user_id) {
-      const now = new Date();
-      const trialEnd = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-
-      const payload = {
-        user_id,
-        plan: "trial",
-        status: "trialing",
-        current_period_start: now.toISOString(),
-        trial_end: trialEnd.toISOString(),
-        started_at: now.toISOString(),
-        // stripe_* restent null
-      };
-
-      const { error: upErr } = await supabaseAdmin
-        .from("subscriptions")
-        .upsert(payload, { onConflict: "user_id" });
-
-      if (upErr) {
-        console.error("❌ subscriptions upsert (TRIAL) error:", upErr);
-        return res.status(500).json({ error: upErr.message });
-      }
-    }
+   
 
     await supabaseAdmin
       .from("pending_signups")
@@ -2839,22 +2785,6 @@ app.post("/api/resend-activation", async (req, res) => {
 
     const user_id = inviteData?.user?.id || pending.user_id || null;
 
-    if (user_id) {
-      const payload = {
-        user_id,
-        plan: pending.desired_plan,   // trial/standard/premium
-        status: pending.desired_plan === "trial" ? "trialing" : "active",
-      };
-
-      const { error: upErr } = await supabaseAdmin
-        .from("subscriptions")
-        .upsert(payload, { onConflict: "user_id" });
-
-      if (upErr) {
-        console.error("❌ subscriptions upsert (RESEND) error:", upErr);
-        // pas forcément bloquant, mais je te conseille de bloquer en dev
-      }
-    }
 
     await supabaseAdmin
       .from("pending_signups")

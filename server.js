@@ -2637,9 +2637,16 @@ app.post("/api/finalize-pending", async (req, res) => {
     // 1) Vérifier session Supabase (user connecté via lien email)
     const auth = req.headers.authorization || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    console.log("🧪 FINALIZE auth header present:", Boolean(auth));
+console.log("🧪 FINALIZE token length:", token ? token.length : 0);
+console.log("🧪 FINALIZE token preview:", token ? token.slice(0, 20) + "..." : "null");
+
     if (!token) return res.status(401).json({ error: "Missing bearer token" });
 
     const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
+    console.log("🧪 FINALIZE getUser error:", userErr?.message || null);
+console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
+
     const user = userData?.user;
     if (userErr || !user) return res.status(401).json({ error: "Invalid session" });
 

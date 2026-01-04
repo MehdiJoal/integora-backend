@@ -419,6 +419,13 @@ function validateCSRF(req, res, next) {
   // On protège uniquement les méthodes qui modifient
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
 
+  console.log("🧪 CSRF CHECK", {
+  method: req.method,
+  path: req.path,
+  url: req.url,
+  originalUrl: req.originalUrl,
+});
+
   // ✅ Routes publiques (signup / paiement) : pas de CSRF, sinon blocage
   const exempt = new Set([
     '/login',
@@ -430,6 +437,7 @@ function validateCSRF(req, res, next) {
     '/api/complete-signup',
     '/api/start-trial-invite',
     '/api/resend-activation',
+    '/api/finalize-pending',
 
     // (optionnel) si tu gardes encore l’ancienne route quelque part
     '/api/create-paid-checkout',
@@ -444,9 +452,17 @@ function validateCSRF(req, res, next) {
   const cookieToken = req.cookies['XSRF-TOKEN'];
 
   if (!headerToken || !cookieToken || headerToken !== cookieToken) {
-    console.log('🚨 CSRF Token invalide');
-    return res.status(403).json({ error: 'Token CSRF invalide' });
-  }
+  console.log("🚨 CSRF Token invalide", {
+    method: req.method,
+    path: req.path,
+    url: req.url,
+    originalUrl: req.originalUrl,
+    headerToken: headerToken ? "present" : "missing",
+    cookieToken: cookieToken ? "present" : "missing",
+  });
+  return res.status(403).json({ error: "Token CSRF invalide" });
+}
+
 
   next();
 }
@@ -2582,7 +2598,7 @@ app.post("/api/complete-signup", async (req, res) => {
 
     const user_id = inviteData?.user?.id || null;
 
-   
+
 
 
 
@@ -2611,6 +2627,171 @@ app.post("/api/complete-signup", async (req, res) => {
     return res.status(500).send(`Erreur complete-signup: ${e.message}`);
   }
 });
+
+//remplir table subscriptions quand la personne clique sur le mail
+app.post("/api/finalize-pending", async (req, res) => {
+  try {
+    const pending_id = String(req.body?.pending_id || "").trim();
+    if (!pending_id) return res.status(400).json({ error: "pending_id requis" });
+
+    // 1) Vérifier session Supabase (user connecté via lien email)
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "Missing bearer token" });
+
+    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
+    const user = userData?.user;
+    if (userErr || !user) return res.status(401).json({ error: "Invalid session" });
+
+    // 2) Charger pending
+    const { data: pending, error: pErr } = await supabaseAdmin
+      .from("pending_signups")
+      .select("*")
+      .eq("id", pending_id)
+      .single();
+
+    if (pErr || !pending) return res.status(404).json({ error: "pending introuvable" });
+
+    // 3) Sécurité email
+    // ✅ Sécurité principale : le pending doit appartenir au user du token
+    const pendingUserId = String(pending.user_id || "").trim();
+    if (!pendingUserId || pendingUserId !== user.id) {
+      return res.status(403).json({ error: "Pending mismatch" });
+    }
+
+    // (optionnel) Sécurité bonus : email doit aussi matcher
+    const emailUser = (user.email || "").toLowerCase().trim();
+    const emailPending = (pending.email || "").toLowerCase().trim();
+    if (emailUser && emailPending && emailUser !== emailPending) {
+      return res.status(403).json({ error: "Email mismatch" });
+    }
+
+
+    // 3b) ✅ Créer/Upsert company + profile (service_role) avant subscription
+    // ⚠️ adapte les colonnes si besoin (voir commentaire en bas)
+    const companyName = String(pending.company_name || "").trim();
+    const companySize = String(pending.company_size || "").trim();
+
+    // --- COMPANY ---
+    // Si ta table companies a un id UUID auto, on peut upsert via owner_user_id (ou user_id) si colonne unique.
+    // Sinon, utilise pending.company_id si tu l’as.
+    // ✅ Version générique (owner_user_id unique) :
+    const { data: companyRow, error: compErr } = await supabaseAdmin
+      .from("companies")
+      .upsert({
+        owner_user_id: user.id,
+        name: companyName || null,
+        size: companySize || null,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "owner_user_id" })
+      .select("id")
+      .maybeSingle();
+
+    if (compErr) return res.status(500).json({ error: `companies: ${compErr.message}` });
+
+    const companyId = companyRow?.id ?? null;
+
+    // --- PROFILE ---
+    const { error: profErr } = await supabaseAdmin
+      .from("profiles")
+      .upsert({
+        user_id: user.id,
+        email: emailUser || null,
+        first_name: pending.first_name ?? null,
+        last_name: pending.last_name ?? null,
+        company_id: companyId,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "user_id" });
+
+    if (profErr) return res.status(500).json({ error: `profiles: ${profErr.message}` });
+
+
+
+    // 4) Créer subscription AU MOMENT DU CLIC
+    if (pending.desired_plan === "trial") {
+      const now = new Date();
+      const trialEnd = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+      const { error: upErr } = await supabaseAdmin
+        .from("subscriptions")
+        .upsert({
+          user_id: user.id,
+          plan: "trial",
+          status: "trialing",
+          current_period_start: now.toISOString(),
+          trial_end: trialEnd.toISOString(),
+          started_at: now.toISOString(),
+        }, { onConflict: "user_id" });
+
+      if (upErr) return res.status(500).json({ error: upErr.message });
+    } else {
+      // ✅ Payant (standard/premium) : la subscription doit déjà exister (créée par webhook Stripe)
+      const { data: subRow, error: subErr } = await supabaseAdmin
+        .from("subscriptions")
+        .select("user_id, plan, status")
+        .eq("user_id", user.id)
+        .maybeSingle();
+
+      if (subErr) return res.status(500).json({ error: subErr.message });
+
+      if (!subRow) {
+        return res.status(409).json({
+          error: "Subscription not ready yet",
+          code: "PAYMENT_PENDING",
+        });
+      }
+    }
+
+    // 5) Marquer pending comme activé
+    // ✅ Idempotence: conserver la date du premier clic
+const { data: curPending, error: curErr } = await supabaseAdmin
+  .from("pending_signups")
+  .select("activated_at")
+  .eq("id", pending_id)
+  .maybeSingle();
+
+if (curErr) return res.status(500).json({ error: curErr.message });
+
+await supabaseAdmin
+  .from("pending_signups")
+  .update({
+    status: "activated",
+    user_id: user.id,
+    updated_at: new Date().toISOString(),
+    activated_at: curPending?.activated_at ?? new Date().toISOString(),
+  })
+  .eq("id", pending_id);
+
+
+
+    // ✅ Générer un lien de création de mot de passe (flow recovery) SANS envoyer un 2e mail
+    const redirectTo = "https://integora-frontend.vercel.app/create-password.html";
+
+    const { data: linkData, error: linkErr } = await supabaseAdmin.auth.admin.generateLink({
+      type: "recovery",
+      email: user.email,
+      options: { redirectTo },
+    });
+
+    if (linkErr) return res.status(500).json({ error: linkErr.message });
+
+    const setPasswordLink =
+      linkData?.properties?.action_link ||
+      linkData?.properties?.actionLink ||
+      null;
+
+    if (!setPasswordLink) {
+      return res.status(500).json({ error: "Missing set_password_link" });
+    }
+
+
+    return res.json({ ok: true, set_password_link: setPasswordLink });
+  } catch (e) {
+    console.error("❌ /api/finalize-pending:", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
 
 
 app.post("/api/start-trial-invite", async (req, res) => {
@@ -2729,7 +2910,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
 
     const user_id = inviteData?.user?.id || null;
 
-   
+
 
     await supabaseAdmin
       .from("pending_signups")

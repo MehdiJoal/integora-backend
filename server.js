@@ -740,6 +740,17 @@ function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
+function decodeJwtPayload(token) {
+  try {
+    const payload = token.split(".")[1];
+    const json = Buffer.from(payload, "base64url").toString("utf8");
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+
 // Vérifie si un abonnement est actif et valide
 async function getActiveSubscription(userId) {
 
@@ -2652,9 +2663,18 @@ app.post("/api/finalize-pending", async (req, res) => {
 
     if (!token) return res.status(401).json({ error: "Missing bearer token" });
 
-    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
-    console.log("🧪 FINALIZE getUser error:", userErr?.message || null);
-    console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
+// ✅ AJOUT ICI
+const payload = decodeJwtPayload(token);
+console.log("🧪 FINALIZE jwt iss:", payload?.iss);
+console.log("🧪 FINALIZE jwt sub:", payload?.sub);
+console.log("🧪 FINALIZE jwt aud:", payload?.aud);
+console.log("🧪 FINALIZE jwt exp:", payload?.exp);
+
+// puis ton getUser existant
+const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
+console.log("🧪 FINALIZE getUser error:", userErr?.message || null);
+console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
+
 
     const user = userData?.user;
     if (userErr || !user) return res.status(401).json({ error: "Invalid session" });

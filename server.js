@@ -2749,18 +2749,25 @@ console.log("🟦 FINALIZE user.id (auth):", user.id);
 
 
     // --- PROFILE ---
-    const { error: profErr } = await supabaseAdmin
-      .from("profiles")
-      .upsert({
-        user_id: user.id,
-        email: emailUser || null,
-        first_name: pending.first_name ?? null,
-        last_name: pending.last_name ?? null,
-        company_id: companyId,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: "user_id" });
+    const { data: profileRow, error: profErr } = await supabaseAdmin
+  .from("profiles")
+  .upsert(
+    {
+      user_id: user.id,
+      first_name: pending.first_name || null,
+      last_name: pending.last_name || null,
+      company_id: companyId,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "user_id" }
+  )
+  .select("user_id, company_id, first_name, last_name")
+  .single();
 
-    if (profErr) return res.status(500).json({ error: `profiles: ${profErr.message}` });
+if (profErr) {
+  console.error("❌ profiles upsert error:", profErr);
+  return res.status(500).json({ error: `profiles: ${profErr.message}` });
+}
 
 
 

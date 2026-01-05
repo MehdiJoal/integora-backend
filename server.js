@@ -192,7 +192,19 @@ app.get('/api/health/supabase', async (req, res) => {
     // ✅ Test simple: lister les buckets
     const { data, error } = await supabase.storage.listBuckets();
 
-    if (error) throw error;
+    console.log("🧪 authEmailExists: checking email=", target, "page=", page);
+console.log("🧪 supabaseAdmin url =", process.env.SUPABASE_URL);
+
+if (error) {
+  console.error("❌ authEmailExists listUsers error:", error);
+  // SAFE MODE : si on ne peut pas vérifier, on bloque
+  return true;
+}
+
+console.log("🧪 listUsers error =", error);
+console.log("🧪 listUsers count =", data?.users?.length);
+console.log("🧪 sample emails =", (data?.users || []).slice(0, 3).map(u => u.email));
+
 
     res.json({
       ok: true,
@@ -1359,6 +1371,27 @@ function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
 }
 
+//verifier si compte payant existe mode standard & premium pour l'inscription
+async function authEmailExists(emailNorm) {
+  const target = String(emailNorm || "").toLowerCase().trim();
+  if (!target) return false;
+
+  const perPage = 1000;
+  let page = 1;
+
+  for (let i = 0; i < 20; i++) { // garde-fou (20k users max scannés)
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage });
+    if (error) throw error;
+
+    const users = data?.users || [];
+    if (users.some(u => String(u?.email || "").toLowerCase().trim() === target)) return true;
+
+    if (users.length < perPage) break;
+    page += 1;
+  }
+
+  return false;
+}
 
 
 // ==========================================
@@ -2388,6 +2421,13 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     if (!isValidEmail(emailNorm)) return res.status(400).json({ error: "email invalide" });
     if (emailNorm.length > 254) return res.status(400).json({ error: "email trop long" });
 
+    // ✅ IMPORTANT : si l'email existe déjà, on NE doit PAS rediriger vers Stripe
+const alreadyExists = await authEmailExists(emailNorm);
+if (alreadyExists) {
+  return res.status(409).json({ error: "ACCOUNT_EXISTS" });
+}
+
+
     const desired_plan = String(req.body?.desired_plan || "").trim();
     if (!["standard", "premium"].includes(desired_plan)) {
       return res.status(400).json({ error: "desired_plan invalide" });
@@ -2675,7 +2715,6 @@ app.post("/api/finalize-pending", async (req, res) => {
 
     // puis ton getUser existant
     const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
-    console.log("🧪 FINALIZE getUser error:", userErr?.message || null);
     console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
 
 
@@ -2927,6 +2966,13 @@ app.post("/api/start-trial-invite", async (req, res) => {
     if (!emailNorm) return res.status(400).json({ error: "email requis" });
     if (!isValidEmail(emailNorm)) return res.status(400).json({ error: "email invalide" });
     if (emailNorm.length > 254) return res.status(400).json({ error: "email trop long" });
+
+    // ✅ IMPORTANT : si l'email existe déjà, on NE doit PAS créer une session Stripe
+// -> même comportement que TRIAL : message générique côté front
+const alreadyExists = await authEmailExists(emailNorm);
+if (alreadyExists) {
+  return res.status(409).json({ error: "ACCOUNT_EXISTS" });
+}
 
     const first_name = cleanPersonName(req.body?.first_name, { max: 50 });
     const last_name = cleanPersonName(req.body?.last_name, { max: 50 });

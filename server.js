@@ -2126,126 +2126,137 @@ app.post('/api/update-profile', authenticateToken, async (req, res) => {
 
 
 // ==================== ROUTE UPLOAD AVATAR ====================
+// ==================== UPLOAD AVATAR (SECURISÉ) ====================
+const multer = require("multer");
 
-const multer = require('multer');
+const ALLOWED_AVATAR_MIME = new Map([
+  ["image/jpeg", "jpg"],
+  ["image/png", "png"],
+  ["image/webp", "webp"],
+  // optionnel:
+  // ["image/gif", "gif"],
+]);
 
-// Configuration Multer pour l'upload en mémoire
-const upload = multer({
+const uploadAvatar = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB max
-  },
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    // Vérifier que c'est bien une image
-    if (file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Seules les images sont autorisées'), false);
+    if (!ALLOWED_AVATAR_MIME.has(file.mimetype)) {
+      return cb(new Error("Format avatar non autorisé. Utilise JPG/PNG/WebP."), false);
     }
-  }
+    cb(null, true);
+  },
 });
 
-// ✅ MIDDLEWARE DE GESTION D'ERREURS MULTER
-const handleMulterError = (error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({
-        ok: false,
-        error: 'Fichier trop volumineux (max 5MB)'
-      });
+// middleware erreurs multer (TU L'AVAIS, mais il n'était pas branché sur la route)
+function handleMulterError(err, req, res, next) {
+  if (err && err.name === "MulterError") {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({ ok: false, error: "Fichier trop volumineux (max 5MB)" });
     }
-    return res.status(400).json({
-      ok: false,
-      error: `Erreur upload: ${error.message}`
-    });
-  } else if (error) {
-    return res.status(400).json({
-      ok: false,
-      error: error.message
-    });
+    return res.status(400).json({ ok: false, error: `Erreur upload: ${err.code}` });
   }
+  if (err) return res.status(400).json({ ok: false, error: err.message || "Erreur upload" });
   next();
-};
+}
 
-// ✅ ROUTE UPLOAD AVATAR
-app.post('/api/upload-avatar', authenticateToken, upload.single('avatar'), async (req, res) => {
-  console.log('🖼️ [API Upload-Avatar] Début - User ID:', req.user?.id);
+function sniffImageType(buffer) {
+  if (!buffer || buffer.length < 12) return null;
 
-  try {
-    if (!req.file) {
-      console.log('❌ [API Upload-Avatar] Aucun fichier reçu');
-      return res.status(400).json({
-        ok: false,
-        error: 'Aucun fichier sélectionné'
-      });
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  const isPng =
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a;
+  if (isPng) return { mime: "image/png", ext: "png" };
+
+  // JPEG: FF D8 FF
+  const isJpg = buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  if (isJpg) return { mime: "image/jpeg", ext: "jpg" };
+
+  // WEBP: "RIFF"...."WEBP"
+  const isWebp =
+    buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+    buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50;
+  if (isWebp) return { mime: "image/webp", ext: "webp" };
+
+  return null;
+}
+
+
+app.post(
+  "/api/upload-avatar",
+  authenticateToken,
+  uploadAvatar.single("avatar"),
+  handleMulterError,
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ ok: false, error: "Aucun fichier sélectionné" });
+      }
+
+      const detected = sniffImageType(req.file.buffer);
+if (!detected) {
+  return res.status(400).json({
+    ok: false,
+    error: "Avatar invalide. Formats autorisés: JPG/PNG/WEBP",
+  });
+}
+
+// ⚠️ si tu veux être strict : le type réel doit matcher le mimetype déclaré
+if (detected.mime !== req.file.mimetype) {
+  return res.status(400).json({
+    ok: false,
+    error: "Avatar invalide (type fichier incohérent).",
+  });
+}
+
+
+      // 🔒 extension forcée depuis le mimetype
+const ext = detected.ext;
+      const fileName = `avatars/${req.user.id}/${Date.now()}.${ext}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from("Avatars")
+        .upload(fileName, req.file.buffer, {
+          contentType: detected.mime,
+          upsert: true,
+        });
+
+      if (uploadError) {
+        return res.status(500).json({ ok: false, error: "Erreur upload storage: " + uploadError.message });
+      }
+
+      const { data: publicUrlData } = supabase.storage.from("Avatars").getPublicUrl(fileName);
+      const avatarUrl = publicUrlData.publicUrl;
+
+      const { data: updatedProfile, error: updateError } = await supabase
+        .from("profiles")
+        .update({ avatar_url: avatarUrl, updated_at: new Date().toISOString() })
+        .eq("user_id", req.user.id)
+        .select("avatar_url")
+        .single();
+
+      if (updateError) {
+        return res.status(500).json({ ok: false, error: "Erreur mise à jour profil: " + updateError.message });
+      }
+
+      return res.json({ ok: true, url: avatarUrl, message: "Avatar mis à jour avec succès !" });
+    } catch (error) {
+      return res.status(500).json({ ok: false, error: "Erreur serveur: " + error.message });
     }
-
-    console.log('📁 [API Upload-Avatar] Fichier reçu:', {
-      originalName: req.file.originalname,
-      size: req.file.size,
-      mimetype: req.file.mimetype
-    });
-
-    // Générer un nom de fichier unique
-    const fileExtension = req.file.originalname.split('.').pop() || 'png';
-    const fileName = `avatars/${req.user.id}/${Date.now()}.${fileExtension}`;
-
-    console.log('☁️ [API Upload-Avatar] Upload vers Supabase Storage:', fileName);
-
-    // ✅ UPLOAD VERS SUPABASE STORAGE
-    const { data: uploadData, error: uploadError } = await supabase
-      .storage
-      .from('Avatars')
-      .upload(fileName, req.file.buffer, {
-        contentType: req.file.mimetype,
-        upsert: true
-      });
-
-    if (uploadError) {
-      console.error('❌ [API Upload-Avatar] Erreur upload storage:', uploadError);
-      return res.status(500).json({ ok: false, error: 'Erreur upload storage: ' + uploadError.message });
-    }
-
-    // ✅ RÉCUPÉRATION DE L'URL PUBLIQUE
-    const { data: publicUrlData } = supabase
-      .storage
-      .from('Avatars')
-      .getPublicUrl(fileName);
-
-    const avatarUrl = publicUrlData.publicUrl;
-    console.log('🔗 [API Upload-Avatar] URL publique générée:', avatarUrl);
-
-    // ✅ MISE À JOUR DU PROFIL
-    console.log('💾 [API Upload-Avatar] Mise à jour profil avec avatar_url:', avatarUrl);
-
-    const { data: updatedProfile, error: updateError } = await supabase
-      .from('profiles')
-      .update({
-        avatar_url: avatarUrl,
-        updated_at: new Date().toISOString()
-      })
-      .eq('user_id', req.user.id)
-      .select('avatar_url')
-      .single();
-
-    if (updateError) {
-      console.error('❌ [API Upload-Avatar] Erreur mise à jour profil:', updateError);
-      return res.status(500).json({ ok: false, error: 'Erreur mise à jour profil: ' + updateError.message });
-    }
-
-    console.log('✅ [API Upload-Avatar] Profil mis à jour - Vérification:', updatedProfile.avatar_url);
-
-    res.json({
-      ok: true,
-      url: avatarUrl,
-      message: 'Avatar mis à jour avec succès !'
-    });
-
-  } catch (error) {
-    console.error('💥 [API Upload-Avatar] Exception:', error);
-    res.status(500).json({ ok: false, error: 'Erreur serveur: ' + error.message });
   }
-});
+);
+
+
+
+
+
 
 /* Upload fichier support pour la platefor */
 const uploadSupport = multer({

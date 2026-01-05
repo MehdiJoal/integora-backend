@@ -2650,6 +2650,9 @@ app.post("/api/complete-signup", async (req, res) => {
 
 //remplir table subscriptions quand la personne clique sur le mail
 app.post("/api/finalize-pending", async (req, res) => {
+  console.log("🟦 FINALIZE-PENDING HIT");
+console.log("🟦 FINALIZE body:", JSON.stringify(req.body));
+
   try {
     const pending_id = String(req.body?.pending_id || "").trim();
     if (!pending_id) return res.status(400).json({ error: "pending_id requis" });
@@ -2685,6 +2688,11 @@ console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
       .select("*")
       .eq("id", pending_id)
       .single();
+
+      console.log("🟦 FINALIZE pending.desired_plan:", pending?.desired_plan);
+console.log("🟦 FINALIZE pending.user_id:", pending?.user_id);
+console.log("🟦 FINALIZE user.id (auth):", user.id);
+
 
     if (pErr || !pending) return res.status(404).json({ error: "pending introuvable" });
 
@@ -2757,23 +2765,39 @@ console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
 
 
     // 4) Créer subscription AU MOMENT DU CLIC
-    if (pending.desired_plan === "trial") {
-      const now = new Date();
-      const trialEnd = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+console.log("🟦 FINALIZE desired_plan:", pending.desired_plan);
+console.log("🟦 FINALIZE will create subscription?", pending.desired_plan === "trial");
 
-      const { error: upErr } = await supabaseAdmin
-        .from("subscriptions")
-        .upsert({
-          user_id: user.id,
-          plan: "trial",
-          status: "trialing",
-          current_period_start: now.toISOString(),
-          trial_end: trialEnd.toISOString(),
-          started_at: now.toISOString(),
-        }, { onConflict: "user_id" });
+if (pending.desired_plan === "trial") {
+  const now = new Date();
+  const trialEnd = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
 
-      if (upErr) return res.status(500).json({ error: upErr.message });
-    } else {
+  const payload = {
+    user_id: user.id,
+    plan: "trial",
+    status: "trialing", // ⚠️ à remplacer par une valeur EXISTANTE de ton enum
+    current_period_start: now.toISOString(),
+    trial_end: trialEnd.toISOString(),
+    started_at: now.toISOString(),
+    updated_at: now.toISOString(),
+  };
+
+  console.log("🟦 FINALIZE subscriptions upsert payload:", payload);
+
+  const { data: subSaved, error: upErr } = await supabaseAdmin
+    .from("subscriptions")
+    .upsert(payload, { onConflict: "user_id" })
+    .select("id, user_id, plan, status, trial_end")
+    .single();
+
+  if (upErr) {
+    console.error("❌ subscriptions upsert error:", upErr);
+    return res.status(500).json({ error: `subscriptions: ${upErr.message}` });
+  }
+
+  console.log("✅ subscriptions upsert OK:", subSaved);
+} else {
+  
       // ✅ Payant (standard/premium) : la subscription doit déjà exister (créée par webhook Stripe)
       const { data: subRow, error: subErr } = await supabaseAdmin
         .from("subscriptions")

@@ -1757,84 +1757,68 @@ function extractPageName(fullPath) {
 // ---------------------------
 
 app.post("/login", async (req, res) => {
-  console.log('🔐 Tentative de connexion pour:', req.body.email);
-
-  const { email, password, device_id } = req.body;
-
-  if (!email || !password) {
-    return res.status(400).json({
-      success: false,
-      error: "Email et mot de passe requis."
-    });
-  }
+  const GENERIC_AUTH_ERROR =
+    "Identifiants invalides. Réessayez ou réinitialisez votre mot de passe.";
 
   try {
-    // ✅ 1. AUTHENTIFICATION avec client AUTH
-    console.log('🔐 Authentification avec client Auth...');
-    const { data: authData, error: authError } = await supabaseAuth.auth.signInWithPassword({
-      email,
-      password,
-    });
+    const { email, password, device_id } = req.body || {};
 
-    if (authError) {
-      console.log('❌ Erreur auth:', authError.message);
-      if (authError.message.includes("Invalid login credentials")) {
-        return res.status(401).json({
-          success: false,
-          error: "Email ou mot de passe incorrect."
-        });
-      }
-      return res.status(401).json({
+    // ✅ 0) Input minimal (mais réponse opaque)
+    if (!email || !password) {
+      return res.status(400).json({
         success: false,
-        error: authError.message
+        error: GENERIC_AUTH_ERROR,
       });
     }
 
-    if (!authData.user) {
+    if (!isProduction) {
+      console.log("🔐 Tentative de connexion (opaque) pour:", String(email).trim().toLowerCase());
+    }
+
+    // ✅ 1) AUTHENTIFICATION avec client AUTH
+    const { data: authData, error: authError } =
+      await supabaseAuth.auth.signInWithPassword({
+        email,
+        password,
+      });
+
+    // 🚫 Toujours opaque : jamais renvoyer authError.message
+    if (authError || !authData?.user) {
+      if (!isProduction) {
+        console.log("❌ Login refusé (opaque). Reason:", authError?.message || "no_user");
+      }
       return res.status(401).json({
         success: false,
-        error: "Utilisateur non trouvé."
+        error: GENERIC_AUTH_ERROR,
       });
     }
 
     const user_id = authData.user.id;
-    console.log('✅ Auth réussie, user_id:', user_id);
 
-    // ✅ 2. PROFIL avec client ADMIN
-    console.log('👤 Récupération profil avec client Admin...');
-    const { data: profile, error: profileError } = await supabaseAdmin
+    // ✅ 2) PROFIL avec client ADMIN (non bloquant)
+    const { data: profile } = await supabaseAdmin
       .from("profiles")
       .select("first_name, last_name, company_id")
       .eq("user_id", user_id)
       .single();
 
-    if (profileError) {
-      console.log('❌ Erreur profil:', profileError);
-      // Continuer même sans profil
-    }
-
-    // ✅ 3. SESSIONS avec client ADMIN
-    console.log('💾 Gestion sessions avec client Admin...');
-    const { error: sessionError } = await supabaseAdmin
+    // ✅ 3) Fermer anciennes sessions (non bloquant)
+    await supabaseAdmin
       .from("token_sessions")
       .update({
         is_active: false,
-        revoked_at: new Date().toISOString()
+        revoked_at: new Date().toISOString(),
       })
       .eq("user_id", user_id)
       .eq("is_active", true);
 
-    if (sessionError) {
-      console.log('⚠️ Erreur session (non critique):', sessionError);
-    }
-
-    // ✅ 4. CRÉATION SESSION avec client ADMIN
+    // ✅ 4) CRÉATION JWT + session DB
     const token = jwt.sign(
       {
         id: user_id,
         email: authData.user.email,
         first_name: profile?.first_name || "Utilisateur",
-        last_name: profile?.last_name || ""
+        last_name: profile?.last_name || "",
       },
       SECRET_KEY,
       { expiresIn: "24h" }
@@ -1844,41 +1828,29 @@ app.post("/login", async (req, res) => {
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
-    const { error: newSessionError } = await supabaseAdmin
-      .from("token_sessions")
-      .insert([
-        {
-          user_id: user_id,
-          token_hash: tokenHash,
-          device_id: device_id || "web",
-          user_agent: req.headers["user-agent"],
-          ip: req.ip,
-          expires_at: expiresAt.toISOString(),
-          is_active: true
-        }
-      ]);
+    await supabaseAdmin.from("token_sessions").insert([
+      {
+        user_id: user_id,
+        token_hash: tokenHash,
+        device_id: device_id || "web",
+        user_agent: req.headers["user-agent"],
+        ip: req.ip,
+        expires_at: expiresAt.toISOString(),
+        is_active: true,
+      },
+    ]);
 
-    if (newSessionError) {
-      console.log("⚠️ Erreur création session:", newSessionError);
-    } else {
-      console.log("✅ Session créée pour:", email);
-    }
-
-    // ✅ 5. COOKIE
+    // ✅ 5) COOKIE
     const isProd = process.env.NODE_ENV === "production";
-
     res.cookie("auth_token", token, {
       httpOnly: true,
-      secure: isProd,                 // ✅ obligatoire si SameSite=None
-      sameSite: isProd ? "none" : "lax", // ✅ cross-site en prod
+      secure: isProd,
+      sameSite: isProd ? "none" : "lax",
       maxAge: 24 * 60 * 60 * 1000,
       path: "/",
     });
 
-
-    console.log('✅ Cookie set pour:', email);
-
-    // ✅ RÉPONSE
+    // ✅ 6) RÉPONSE OK
     return res.json({
       success: true,
       redirect: "/app/choix_irl_digital.html",
@@ -1887,18 +1859,18 @@ app.post("/login", async (req, res) => {
         first_name: profile?.first_name || "Utilisateur",
         last_name: profile?.last_name || "",
         email: authData.user.email,
-        company_id: profile?.company_id || null
-      }
+        company_id: profile?.company_id || null,
+      },
     });
-
   } catch (error) {
     console.error("💥 Erreur login:", error);
     return res.status(500).json({
       success: false,
-      error: "Erreur serveur lors de la connexion."
+      error: "Erreur serveur lors de la connexion.",
     });
   }
 });
+
 
 // ✅ ROUTE DE DEBUG COOKIES
 app.get("/api/debug-cookies", (req, res) => {

@@ -323,9 +323,9 @@ app.use(helmet({
 const { ipKeyGenerator } = require("express-rate-limit");
 
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: { error: "Trop de tentatives. Réessayez dans 15 minutes." },
+  windowMs: 2 * 60 * 1000,
+  max: 10,
+  message: { error: "Trop de tentatives. Réessayez dans 2 minutes." },
   standardHeaders: true,
   legacyHeaders: false,
 

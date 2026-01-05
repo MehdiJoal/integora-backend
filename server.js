@@ -23,6 +23,35 @@ console.log("🧪 SERVICE_ROLE prefix:", (process.env.SUPABASE_SERVICE_ROLE_KEY 
 const express = require("express");
 const app = express();
 
+// ==================== CORS (TOUT EN HAUT) ====================
+const ALLOWED_ORIGINS = new Set([
+  "https://integora-frontend.vercel.app",
+  "http://localhost:3000",
+  "http://localhost:5173",
+]);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+const isVercelPreview =
+  origin && /^https:\/\/integora-frontend-.*\.vercel\.app$/.test(origin);
+
+if (origin && (ALLOWED_ORIGINS.has(origin) || isVercelPreview)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token");
+  }
+
+  // ✅ Répondre aux preflights AVANT tout le reste
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  next();
+});
+
 
 // ==========================================
 // 📦 IMPORTS DES MODULES
@@ -300,6 +329,8 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 
+  skip: (req) => req.method === "OPTIONS",
+
   keyGenerator: (req, res) => {
     const email = (req.body?.email || "").toString().trim().toLowerCase();
     return `${ipKeyGenerator(req, res)}:${email}`;
@@ -325,8 +356,11 @@ const supportLimiter = rateLimit({
 
 
 const globalLimiter = rateLimit({
+  skip: (req) => req.method === "OPTIONS",
+
   windowMs: 1 * 60 * 1000, // 1 minute seulement
   max: 300, // 300 requêtes par minute par IP
+  
   message: {
     error: 'Trop de requêtes. Réessayez dans une minute.',
     code: 'RATE_LIMIT_EXCEEDED'
@@ -482,35 +516,6 @@ function validateCSRF(req, res, next) {
 
   next();
 }
-
-
-
-app.use((req, res, next) => {
-  const allowedOrigins = [
-    "http://localhost:3000",
-    "https://integora-frontend.vercel.app",
-  ];
-
-  const origin = req.headers.origin;
-
-  const isVercelPreview =
-    origin && /^https:\/\/integora-frontend-.*\.vercel\.app$/.test(origin);
-
-  if (allowedOrigins.includes(origin) || isVercelPreview) {
-    res.header("Access-Control-Allow-Origin", origin);
-    res.header("Vary", "Origin"); // important pour éviter des caches CORS bizarres
-  }
-
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-csrf-token"
-  );
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Credentials", "true");
-
-  if (req.method === "OPTIONS") return res.status(200).end();
-  next();
-});
 
 
 function ensureCsrfToken(req, res, next) {
@@ -2583,7 +2588,7 @@ if (alreadyExists) {
 
   } catch (e) {
     console.error("❌ [START-PAID] error:", e);
-    return res.status(500).json({ error: "Erreur start-paid-checkout", details: e.message });
+return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
@@ -3097,7 +3102,7 @@ if (alreadyExists) {
 
   } catch (e) {
     console.error("❌ [TRIAL] error:", e);
-    return res.status(500).json({ error: "Erreur start-trial-invite", details: e.message });
+return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 

@@ -15,6 +15,10 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
 
 
 console.log("✅ Variables d'environnement chargées avec succès");
+console.log("🧪 SUPABASE_URL USED:", process.env.SUPABASE_URL);
+console.log("🧪 ANON prefix:", (process.env.SUPABASE_ANON_KEY || "").slice(0, 12));
+console.log("🧪 SERVICE_ROLE prefix:", (process.env.SUPABASE_SERVICE_ROLE_KEY || "").slice(0, 12));
+
 
 const express = require("express");
 const app = express();

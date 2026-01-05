@@ -2651,7 +2651,7 @@ app.post("/api/complete-signup", async (req, res) => {
 //remplir table subscriptions quand la personne clique sur le mail
 app.post("/api/finalize-pending", async (req, res) => {
   console.log("🟦 FINALIZE-PENDING HIT");
-console.log("🟦 FINALIZE body:", JSON.stringify(req.body));
+  console.log("🟦 FINALIZE body:", JSON.stringify(req.body));
 
   try {
     const pending_id = String(req.body?.pending_id || "").trim();
@@ -2666,17 +2666,17 @@ console.log("🟦 FINALIZE body:", JSON.stringify(req.body));
 
     if (!token) return res.status(401).json({ error: "Missing bearer token" });
 
-// ✅ AJOUT ICI
-const payload = decodeJwtPayload(token);
-console.log("🧪 FINALIZE jwt iss:", payload?.iss);
-console.log("🧪 FINALIZE jwt sub:", payload?.sub);
-console.log("🧪 FINALIZE jwt aud:", payload?.aud);
-console.log("🧪 FINALIZE jwt exp:", payload?.exp);
+    // ✅ AJOUT ICI
+    const payload = decodeJwtPayload(token);
+    console.log("🧪 FINALIZE jwt iss:", payload?.iss);
+    console.log("🧪 FINALIZE jwt sub:", payload?.sub);
+    console.log("🧪 FINALIZE jwt aud:", payload?.aud);
+    console.log("🧪 FINALIZE jwt exp:", payload?.exp);
 
-// puis ton getUser existant
-const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
-console.log("🧪 FINALIZE getUser error:", userErr?.message || null);
-console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
+    // puis ton getUser existant
+    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
+    console.log("🧪 FINALIZE getUser error:", userErr?.message || null);
+    console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
 
 
     const user = userData?.user;
@@ -2689,9 +2689,9 @@ console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
       .eq("id", pending_id)
       .single();
 
-      console.log("🟦 FINALIZE pending.desired_plan:", pending?.desired_plan);
-console.log("🟦 FINALIZE pending.user_id:", pending?.user_id);
-console.log("🟦 FINALIZE user.id (auth):", user.id);
+    console.log("🟦 FINALIZE pending.desired_plan:", pending?.desired_plan);
+    console.log("🟦 FINALIZE pending.user_id:", pending?.user_id);
+    console.log("🟦 FINALIZE user.id (auth):", user.id);
 
 
     if (pErr || !pending) return res.status(404).json({ error: "pending introuvable" });
@@ -2724,6 +2724,29 @@ console.log("🟦 FINALIZE user.id (auth):", user.id);
       return res.status(400).json({ error: "company_size missing in pending_signups" });
     }
 
+    // ✅ Gate payant AVANT companies/profiles
+    const plan = String(pending.desired_plan || "").trim();
+
+    if (plan !== "trial") {
+      const hasStripeCustomer = !!pending.stripe_customer_id;
+      const hasStripeSub = !!pending.stripe_subscription_id;
+
+      console.log("🟦 PAY GATE plan:", plan);
+      console.log("🟦 PAY GATE stripe_customer_id:", pending.stripe_customer_id);
+      console.log("🟦 PAY GATE stripe_subscription_id:", pending.stripe_subscription_id);
+      console.log("🟦 PAY GATE pending.status:", pending.status);
+
+      // ✅ Condition “READY” = IDs Stripe présents
+      if (!hasStripeCustomer || !hasStripeSub) {
+        return res.status(409).json({
+          error: "Subscription not ready yet",
+          code: "PAYMENT_PENDING",
+          details: { hasStripeCustomer, hasStripeSub },
+        });
+      }
+    }
+
+
     // --- COMPANY ---
     const { data: companyRow, error: compErr } = await supabaseAdmin
       .from("companies")
@@ -2750,61 +2773,61 @@ console.log("🟦 FINALIZE user.id (auth):", user.id);
 
     // --- PROFILE ---
     const { data: profileRow, error: profErr } = await supabaseAdmin
-  .from("profiles")
-  .upsert(
-    {
-      user_id: user.id,
-      first_name: pending.first_name || null,
-      last_name: pending.last_name || null,
-      company_id: companyId,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "user_id" }
-  )
-  .select("user_id, company_id, first_name, last_name")
-  .single();
+      .from("profiles")
+      .upsert(
+        {
+          user_id: user.id,
+          first_name: pending.first_name || null,
+          last_name: pending.last_name || null,
+          company_id: companyId,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" }
+      )
+      .select("user_id, company_id, first_name, last_name")
+      .single();
 
-if (profErr) {
-  console.error("❌ profiles upsert error:", profErr);
-  return res.status(500).json({ error: `profiles: ${profErr.message}` });
-}
+    if (profErr) {
+      console.error("❌ profiles upsert error:", profErr);
+      return res.status(500).json({ error: `profiles: ${profErr.message}` });
+    }
 
 
 
     // 4) Créer subscription AU MOMENT DU CLIC
-console.log("🟦 FINALIZE desired_plan:", pending.desired_plan);
-console.log("🟦 FINALIZE will create subscription?", pending.desired_plan === "trial");
+    console.log("🟦 FINALIZE desired_plan:", pending.desired_plan);
+    console.log("🟦 FINALIZE will create subscription?", pending.desired_plan === "trial");
 
-if (pending.desired_plan === "trial") {
-  const now = new Date();
-  const trialEnd = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    if (pending.desired_plan === "trial") {
+      const now = new Date();
+      const trialEnd = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
 
-  const payload = {
-    user_id: user.id,
-    plan: "trial",
-    status: "trialing", // ⚠️ à remplacer par une valeur EXISTANTE de ton enum
-    current_period_start: now.toISOString(),
-    trial_end: trialEnd.toISOString(),
-    started_at: now.toISOString(),
-    updated_at: now.toISOString(),
-  };
+      const payload = {
+        user_id: user.id,
+        plan: "trial",
+        status: "trialing", // ⚠️ à remplacer par une valeur EXISTANTE de ton enum
+        current_period_start: now.toISOString(),
+        trial_end: trialEnd.toISOString(),
+        started_at: now.toISOString(),
+        updated_at: now.toISOString(),
+      };
 
-  console.log("🟦 FINALIZE subscriptions upsert payload:", payload);
+      console.log("🟦 FINALIZE subscriptions upsert payload:", payload);
 
-  const { data: subSaved, error: upErr } = await supabaseAdmin
-    .from("subscriptions")
-    .upsert(payload, { onConflict: "user_id" })
-    .select("id, user_id, plan, status, trial_end")
-    .single();
+      const { data: subSaved, error: upErr } = await supabaseAdmin
+        .from("subscriptions")
+        .upsert(payload, { onConflict: "user_id" })
+        .select("id, user_id, plan, status, trial_end")
+        .single();
 
-  if (upErr) {
-    console.error("❌ subscriptions upsert error:", upErr);
-    return res.status(500).json({ error: `subscriptions: ${upErr.message}` });
-  }
+      if (upErr) {
+        console.error("❌ subscriptions upsert error:", upErr);
+        return res.status(500).json({ error: `subscriptions: ${upErr.message}` });
+      }
 
-  console.log("✅ subscriptions upsert OK:", subSaved);
-} else {
-  
+      console.log("✅ subscriptions upsert OK:", subSaved);
+    } else {
+
       // ✅ Payant (standard/premium) : la subscription doit déjà exister (créée par webhook Stripe)
       const { data: subRow, error: subErr } = await supabaseAdmin
         .from("subscriptions")
@@ -2815,11 +2838,33 @@ if (pending.desired_plan === "trial") {
       if (subErr) return res.status(500).json({ error: subErr.message });
 
       if (!subRow) {
-        return res.status(409).json({
-          error: "Subscription not ready yet",
-          code: "PAYMENT_PENDING",
-        });
+        console.log("🟧 FINALIZE no subscriptions row yet -> creating fallback from pending");
+
+        const { data: createdSub, error: createErr } = await supabaseAdmin
+          .from("subscriptions")
+          .upsert(
+            {
+              user_id: user.id,
+              plan: plan,                  // "standard" ou "premium"
+              status: "active",            // ✅ dans ton enum sub_status
+              stripe_customer_id: pending.stripe_customer_id,
+              stripe_subscription_id: pending.stripe_subscription_id,
+              started_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "user_id" }
+          )
+          .select("id, user_id, plan, status, stripe_subscription_id")
+          .single();
+
+        if (createErr) {
+          console.error("❌ FINALIZE fallback subscriptions upsert error:", createErr);
+          return res.status(500).json({ error: `subscriptions: ${createErr.message}` });
+        }
+
+        console.log("✅ FINALIZE fallback subscriptions created:", createdSub);
       }
+
     }
 
     // 5) Marquer pending comme activé

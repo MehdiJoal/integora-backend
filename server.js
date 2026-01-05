@@ -596,23 +596,28 @@ app.use((error, req, res, next) => {
 
 // ✅ CONFIG FRONT 
 app.get("/config.js", (req, res) => {
-  const url = process.env.SUPABASE_URL;
-  const anon = process.env.SUPABASE_ANON_KEY;
-
-  if (!url || !anon) {
-    return res.status(500).type("text/plain").send("Missing SUPABASE_URL or SUPABASE_ANON_KEY");
-  }
-
   res.setHeader("Content-Type", "application/javascript; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store, max-age=0");
 
-  return res.send(
-    `window.APP_CONFIG=${JSON.stringify({
-      SUPABASE_URL: url,
-      SUPABASE_ANON_KEY: anon,
-    })};`
-  );
+  // ✅ Autoriser explicitement le chargement cross-origin du script
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  // ✅ Évite certains blocages CORP/COEP
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+
+  // (optionnel mais safe)
+  res.setHeader("Cache-Control", "no-store");
+
+  const SUPABASE_URL = process.env.SUPABASE_URL || "";
+  const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
+
+  res.send(`
+    window.APP_CONFIG = {
+      SUPABASE_URL: ${JSON.stringify(SUPABASE_URL)},
+      SUPABASE_ANON_KEY: ${JSON.stringify(SUPABASE_ANON_KEY)}
+    };
+  `);
 });
+
 
 
 // 🎯 PAGES AUTORISÉES AVEC MAPPAGE OPAQUE

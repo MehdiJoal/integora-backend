@@ -424,11 +424,11 @@ function validateCSRF(req, res, next) {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
 
   console.log("🧪 CSRF CHECK", {
-  method: req.method,
-  path: req.path,
-  url: req.url,
-  originalUrl: req.originalUrl,
-});
+    method: req.method,
+    path: req.path,
+    url: req.url,
+    originalUrl: req.originalUrl,
+  });
 
   // ✅ Routes publiques (signup / paiement) : pas de CSRF, sinon blocage
   const exempt = new Set([
@@ -456,16 +456,16 @@ function validateCSRF(req, res, next) {
   const cookieToken = req.cookies['XSRF-TOKEN'];
 
   if (!headerToken || !cookieToken || headerToken !== cookieToken) {
-  console.log("🚨 CSRF Token invalide", {
-    method: req.method,
-    path: req.path,
-    url: req.url,
-    originalUrl: req.originalUrl,
-    headerToken: headerToken ? "present" : "missing",
-    cookieToken: cookieToken ? "present" : "missing",
-  });
-  return res.status(403).json({ error: "Token CSRF invalide" });
-}
+    console.log("🚨 CSRF Token invalide", {
+      method: req.method,
+      path: req.path,
+      url: req.url,
+      originalUrl: req.originalUrl,
+      headerToken: headerToken ? "present" : "missing",
+      cookieToken: cookieToken ? "present" : "missing",
+    });
+    return res.status(403).json({ error: "Token CSRF invalide" });
+  }
 
 
   next();
@@ -2647,14 +2647,14 @@ app.post("/api/finalize-pending", async (req, res) => {
     const auth = req.headers.authorization || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
     console.log("🧪 FINALIZE auth header present:", Boolean(auth));
-console.log("🧪 FINALIZE token length:", token ? token.length : 0);
-console.log("🧪 FINALIZE token preview:", token ? token.slice(0, 20) + "..." : "null");
+    console.log("🧪 FINALIZE token length:", token ? token.length : 0);
+    console.log("🧪 FINALIZE token preview:", token ? token.slice(0, 20) + "..." : "null");
 
     if (!token) return res.status(401).json({ error: "Missing bearer token" });
 
     const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
     console.log("🧪 FINALIZE getUser error:", userErr?.message || null);
-console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
+    console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
 
     const user = userData?.user;
     if (userErr || !user) return res.status(401).json({ error: "Invalid session" });
@@ -2684,28 +2684,41 @@ console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
 
 
     // 3b) ✅ Créer/Upsert company + profile (service_role) avant subscription
-    // ⚠️ adapte les colonnes si besoin (voir commentaire en bas)
-    const companyName = String(pending.company_name || "").trim();
-    const companySize = String(pending.company_size || "").trim();
+
+    const companyName = String(pending.company_name ?? "").trim();
+    const companySize = String(pending.company_size ?? "").trim();
+
+    if (!companyName) {
+      return res.status(400).json({ error: "company_name missing in pending_signups" });
+    }
+
+    if (!companySize) {
+      return res.status(400).json({ error: "company_size missing in pending_signups" });
+    }
 
     // --- COMPANY ---
-    // Si ta table companies a un id UUID auto, on peut upsert via owner_user_id (ou user_id) si colonne unique.
-    // Sinon, utilise pending.company_id si tu l’as.
-    // ✅ Version générique (owner_user_id unique) :
     const { data: companyRow, error: compErr } = await supabaseAdmin
       .from("companies")
-      .upsert({
-        owner_user_id: user.id,
-        name: companyName || null,
-        size: companySize || null,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: "owner_user_id" })
+      .upsert(
+        {
+          owner_id: user.id,
+          legal_name: companyName,
+          display_name: companyName,
+          company_size: companySize,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "owner_id" }
+      )
       .select("id")
-      .maybeSingle();
+      .single();
 
-    if (compErr) return res.status(500).json({ error: `companies: ${compErr.message}` });
+    if (compErr) {
+      return res.status(500).json({ error: `companies: ${compErr.message}` });
+    }
 
-    const companyId = companyRow?.id ?? null;
+    const companyId = companyRow.id;
+
+
 
     // --- PROFILE ---
     const { error: profErr } = await supabaseAdmin
@@ -2760,23 +2773,23 @@ console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
 
     // 5) Marquer pending comme activé
     // ✅ Idempotence: conserver la date du premier clic
-const { data: curPending, error: curErr } = await supabaseAdmin
-  .from("pending_signups")
-  .select("activated_at")
-  .eq("id", pending_id)
-  .maybeSingle();
+    const { data: curPending, error: curErr } = await supabaseAdmin
+      .from("pending_signups")
+      .select("activated_at")
+      .eq("id", pending_id)
+      .maybeSingle();
 
-if (curErr) return res.status(500).json({ error: curErr.message });
+    if (curErr) return res.status(500).json({ error: curErr.message });
 
-await supabaseAdmin
-  .from("pending_signups")
-  .update({
-    status: "activated",
-    user_id: user.id,
-    updated_at: new Date().toISOString(),
-    activated_at: curPending?.activated_at ?? new Date().toISOString(),
-  })
-  .eq("id", pending_id);
+    await supabaseAdmin
+      .from("pending_signups")
+      .update({
+        status: "activated",
+        user_id: user.id,
+        updated_at: new Date().toISOString(),
+        activated_at: curPending?.activated_at ?? new Date().toISOString(),
+      })
+      .eq("id", pending_id);
 
 
 

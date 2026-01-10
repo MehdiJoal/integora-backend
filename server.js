@@ -3095,9 +3095,41 @@ app.post("/api/start-trial-invite", async (req, res) => {
       });
 
     if (inviteErr) {
+      const msg = String(inviteErr.message || "");
       console.error("❌ inviteUserByEmail error:", inviteErr);
-      return res.status(409).json({ error: inviteErr.message });
+
+      if (msg.toLowerCase().includes("already been registered")) {
+        const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+        const redirectTo = `${FRONT}/create-password.html?pending_id=${pending_id}`;
+
+        const { data: linkData, error: linkErr } =
+          await supabaseAdmin.auth.admin.generateLink({
+            type: "recovery",
+            email: emailNorm, // ou pending.email selon la route
+            options: { redirectTo },
+          });
+
+        if (linkErr) return res.status(500).json({ error: linkErr.message });
+
+        const setPasswordLink =
+          linkData?.properties?.action_link ||
+          linkData?.properties?.actionLink ||
+          null;
+
+        if (!setPasswordLink) {
+          return res.status(500).json({ error: "Missing set_password_link" });
+        }
+
+        return res.json({
+          ok: true,
+          account_exists: true,
+          set_password_link: setPasswordLink,
+        });
+      }
+
+      return res.status(409).json({ error: msg });
     }
+
 
     const user_id = inviteData?.user?.id || null;
 
@@ -3152,8 +3184,42 @@ app.post("/api/resend-activation", async (req, res) => {
       });
 
     if (inviteErr) {
-      return res.status(409).json({ error: inviteErr.message });
+      const msg = String(inviteErr.message || "");
+
+      // ✅ Cas : user déjà créé -> on génère un lien "recovery" pour définir le mot de passe
+      if (msg.toLowerCase().includes("already been registered")) {
+        const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+        const redirectTo = `${FRONT}/create-password.html?pending_id=${pending_id}`;
+
+        const { data: linkData, error: linkErr } =
+          await supabaseAdmin.auth.admin.generateLink({
+            type: "recovery",
+            email: pending.email,
+            options: { redirectTo },
+          });
+
+        if (linkErr) return res.status(500).json({ error: linkErr.message });
+
+        const setPasswordLink =
+          linkData?.properties?.action_link ||
+          linkData?.properties?.actionLink ||
+          null;
+
+        if (!setPasswordLink) {
+          return res.status(500).json({ error: "Missing set_password_link" });
+        }
+
+        return res.json({
+          ok: true,
+          account_exists: true,
+          set_password_link: setPasswordLink,
+        });
+      }
+
+      // autres erreurs -> on garde 409
+      return res.status(409).json({ error: msg });
     }
+
 
     const user_id = inviteData?.user?.id || pending.user_id || null;
 

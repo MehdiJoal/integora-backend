@@ -33,10 +33,10 @@ const ALLOWED_ORIGINS = new Set([
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
-const isVercelPreview =
-  origin && /^https:\/\/integora-frontend-.*\.vercel\.app$/.test(origin);
+  const isVercelPreview =
+    origin && /^https:\/\/integora-frontend-.*\.vercel\.app$/.test(origin);
 
-if (origin && (ALLOWED_ORIGINS.has(origin) || isVercelPreview)) {
+  if (origin && (ALLOWED_ORIGINS.has(origin) || isVercelPreview)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Credentials", "true");
@@ -222,17 +222,17 @@ app.get('/api/health/supabase', async (req, res) => {
     const { data, error } = await supabase.storage.listBuckets();
 
     console.log("🧪 authEmailExists: checking email=", target, "page=", page);
-console.log("🧪 supabaseAdmin url =", process.env.SUPABASE_URL);
+    console.log("🧪 supabaseAdmin url =", process.env.SUPABASE_URL);
 
-if (error) {
-  console.error("❌ authEmailExists listUsers error:", error);
-  // SAFE MODE : si on ne peut pas vérifier, on bloque
-  return true;
-}
+    if (error) {
+      console.error("❌ authEmailExists listUsers error:", error);
+      // SAFE MODE : si on ne peut pas vérifier, on bloque
+      return true;
+    }
 
-console.log("🧪 listUsers error =", error);
-console.log("🧪 listUsers count =", data?.users?.length);
-console.log("🧪 sample emails =", (data?.users || []).slice(0, 3).map(u => u.email));
+    console.log("🧪 listUsers error =", error);
+    console.log("🧪 listUsers count =", data?.users?.length);
+    console.log("🧪 sample emails =", (data?.users || []).slice(0, 3).map(u => u.email));
 
 
     res.json({
@@ -360,7 +360,7 @@ const globalLimiter = rateLimit({
 
   windowMs: 1 * 60 * 1000, // 1 minute seulement
   max: 300, // 300 requêtes par minute par IP
-  
+
   message: {
     error: 'Trop de requêtes. Réessayez dans une minute.',
     code: 'RATE_LIMIT_EXCEEDED'
@@ -2201,24 +2201,24 @@ app.post(
       }
 
       const detected = sniffImageType(req.file.buffer);
-if (!detected) {
-  return res.status(400).json({
-    ok: false,
-    error: "Avatar invalide. Formats autorisés: JPG/PNG/WEBP",
-  });
-}
+      if (!detected) {
+        return res.status(400).json({
+          ok: false,
+          error: "Avatar invalide. Formats autorisés: JPG/PNG/WEBP",
+        });
+      }
 
-// ⚠️ si tu veux être strict : le type réel doit matcher le mimetype déclaré
-if (detected.mime !== req.file.mimetype) {
-  return res.status(400).json({
-    ok: false,
-    error: "Avatar invalide (type fichier incohérent).",
-  });
-}
+      // ⚠️ si tu veux être strict : le type réel doit matcher le mimetype déclaré
+      if (detected.mime !== req.file.mimetype) {
+        return res.status(400).json({
+          ok: false,
+          error: "Avatar invalide (type fichier incohérent).",
+        });
+      }
 
 
       // 🔒 extension forcée depuis le mimetype
-const ext = detected.ext;
+      const ext = detected.ext;
       const fileName = `avatars/${req.user.id}/${Date.now()}.${ext}`;
 
       const { error: uploadError } = await supabase.storage
@@ -2410,10 +2410,10 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     if (emailNorm.length > 254) return res.status(400).json({ error: "email trop long" });
 
     // ✅ IMPORTANT : si l'email existe déjà, on NE doit PAS rediriger vers Stripe
-const alreadyExists = await authEmailExists(emailNorm);
-if (alreadyExists) {
-  return res.status(409).json({ error: "ACCOUNT_EXISTS" });
-}
+    const alreadyExists = await authEmailExists(emailNorm);
+    if (alreadyExists) {
+      return res.status(409).json({ error: "ACCOUNT_EXISTS" });
+    }
 
 
     const desired_plan = String(req.body?.desired_plan || "").trim();
@@ -2571,7 +2571,7 @@ if (alreadyExists) {
 
   } catch (e) {
     console.error("❌ [START-PAID] error:", e);
-return res.status(500).json({ error: "Erreur serveur" });
+    return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
@@ -2638,10 +2638,42 @@ app.post("/api/complete-signup", async (req, res) => {
       });
 
     if (inviteErr) {
-      console.error("❌ inviteUserByEmail error:", inviteErr);
-      // cas typique : user existe déjà
-      return res.status(409).json({ error: inviteErr.message });
+      const msg = String(inviteErr.message || "");
+
+      // ✅ Cas : user déjà créé -> on renvoie un lien de création de mot de passe
+      if (msg.toLowerCase().includes("already been registered")) {
+        const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+        const redirectTo = `${FRONT}/create-password.html?pending_id=${pending_id}`;
+
+        const { data: linkData, error: linkErr } =
+          await supabaseAdmin.auth.admin.generateLink({
+            type: "recovery",
+            email: pending.email,
+            options: { redirectTo },
+          });
+
+        if (linkErr) return res.status(500).json({ error: linkErr.message });
+
+        const setPasswordLink =
+          linkData?.properties?.action_link ||
+          linkData?.properties?.actionLink ||
+          null;
+
+        if (!setPasswordLink) {
+          return res.status(500).json({ error: "Missing set_password_link" });
+        }
+
+        return res.json({
+          ok: true,
+          account_exists: true,
+          set_password_link: setPasswordLink,
+        });
+      }
+
+      // autres erreurs -> on garde 409
+      return res.status(409).json({ error: msg });
     }
+
 
 
     const user_id = inviteData?.user?.id || null;
@@ -2956,11 +2988,11 @@ app.post("/api/start-trial-invite", async (req, res) => {
     if (emailNorm.length > 254) return res.status(400).json({ error: "email trop long" });
 
     // ✅ IMPORTANT : si l'email existe déjà, on NE doit PAS créer une session Stripe
-// -> même comportement que TRIAL : message générique côté front
-const alreadyExists = await authEmailExists(emailNorm);
-if (alreadyExists) {
-  return res.status(409).json({ error: "ACCOUNT_EXISTS" });
-}
+    // -> même comportement que TRIAL : message générique côté front
+    const alreadyExists = await authEmailExists(emailNorm);
+    if (alreadyExists) {
+      return res.status(409).json({ error: "ACCOUNT_EXISTS" });
+    }
 
     const first_name = cleanPersonName(req.body?.first_name, { max: 50 });
     const last_name = cleanPersonName(req.body?.last_name, { max: 50 });
@@ -3085,7 +3117,7 @@ if (alreadyExists) {
 
   } catch (e) {
     console.error("❌ [TRIAL] error:", e);
-return res.status(500).json({ error: "Erreur serveur" });
+    return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 

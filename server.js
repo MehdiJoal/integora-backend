@@ -2468,13 +2468,14 @@ app.post(
         });
       }
 
-      // ⚠️ si tu veux être strict : le type réel doit matcher le mimetype déclaré
-      if (detected.mime !== req.file.mimetype) {
+      // ✅ tolérant : on accepte si c'est une image, et sniffImageType est la vérité
+      if (!req.file.mimetype || !req.file.mimetype.startsWith("image/")) {
         return res.status(400).json({
           ok: false,
-          error: "Avatar invalide (type fichier incohérent).",
+          error: "Avatar invalide (mimetype non image).",
         });
       }
+
 
 
       // 🔒 extension forcée depuis le mimetype
@@ -2515,7 +2516,18 @@ app.post(
         return res.status(500).json({ ok: false, error: "Erreur signed url: " + signErr.message });
       }
 
-      return res.json({ ok: true, url: signed.signedUrl, path: avatarPath, message: "Avatar mis à jour avec succès !" });
+      return res.json({
+        ok: true,
+        path: avatarPath,
+
+        // ✅ nouveau champ explicite
+        signedUrl: signed.signedUrl,
+
+        // ✅ rétro-compat (ton front actuel lit "url")
+        url: signed.signedUrl,
+
+        message: "Avatar mis à jour avec succès !"
+      });
 
     } catch (error) {
       return res.status(500).json({ ok: false, error: "Erreur serveur: " + error.message });
@@ -2535,22 +2547,45 @@ app.get("/api/my-avatar-url", authenticateToken, async (req, res) => {
       return res.status(500).json({ ok: false, error: error.message });
     }
 
-    // avatar_url = PATH stocké, sinon default
-    const path = prof?.avatar_url || "avatars/default/default-avatar.png";
+    // ✅ Normalise avatar_url : on veut TOUJOURS un PATH "dans le bucket"
+    const normalizeAvatarPath = (v) => {
+      if (!v) return null;
+
+      // si c'est une URL complète => on extrait ce qu'il y a après "/Avatars/"
+      if (v.startsWith("http://") || v.startsWith("https://")) {
+        const idx = v.indexOf("/Avatars/");
+        if (idx !== -1) {
+          return v.slice(idx + "/Avatars/".length).split("?")[0];
+        }
+        return null;
+      }
+
+      // sinon on suppose que c'est déjà un path correct
+      return v;
+    };
+
+    // ✅ IMPORTANT : ton fichier default est dans "default/default-avatar.png"
+    const DEFAULT_AVATAR_PATH = "default/default-avatar.png";
+
+    const path = normalizeAvatarPath(prof?.avatar_url) || DEFAULT_AVATAR_PATH;
 
     const { data: signed, error: signErr } = await supabase.storage
       .from("Avatars")
       .createSignedUrl(path, 60 * 60);
 
     if (signErr) {
-      return res.status(500).json({ ok: false, error: signErr.message });
+      // 🔎 te donne un log explicite pour ne plus être dans le flou
+      console.error("❌ /api/my-avatar-url createSignedUrl error:", signErr, "path:", path);
+      return res.status(500).json({ ok: false, error: signErr.message, path });
     }
 
     return res.json({ ok: true, url: signed.signedUrl, path });
   } catch (e) {
+    console.error("💥 /api/my-avatar-url exception:", e);
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 
 
 
@@ -2868,16 +2903,35 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     // ✅ 3) Créer session Stripe (nouvelle session à chaque tentative)
     const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
 
+    // ✅ 3) Créer un Customer Stripe AVANT checkout (pour facture parfaite)
+    const stripeCustomer = await stripe.customers.create({
+      email: emailNorm,
+      name: company_name,
+      address: {
+        line1: billing_street,
+        postal_code: billing_postal_code,
+        city: billing_city,
+        country: (billing_country || "FR").toUpperCase(),
+      },
+      invoice_settings: {
+        custom_fields: [
+          { name: "SIRET", value: company_siret },
+        ],
+      },
+      metadata: {
+        source: "integora_signup",
+        pending_id,
+        company_name,
+        company_siret,
+      },
+    });
+
+    // ✅ 4) Créer session Stripe (facture = infos Customer)
     const session = await stripe.checkout.sessions.create({
-
-      // ✅ force la création d’un Customer Stripe (important pour cohérence)
       mode: "subscription",
-      customer_email: emailNorm,
+      customer: stripeCustomer.id,
 
-
-      // ✅ empêche la sauvegarde automatique du moyen de paiement
       payment_method_collection: "always",
-
       line_items: [{ price: priceId, quantity: 1 }],
 
       success_url: `${FRONT}/email-sent-paiement.html?session_id={CHECKOUT_SESSION_ID}&pending_id=${pending_id}`,
@@ -2886,18 +2940,19 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       metadata: {
         pending_id,
         desired_plan,
-        user_email: emailNorm
+        user_email: emailNorm,
+        stripe_customer_id: stripeCustomer.id, // ✅ utile pour debug
       },
 
       subscription_data: {
-
         metadata: {
           pending_id,
           desired_plan,
-          user_email: emailNorm
-        }
-      }
+          user_email: emailNorm,
+        },
+      },
     });
+
 
 
     // ✅ 4) Stocker stripe_session_id dans pending
@@ -2905,9 +2960,11 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       .from("pending_signups")
       .update({
         stripe_session_id: session.id,
+        stripe_customer_id: stripeCustomer.id, // ✅ IMPORTANT
         updated_at: new Date().toISOString()
       })
       .eq("id", pending_id);
+
 
     if (sessUpdErr) {
       console.error("❌ pending_signups update stripe_session_id error:", sessUpdErr);

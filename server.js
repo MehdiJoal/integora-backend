@@ -2425,12 +2425,27 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     const last_name = cleanPersonName(req.body?.last_name, { max: 50 });
     const company_name = cleanTextStrict(req.body?.company_name, { max: 120, allowEmpty: false });
     const company_size = String(req.body?.company_size || "").trim();
+    // =========================
+    // VALIDATION FACTURATION (PAYANT)
+    // =========================
+    const rawSiret = String(req.body?.company_siret || "");
+    const company_siret = rawSiret.replace(/\D/g, "");
+    const billing_address = cleanTextStrict(req.body?.billing_address, {
+      max: 300,
+      allowEmpty: false,
+    });
+
 
     if (!first_name || first_name.length < 2) return res.status(400).json({ error: "first_name invalide" });
     if (!last_name || last_name.length < 2) return res.status(400).json({ error: "last_name invalide" });
     if (!company_name || company_name.length < 2) return res.status(400).json({ error: "company_name invalide" });
     if (!ALLOWED_COMPANY_SIZES.has(company_size)) return res.status(400).json({ error: "company_size invalide" });
-
+    if (company_siret.length !== 14) {
+      return res.status(400).json({ error: "INVALID_SIRET" });
+    }
+    if (!billing_address || billing_address.length < 10) {
+      return res.status(400).json({ error: "INVALID_BILLING_ADDRESS" });
+    }
 
     // ✅ 0) S'il existe déjà un pending actif pour cet email, on le réutilise
     //     (évite l’erreur unique constraint pending_one_active_per_email)
@@ -2464,6 +2479,8 @@ app.post("/api/start-paid-checkout", async (req, res) => {
           company_name: company_name ?? existingPending.company_name,
           company_size: company_size ?? existingPending.company_size,
           desired_plan,
+          company_siret,
+          billing_address,
           status: "pending",
           updated_at: new Date().toISOString()
         })
@@ -2485,6 +2502,8 @@ app.post("/api/start-paid-checkout", async (req, res) => {
           company_name: company_name ?? null,
           company_size: company_size ?? null,
           desired_plan,
+          company_siret,
+          billing_address,
           status: "pending",
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
@@ -2815,6 +2834,8 @@ app.post("/api/finalize-pending", async (req, res) => {
           legal_name: companyName,
           display_name: companyName,
           company_size: companySize,
+          company_siret: pending.company_siret ?? null,
+          billing_address: pending.billing_address ?? null,
           updated_at: new Date().toISOString(),
         },
         { onConflict: "owner_id" }

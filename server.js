@@ -453,6 +453,65 @@ app.get("/app/*", (req, res) => {
   return res.sendFile(path.join(APP_DIR, "choix_irl_digital.html"));
 });
 
+//middleware empechant POST PUT, ect site externe
+
+function enforceSameSiteForMutations(req, res, next) {
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) return next();
+
+  const origin = req.headers.origin || "";
+  const referer = req.headers.referer || "";
+
+  const allowed = (o) =>
+    ALLOWED_ORIGINS.has(o) || /^https:\/\/integora-frontend-.*\.vercel\.app$/.test(o);
+
+  // si origin est présent => on le valide
+  if (origin) {
+    if (!allowed(origin)) return res.status(403).json({ error: "Origin interdit" });
+    return next();
+  }
+
+  // fallback referer (certains navigateurs / cas)
+  if (referer) {
+    try {
+      const refOrigin = new URL(referer).origin;
+      if (!allowed(refOrigin)) return res.status(403).json({ error: "Referer interdit" });
+    } catch {
+      return res.status(403).json({ error: "Referer invalide" });
+    }
+  }
+
+  return next();
+}
+
+app.use(enforceSameSiteForMutations);
+
+function requireJson(req, res, next) {
+  // On ne force pas le JSON sur les méthodes non mutantes
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) return next();
+
+  // Seulement pour l'API
+  if (!req.path.startsWith("/api/")) return next();
+
+  // ✅ Autoriser les uploads multipart (avatar, support, etc.)
+  if (req.is("multipart/form-data")) return next();
+
+  // ✅ Autoriser JSON normal
+  if (req.is("application/json")) return next();
+
+  // ✅ Autoriser body vide (certains DELETE/POST sans body)
+  const len = Number(req.headers["content-length"] || 0);
+  if (!len) return next();
+
+  return res.status(415).json({
+    error: "Content-Type application/json ou multipart/form-data requis",
+  });
+}
+
+app.use(requireJson);
+
+
+
+
 
 
 
@@ -728,6 +787,59 @@ function cleanTextStrict(v, { max, allowEmpty = false } = {}) {
   const ok = /^[A-Za-zÀ-ÖØ-öø-ÿ0-9][A-Za-zÀ-ÖØ-öø-ÿ0-9\s.,&'()\/-]*$/.test(s);
   return ok ? s : "";
 }
+
+
+function rejectIfBadChars(s) {
+  if (typeof s !== "string") return "";
+  if (/[<>"']/.test(s)) return "";          // bloque < > " '
+  if (/[\r\n\t]/.test(s)) return "";        // bloque retours ligne / tabs
+  if (/(https?:\/\/|www\.)/i.test(s)) return ""; // bloque URLs
+  return s;
+}
+
+function cleanDigitsStrict(v, { min, max, allowEmpty = true } = {}) {
+  if (typeof v !== "string") return allowEmpty ? null : "";
+  let s = v.trim();
+  if (!s) return allowEmpty ? null : "";
+  s = rejectIfBadChars(s);
+  if (!s) return ""; // rejet
+  if (!/^\d+$/.test(s)) return ""; // que des chiffres
+  if (min && s.length < min) return "";
+  if (max && s.length > max) return "";
+  return s;
+}
+
+// Lettres (accents OK) + espaces + tirets + apostrophes + points
+function cleanNameLike(v, { min = 0, max = 64, allowEmpty = true } = {}) {
+  if (typeof v !== "string") return allowEmpty ? null : "";
+  let s = v.trim();
+  if (!s) return allowEmpty ? null : "";
+  s = rejectIfBadChars(s);
+  if (!s) return "";
+  if (s.length > max) s = s.slice(0, max);
+
+  const re = /^[\p{L}][\p{L}\p{M}\s\-'.]{0,}$/u;
+  if (!re.test(s)) return "";
+  if (min && s.length < min) return "";
+  return s;
+}
+
+// Adresse : autorise lettres/chiffres/espaces/virgule/point/tiret/apostrophe/#/()
+function cleanAddress(v, { min = 0, max = 140, allowEmpty = true } = {}) {
+  if (typeof v !== "string") return allowEmpty ? null : "";
+  let s = v.trim();
+  if (!s) return allowEmpty ? null : "";
+  s = rejectIfBadChars(s);
+  if (!s) return "";
+  if (s.length > max) s = s.slice(0, max);
+
+  // autorise : lettres, chiffres, espaces, , . - ' # / ( )
+  const re = /^[\p{L}\p{M}\d\s,.\-'/#()]+$/u;
+  if (!re.test(s)) return "";
+  if (min && s.length < min) return "";
+  return s;
+}
+
 
 //Helper 2 — nom/prénom (lettres + tiret)
 function cleanPersonName(v, { max } = {}) {
@@ -2024,7 +2136,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// ✅ Lecture du profil utilisateur
+
 // ✅ ROUTE MY-PROFILE - VÉRIFIEZ QU'ELLE RETOURNE avatar_url
 app.get('/api/my-profile', authenticateToken, async (req, res) => {
   console.log('👤 [API My-Profile] Début - User ID:', req.user?.id);
@@ -2065,6 +2177,34 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
+
+
+// ✅ Lecture des infos entreprise (companies) -> auto-remplissage profile.html
+app.get("/api/my-company", authenticateToken, async (req, res) => {
+  console.log("🏢 [API My-Company] User ID:", req.user?.id);
+
+  try {
+    const { data: company, error } = await supabase
+      .from("companies")
+      .select(
+        "id, legal_name, display_name, company_size, company_siret, billing_street, billing_postal_code, billing_city, billing_country",
+      )
+      .eq("owner_id", req.user.id)
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ [API My-Company] Supabase error:", error);
+      return res.status(400).json({ ok: false, error: error.message });
+    }
+
+    // Si pas encore de company : on renvoie un objet vide (pas une 404)
+    return res.json(company || {});
+  } catch (e) {
+    console.error("💥 [API My-Company] Exception:", e);
+    return res.status(500).json({ ok: false, error: "Erreur serveur my-company" });
+  }
+});
+
 
 // ✅ Mise à jour du profil (POST au lieu de PUT pour CSRF)
 app.post('/api/update-profile', authenticateToken, async (req, res) => {
@@ -2120,6 +2260,126 @@ app.post('/api/update-profile', authenticateToken, async (req, res) => {
       ok: false,
       error: 'Erreur serveur lors de la mise à jour du profil'
     });
+  }
+});
+
+
+
+app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
+  console.log("🏢 [API update-billing] User:", req.user?.id);
+  console.log("📦 [API update-billing] Body:", req.body);
+
+  try {
+    const owner_id = req.user.id;
+
+    const body = req.body || {};
+
+    // 1) Nettoyage/validation (backend = source de vérité sécurité)
+    const legal_name = cleanTextStrict(body.legal_name, { max: 120, allowEmpty: false });
+    if (!legal_name) {
+      return res.status(400).json({ ok: false, error: "Raison sociale invalide." });
+    }
+
+    // optionnel
+    const display_name = cleanTextStrict(body.display_name, { max: 120, allowEmpty: true });
+
+    // company_size est NOT NULL dans ta table, donc on le garde si existant sinon requis
+    const company_size_in = cleanTextStrict(body.company_size, { max: 30, allowEmpty: true });
+
+    // SIRET : strict 14 chiffres (ou vide)
+    const company_siret = cleanDigitsStrict(body.company_siret, { min: 14, max: 14, allowEmpty: true });
+    if (company_siret === "") {
+      return res.status(400).json({ ok: false, error: "SIRET invalide : 14 chiffres requis." });
+    }
+
+    // Adresse : min 6 (cohérent avec ta contrainte SQL) / max 140
+    const billing_street = cleanAddress(body.billing_street, { min: 6, max: 140, allowEmpty: true });
+    if (billing_street === "") {
+      return res.status(400).json({ ok: false, error: "Adresse invalide (min 6 caractères, caractères interdits)." });
+    }
+
+    // Code postal : chiffres only (large : 4-10)
+    const billing_postal_code = cleanDigitsStrict(body.billing_postal_code, { min: 4, max: 10, allowEmpty: true });
+    if (billing_postal_code === "") {
+      return res.status(400).json({ ok: false, error: "Code postal invalide : chiffres uniquement (4 à 10)." });
+    }
+
+    // Ville : min 2 (cohérent SQL) / max 64
+    const billing_city = cleanNameLike(body.billing_city, { min: 2, max: 64, allowEmpty: true });
+    if (billing_city === "") {
+      return res.status(400).json({ ok: false, error: "Ville invalide (lettres/espaces/tirets/apostrophes/points)." });
+    }
+
+    // Pays : tu veux "en entier" => max 56 (comme ton front) + mêmes règles "name-like"
+    const billing_country = cleanNameLike(body.billing_country, { min: 2, max: 56, allowEmpty: true });
+    if (billing_country === "") {
+      return res.status(400).json({ ok: false, error: "Pays invalide (lettres/espaces/tirets/apostrophes/points)." });
+    }
+
+    // 2) companies.legal_name + company_size sont NOT NULL
+    // => soit tu fournis ici, soit ça existe déjà en base
+    const { data: existing, error: exErr } = await supabase
+      .from("companies")
+      .select("id, legal_name, company_size")
+      .eq("owner_id", owner_id)
+      .maybeSingle();
+
+    if (exErr) return res.status(400).json({ ok: false, error: exErr.message });
+
+    const finalLegal = legal_name || existing?.legal_name || null;
+    const finalSize = company_size_in || existing?.company_size || null;
+
+    if (!finalLegal || !finalSize) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Impossible d'enregistrer: legal_name et company_size sont requis (ou doivent déjà exister).",
+      });
+    }
+
+    // 3) Upsert companies
+    const upsertData = {
+      owner_id,
+      legal_name: finalLegal,
+      company_size: finalSize,
+      display_name: display_name || null,
+      company_siret: company_siret || null,
+      billing_street: billing_street || null,
+      billing_postal_code: billing_postal_code || null,
+      billing_city: billing_city || null,
+      billing_country: billing_country || null,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data: company, error: upErr } = await supabase
+      .from("companies")
+      .upsert(upsertData, { onConflict: "owner_id" })
+      .select(
+        "id, legal_name, display_name, company_size, company_siret, billing_street, billing_postal_code, billing_city, billing_country",
+      )
+      .single();
+
+    if (upErr) {
+      return res.status(400).json({ ok: false, error: upErr.message });
+    }
+
+    // 4) Liaison profile -> company_id (comme tu le fais déjà)
+    const { error: profErr } = await supabase
+      .from("profiles")
+      .update({ company_id: company.id, updated_at: new Date().toISOString() })
+      .eq("user_id", owner_id);
+
+    if (profErr) {
+      return res.status(400).json({
+        ok: false,
+        error: "Company OK mais échec update profiles.company_id: " + profErr.message,
+      });
+    }
+
+    return res.json({ ok: true, message: "Entreprise mise à jour", company });
+  } catch (e) {
+    console.error("💥 [API update-billing] Exception:", e);
+    return res.status(500).json({ ok: false, error: "Erreur serveur update-billing" });
   }
 });
 
@@ -2232,12 +2492,12 @@ app.post(
         return res.status(500).json({ ok: false, error: "Erreur upload storage: " + uploadError.message });
       }
 
-      const { data: publicUrlData } = supabase.storage.from("Avatars").getPublicUrl(fileName);
-      const avatarUrl = publicUrlData.publicUrl;
+      // 1) Stocke le PATH (pas une URL publique)
+      const avatarPath = fileName;
 
       const { data: updatedProfile, error: updateError } = await supabase
         .from("profiles")
-        .update({ avatar_url: avatarUrl, updated_at: new Date().toISOString() })
+        .update({ avatar_url: avatarPath, updated_at: new Date().toISOString() }) // avatar_url contient maintenant un PATH
         .eq("user_id", req.user.id)
         .select("avatar_url")
         .single();
@@ -2246,12 +2506,52 @@ app.post(
         return res.status(500).json({ ok: false, error: "Erreur mise à jour profil: " + updateError.message });
       }
 
-      return res.json({ ok: true, url: avatarUrl, message: "Avatar mis à jour avec succès !" });
+      // 2) Retourne une SIGNED URL pour affichage immédiat
+      const { data: signed, error: signErr } = await supabase.storage
+        .from("Avatars")
+        .createSignedUrl(avatarPath, 60 * 60); // 1h
+
+      if (signErr) {
+        return res.status(500).json({ ok: false, error: "Erreur signed url: " + signErr.message });
+      }
+
+      return res.json({ ok: true, url: signed.signedUrl, path: avatarPath, message: "Avatar mis à jour avec succès !" });
+
     } catch (error) {
       return res.status(500).json({ ok: false, error: "Erreur serveur: " + error.message });
     }
   }
 );
+
+app.get("/api/my-avatar-url", authenticateToken, async (req, res) => {
+  try {
+    const { data: prof, error } = await supabase
+      .from("profiles")
+      .select("avatar_url")
+      .eq("user_id", req.user.id)
+      .single();
+
+    if (error) {
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    // avatar_url = PATH stocké, sinon default
+    const path = prof?.avatar_url || "avatars/default/default-avatar.png";
+
+    const { data: signed, error: signErr } = await supabase.storage
+      .from("Avatars")
+      .createSignedUrl(path, 60 * 60);
+
+    if (signErr) {
+      return res.status(500).json({ ok: false, error: signErr.message });
+    }
+
+    return res.json({ ok: true, url: signed.signedUrl, path });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 
 
 
@@ -2430,8 +2730,19 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     // =========================
     const rawSiret = String(req.body?.company_siret || "");
     const company_siret = rawSiret.replace(/\D/g, "");
-    const billing_address = cleanTextStrict(req.body?.billing_address, {
-      max: 300,
+    const billing_street = cleanTextStrict(req.body?.billing_street, {
+      max: 120,
+      allowEmpty: false,
+    });
+
+    const billing_postal_code_raw = String(req.body?.billing_postal_code || "").trim();
+    const billing_city = cleanTextStrict(req.body?.billing_city, {
+      max: 60,
+      allowEmpty: false,
+    });
+
+    const billing_country = cleanTextStrict(req.body?.billing_country, {
+      max: 60,
       allowEmpty: false,
     });
 
@@ -2443,9 +2754,23 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     if (company_siret.length !== 14) {
       return res.status(400).json({ error: "INVALID_SIRET" });
     }
-    if (!billing_address || billing_address.length < 10) {
-      return res.status(400).json({ error: "INVALID_BILLING_ADDRESS" });
+    if (!billing_street || billing_street.length < 6) {
+      return res.status(400).json({ error: "INVALID_BILLING_STREET" });
     }
+
+    const billing_postal_code = billing_postal_code_raw.replace(/\s+/g, "");
+    if (!/^[0-9A-Za-z-]{4,10}$/.test(billing_postal_code)) {
+      return res.status(400).json({ error: "INVALID_BILLING_POSTAL_CODE" });
+    }
+
+    if (!billing_city || billing_city.length < 2) {
+      return res.status(400).json({ error: "INVALID_BILLING_CITY" });
+    }
+
+    if (!billing_country || billing_country.length < 2) {
+      return res.status(400).json({ error: "INVALID_BILLING_COUNTRY" });
+    }
+
 
     // ✅ 0) S'il existe déjà un pending actif pour cet email, on le réutilise
     //     (évite l’erreur unique constraint pending_one_active_per_email)
@@ -2480,8 +2805,12 @@ app.post("/api/start-paid-checkout", async (req, res) => {
           company_size: company_size ?? existingPending.company_size,
           desired_plan,
           company_siret,
-          billing_address,
           status: "pending",
+          billing_street,
+          billing_postal_code,
+          billing_city,
+          billing_country,
+
           updated_at: new Date().toISOString()
         })
         .eq("id", pending_id);
@@ -2503,7 +2832,10 @@ app.post("/api/start-paid-checkout", async (req, res) => {
           company_size: company_size ?? null,
           desired_plan,
           company_siret,
-          billing_address,
+          billing_street,
+          billing_postal_code,
+          billing_city,
+          billing_country,
           status: "pending",
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
@@ -2835,7 +3167,11 @@ app.post("/api/finalize-pending", async (req, res) => {
           display_name: companyName,
           company_size: companySize,
           company_siret: pending.company_siret ?? null,
-          billing_address: pending.billing_address ?? null,
+          billing_street: pending.billing_street,
+          billing_postal_code: pending.billing_postal_code,
+          billing_city: pending.billing_city,
+          billing_country: pending.billing_country,
+
           updated_at: new Date().toISOString(),
         },
         { onConflict: "owner_id" }

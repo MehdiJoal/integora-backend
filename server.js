@@ -1711,6 +1711,33 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Subscription Stripe invalide (item manquant)" });
     }
 
+    // 🧹 IMPORTANT : supprimer les pending invoice items liés au prépaiement année suivante
+    // sinon Stripe les affiche pendant l’upgrade (et tu vois 180€/an “année suivante”)
+    try {
+      const items = await stripe.invoiceItems.list({
+        customer: sub.stripe_customer_id,
+        pending: true,
+        limit: 100,
+      });
+
+      const targets = items.data.filter((it) => {
+        const action = it.metadata?.action;
+        const desc = String(it.description || "").toLowerCase();
+        return action === "prepay_next_year" || desc.includes("prépaiement année suivante");
+      });
+
+      for (const it of targets) {
+        await stripe.invoiceItems.del(it.id);
+      }
+
+      if (targets.length) {
+        console.log("🧹 Pending prepay invoice items supprimés:", targets.length);
+      }
+    } catch (e) {
+      console.warn("🧹 purge pending invoice items skipped:", e?.message || e);
+    }
+
+
     // 3) Billing Portal : Stripe calcule prorata + affiche + paiement manuel
     const portalSession = await stripe.billingPortal.sessions.create({
       customer: sub.stripe_customer_id,

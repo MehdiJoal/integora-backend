@@ -860,6 +860,107 @@ function normalizeCountryISO2(input) {
   return map[normalized] || null;
 }
 
+
+
+// ==================== SYNC FACTURATION (Supabase -> Stripe Customer) ====================
+// Ne touche qu'au Customer Stripe (affichage facture), pas aux abonnements.
+async function syncStripeCustomerBillingFromDb({ userId, stripeCustomerId, requireComplete = true }) {
+  // 1) Lire profil + entreprise
+  const { data: prof, error: profErr } = await supabaseAdmin
+    .from("profiles")
+    .select(`
+      first_name,
+      last_name,
+      company_id,
+      companies:company_id (
+        legal_name,
+        display_name,
+        company_siret,
+        billing_street,
+        billing_postal_code,
+        billing_city,
+        billing_country
+      )
+    `)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (profErr) {
+    console.warn("⚠️ syncStripeCustomerBillingFromDb: profiles read error:", profErr);
+    if (requireComplete) throw new Error("Erreur lecture profil/entreprise");
+    return { ok: false, reason: "db_read_error" };
+  }
+
+  const company = prof?.companies || null;
+
+  const legalName = company?.legal_name || null;
+  const displayName = company?.display_name || null;
+  const siretRaw = company?.company_siret || null;
+
+  const street = company?.billing_street || null;
+  const postal = company?.billing_postal_code || null;
+  const city = company?.billing_city || null;
+  const country = company?.billing_country || null;
+
+  // 2) Normalisations strictes
+  const siret = siretRaw ? String(siretRaw).replace(/\s+/g, "") : null;
+  const siren = siret && siret.length >= 9 ? siret.slice(0, 9) : null;
+
+  const countryIso2 = country ? normalizeCountryISO2(country) : null;
+
+  // 3) Si requireComplete: on fail-hard (utile pour trial -> paiement / upgrade / prépay)
+  if (requireComplete) {
+    const missing = [];
+    if (!legalName) missing.push("raison sociale");
+    if (!siret || siret.length !== 14) missing.push("SIRET (14 chiffres)");
+    if (!street) missing.push("adresse");
+    if (!postal) missing.push("code postal");
+    if (!city) missing.push("ville");
+    if (!countryIso2) missing.push("pays");
+
+    if (missing.length) {
+      const msg = `Informations légales/facturation manquantes: ${missing.join(", ")}.`;
+      const err = new Error(msg);
+      err.code = "BILLING_INCOMPLETE";
+      throw err;
+    }
+  }
+
+  // 4) Construire le "name" Customer (raison sociale en priorité)
+  const customerName =
+    displayName ||
+    legalName ||
+    `${prof?.first_name || ""} ${prof?.last_name || ""}`.trim() ||
+    "Client";
+
+  // 5) Update Stripe customer (facture)
+  await stripe.customers.update(stripeCustomerId, {
+    name: customerName,
+    address: {
+      line1: street || undefined,
+      postal_code: postal || undefined,
+      city: city || undefined,
+      country: countryIso2 || undefined,
+    },
+    invoice_settings: {
+      custom_fields: [
+        ...(siret ? [{ name: "SIRET", value: siret }] : []),
+        ...(siren ? [{ name: "SIREN", value: siren }] : []),
+      ],
+    },
+    metadata: {
+      source: "integora_profile_billing",
+      user_id: userId,
+      company_id: prof?.company_id || "",
+      company_siret: siret || "",
+      company_legal_name: legalName || "",
+    },
+  });
+
+  return { ok: true };
+}
+
+
 // Adresse : autorise lettres/chiffres/espaces/virgule/point/tiret/apostrophe/#/()
 function cleanAddress(v, { min = 0, max = 140, allowEmpty = true } = {}) {
   if (typeof v !== "string") return allowEmpty ? null : "";
@@ -1579,6 +1680,24 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Upgrade possible uniquement depuis Standard" });
     }
 
+    // ✅✅✅ PATCH ICI : sync facturation Stripe AVANT portal (facture propre)
+    try {
+      await syncStripeCustomerBillingFromDb({
+        userId,
+        stripeCustomerId: sub.stripe_customer_id,
+        requireComplete: true,
+      });
+    } catch (e) {
+      if (e?.code === "BILLING_INCOMPLETE") {
+        return res.status(400).json({
+          error: e.message,
+          code: "BILLING_INCOMPLETE",
+        });
+      }
+      console.error("❌ sync billing (change-plan) error:", e);
+      return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
+    }
+
     const PREMIUM_PRICE_ID =
       process.env.STRIPE_PRICE_PREMIUM || "price_1SIoZGPGbG6oFrATq6020zVW";
 
@@ -1620,6 +1739,13 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
 // ==========================================
 // payer l’année suivante
 // ==========================================
+
+// 💰 Montants en centimes par plan
+const AMOUNT_BY_PLAN = {
+  standard: 12000,
+  premium: 18000,
+};
+
 app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -1637,33 +1763,25 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     // ✅ empêcher un 2e prépaiement en attente
     const { data: pendingPrepay, error: prepayErr } = await supabaseAdmin
       .from("subscription_prepayments")
-      .select("amount, currency, plan, created_at, checkout_session_id, effective_period_start, effective_period_end, consumed_at")
+      .select("id")
       .eq("user_id", userId)
-      .is("consumed_at", null)              // si tu n'as pas encore la colonne, retire cette ligne
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .is("consumed_at", null)
+      .limit(1);
 
-    if (prepayErr) console.warn("⚠️ prepay check:", prepayErr);
-
-    if (pendingPrepay?.id) {
-      return res.status(409).json({
-        error: "Vous avez déjà prépayé la prochaine période.",
-        startsAt: pendingPrepay.effective_period_start ?? null
-      });
+    if (prepayErr) {
+      console.error("❌ prepay-next-year pending check error:", prepayErr);
+      return res.status(500).json({ error: "Erreur vérification prépaiement" });
     }
 
-
-    const plan = (req.body?.plan || sub.plan);
-    if (!["standard", "premium"].includes(plan)) {
-      return res.status(400).json({ error: "Plan invalide" });
+    if (pendingPrepay && pendingPrepay.length > 0) {
+      return res.status(400).json({ error: "Pré-paiement déjà effectué pour l’année suivante." });
     }
 
-    const AMOUNT_BY_PLAN = {
-      standard: 12000, // centimes
-      premium: 18000
-    };
-
+    const requestedPlan = String(req.body?.plan ?? "").trim().toLowerCase();
+    const plan =
+      (requestedPlan === "standard" || requestedPlan === "premium")
+        ? requestedPlan
+        : (sub.plan || "standard");
     const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
     // ==========================================
@@ -1676,13 +1794,30 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       const ms = end.getTime() - now.getTime();
       const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
 
-
       if (daysRemaining > 366) {
         return res.status(400).json({
           error: "Le prépaiement est disponible uniquement à moins d’un an de l’échéance.",
           daysRemaining
         });
       }
+    }
+
+    // ✅✅✅ PATCH ICI : sync facturation Stripe AVANT checkout (prépay)
+    try {
+      await syncStripeCustomerBillingFromDb({
+        userId,
+        stripeCustomerId: sub.stripe_customer_id,
+        requireComplete: true,
+      });
+    } catch (e) {
+      if (e?.code === "BILLING_INCOMPLETE") {
+        return res.status(400).json({
+          error: e.message,
+          code: "BILLING_INCOMPLETE",
+        });
+      }
+      console.error("❌ sync billing (prepay) error:", e);
+      return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -1715,6 +1850,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
 
 
 
+
 // ==========================================
 // 🔁 TOGGLE RENOUVELLEMENT (cancel_at_period_end)
 // ==========================================
@@ -1733,9 +1869,16 @@ app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res)
       return res.status(400).json({ error: "Aucun abonnement Stripe actif" });
     }
 
+    const current = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
+
     const updated = await stripe.subscriptions.update(sub.stripe_subscription_id, {
-      cancel_at_period_end: autoRenew ? false : true
+      cancel_at_period_end: autoRenew ? false : true,
+      metadata: {
+        ...(current.metadata || {}),
+        renewal_mode: autoRenew ? "auto" : "manual",
+      }
     });
+
 
     // après: const updated = await stripe.subscriptions.update(...)
 
@@ -1762,35 +1905,7 @@ app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res)
   }
 });
 
-// ==========================================
-// 🔁 ACTIVER / DÉSACTIVER RENOUVELLEMENT
-// ==========================================
-app.post('/api/toggle-renewal', authenticateToken, async (req, res) => {
-  try {
-    const { renew } = req.body;
-    const userId = req.user.id;
 
-    const { data: sub } = await supabaseAdmin
-      .from('subscriptions')
-      .select('stripe_subscription_id')
-      .eq('user_id', userId)
-      .single();
-
-    if (!sub?.stripe_subscription_id) {
-      return res.status(400).json({ error: "Aucun abonnement actif" });
-    }
-
-    await stripe.subscriptions.update(sub.stripe_subscription_id, {
-      cancel_at_period_end: !renew
-    });
-
-    return res.json({ success: true });
-
-  } catch (err) {
-    console.error("toggle-renewal error:", err);
-    res.status(500).json({ error: "Erreur renouvellement" });
-  }
-});
 
 
 // ==========================================
@@ -1842,6 +1957,28 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
         .from("subscriptions")
         .upsert({ user_id: userId, stripe_customer_id: customerId }, { onConflict: "user_id" });
     }
+
+
+    // ✅ Synchronise la facturation Stripe avec les infos companies/profiles AVANT de créer la session
+    try {
+      await syncStripeCustomerBillingFromDb({
+        userId,
+        stripeCustomerId: customerId,
+        requireComplete: true,
+      });
+    } catch (e) {
+      if (e?.code === "BILLING_INCOMPLETE") {
+        return res.status(400).json({
+          ok: false,
+          error: e.message,
+          code: "BILLING_INCOMPLETE",
+        });
+      }
+      console.error("❌ sync billing (subscribe/session) error:", e);
+      return res.status(500).json({ ok: false, error: "Erreur sync facturation (Stripe)" });
+    }
+
+
 
     // 4) créer Checkout Session subscription (PARAMS STRIPE VALIDES)
     const session = await stripe.checkout.sessions.create({
@@ -2373,15 +2510,18 @@ app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
     if (exErr) return res.status(400).json({ ok: false, error: exErr.message });
 
     const finalLegal = legal_name || existing?.legal_name || null;
-    const finalSize = company_size_in || existing?.company_size || null;
 
-    if (!finalLegal || !finalSize) {
+    // ✅ company_size : si ton UI ne le demande pas, on met une valeur par défaut
+    // (si tu as une contrainte/enum sur company_size, remplace "unknown" par une valeur autorisée)
+    const finalSize = company_size_in || existing?.company_size || "unknown";
+
+    if (!finalLegal) {
       return res.status(400).json({
         ok: false,
-        error:
-          "Impossible d'enregistrer: legal_name et company_size sont requis (ou doivent déjà exister).",
+        error: "Impossible d'enregistrer: legal_name est requis.",
       });
     }
+
 
     // 3) Upsert companies
     const upsertData = {

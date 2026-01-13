@@ -824,6 +824,42 @@ function cleanNameLike(v, { min = 0, max = 64, allowEmpty = true } = {}) {
   return s;
 }
 
+
+/** ✅ Pays : ISO2 strict (FR, BE, ...).
+ *  Accepte aussi "France" / "FRANCE" etc (compat anciennes valeurs) => FR
+ *  Retourne null si invalide
+ */
+function normalizeCountryISO2(input) {
+  const v = String(input ?? "").trim();
+  if (!v) return null;
+
+  const up = v.toUpperCase();
+  if (/^[A-Z]{2}$/.test(up)) return up;
+
+  const normalized = v
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const map = {
+    "france": "FR",
+    "belgique": "BE",
+    "luxembourg": "LU",
+    "suisse": "CH",
+    "allemagne": "DE",
+    "espagne": "ES",
+    "italie": "IT",
+    "royaume-uni": "GB",
+    "royaume uni": "GB",
+    "pays-bas": "NL",
+    "pays bas": "NL",
+  };
+
+  return map[normalized] || null;
+}
+
 // Adresse : autorise lettres/chiffres/espaces/virgule/point/tiret/apostrophe/#/()
 function cleanAddress(v, { min = 0, max = 140, allowEmpty = true } = {}) {
   if (typeof v !== "string") return allowEmpty ? null : "";
@@ -2310,11 +2346,21 @@ app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Ville invalide (lettres/espaces/tirets/apostrophes/points)." });
     }
 
-    // Pays : tu veux "en entier" => max 56 (comme ton front) + mêmes règles "name-like"
-    const billing_country = cleanNameLike(body.billing_country, { min: 2, max: 56, allowEmpty: true });
-    if (billing_country === "") {
-      return res.status(400).json({ ok: false, error: "Pays invalide (lettres/espaces/tirets/apostrophes/points)." });
+    // Pays : ISO2 obligatoire (FR, BE, ...)
+    // Le front envoie déjà ISO2 (select), mais on revalide côté backend (fail-hard).
+    const billing_country_in = String(body.billing_country ?? "").trim();
+
+    // allowEmpty:true => si vide, on met null (ça suit ta logique actuelle)
+    let billing_country = null;
+    if (billing_country_in) {
+      const iso2 = normalizeCountryISO2(billing_country_in);
+      if (!iso2) {
+        return res.status(400).json({ ok: false, error: "Pays invalide : choisissez un pays dans la liste." });
+      }
+      billing_country = iso2;
     }
+
+
 
     // 2) companies.legal_name + company_size sont NOT NULL
     // => soit tu fournis ici, soit ça existe déjà en base
@@ -2805,6 +2851,11 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     if (!billing_country || billing_country.length < 2) {
       return res.status(400).json({ error: "INVALID_BILLING_COUNTRY" });
     }
+    const billingCountryIso2 = normalizeCountryISO2(billing_country);
+    if (!billingCountryIso2) {
+      return res.status(400).json({ error: "INVALID_BILLING_COUNTRY_ISO2" });
+    }
+
 
 
     // ✅ 0) S'il existe déjà un pending actif pour cet email, on le réutilise
@@ -2911,7 +2962,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
         line1: billing_street,
         postal_code: billing_postal_code,
         city: billing_city,
-        country: (billing_country || "FR").toUpperCase(),
+        country: billingCountryIso2,
       },
       invoice_settings: {
         custom_fields: [
@@ -2925,6 +2976,8 @@ app.post("/api/start-paid-checkout", async (req, res) => {
         company_siret,
       },
     });
+
+
 
     // ✅ 4) Créer session Stripe (facture = infos Customer)
     const session = await stripe.checkout.sessions.create({

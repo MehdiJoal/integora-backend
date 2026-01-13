@@ -1655,21 +1655,17 @@ async function authEmailExists(emailNorm) {
 // ✅ paiement manuel dans Stripe
 // ✅ aucune update silencieuse côté serveur
 // ==========================================
-// 🔁 UPGRADE STANDARD → PREMIUM (MANUEL + PRORATA)
-// ==========================================
 app.post("/api/change-plan", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const { newPlan } = req.body;
-
-    console.log(`🔄 [CHANGE-PLAN] Demandé par ${req.user.email} vers ${newPlan}`);
 
     // ✅ Upgrade uniquement standard -> premium
     if (newPlan !== "premium") {
       return res.status(400).json({ error: "Upgrade autorisé uniquement vers Premium" });
     }
 
-    // 1) Abonnement actuel
+    // 1) Abonnement actuel (Supabase = vérité applicative)
     const { data: sub, error } = await supabaseAdmin
       .from("subscriptions")
       .select("stripe_subscription_id, stripe_customer_id, plan")
@@ -1684,7 +1680,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Upgrade possible uniquement depuis Standard" });
     }
 
-    // ✅ Sync facturation Stripe
+    // ✅✅✅ PATCH ICI : sync facturation Stripe AVANT portal (facture propre)
     try {
       await syncStripeCustomerBillingFromDb({
         userId,
@@ -1693,16 +1689,21 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       });
     } catch (e) {
       if (e?.code === "BILLING_INCOMPLETE") {
-        return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
+        return res.status(400).json({
+          error: e.message,
+          code: "BILLING_INCOMPLETE",
+        });
       }
       console.error("❌ sync billing (change-plan) error:", e);
       return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
     }
 
-    const PREMIUM_PRICE_ID = process.env.STRIPE_PRICE_PREMIUM || "price_1SIoZGPGbG6oFrATq6020zVW";
+    const PREMIUM_PRICE_ID =
+      process.env.STRIPE_PRICE_PREMIUM || "price_1SIoZGPGbG6oFrATq6020zVW";
+
     const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
-    // 2) Récupérer l’item id
+    // 2) Récupérer l’item id de la subscription Stripe (obligatoire pour update_confirm)
     const stripeSub = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
     const itemId = stripeSub?.items?.data?.[0]?.id;
 
@@ -1710,32 +1711,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Subscription Stripe invalide (item manquant)" });
     }
 
-    // ============================================================
-    // 🧹 GRAND NETTOYAGE (C'est ici qu'on retire la ligne 2027)
-    // ============================================================
-    try {
-      console.log(`🧹 [CHANGE-PLAN] Recherche de lignes fantômes pour ${sub.stripe_customer_id}...`);
-      const pendingItems = await stripe.invoiceItems.list({
-        customer: sub.stripe_customer_id,
-        pending: true,
-      });
-
-      if (pendingItems.data.length > 0) {
-        console.log(`⚠️ TROUVÉ ${pendingItems.data.length} lignes fantômes ! Suppression en cours...`);
-        // On supprime TOUT ce qui traîne pour avoir une facture propre
-        for (const item of pendingItems.data) {
-          await stripe.invoiceItems.del(item.id);
-          console.log(`   🗑️ Item supprimé: ${item.id} (${item.amount} cts)`);
-        }
-        console.log("✅ [CHANGE-PLAN] Nettoyage terminé.");
-      } else {
-        console.log("✅ [CHANGE-PLAN] Aucune ligne fantôme trouvée.");
-      }
-    } catch (cleanErr) {
-      console.warn("⚠️ [CHANGE-PLAN] Erreur non-bloquante nettoyage items:", cleanErr.message);
-    }
-
-    // 3) Billing Portal : Stripe calcule le prorata proprement
+    // 3) Billing Portal : Stripe calcule prorata + affiche + paiement manuel
     const portalSession = await stripe.billingPortal.sessions.create({
       customer: sub.stripe_customer_id,
       return_url: `${FRONTEND_URL}/app/profile.html?upgrade=return`,
@@ -1748,12 +1724,14 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       },
     });
 
-    return res.json({ url: portalSession.url });
+    return res.json({ url: portalSession.url }); // ✅ garde "url" pour ton frontend actuel
   } catch (err) {
     console.error("❌ change-plan portal error:", err?.raw?.message || err);
     return res.status(500).json({ error: "Erreur upgrade" });
   }
 });
+
+
 
 
 

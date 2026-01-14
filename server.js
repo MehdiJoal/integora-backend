@@ -1711,32 +1711,6 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Subscription Stripe invalide (item manquant)" });
     }
 
-    // 🧹 IMPORTANT : supprimer les pending invoice items liés au prépaiement année suivante
-    // sinon Stripe les affiche pendant l’upgrade (et tu vois 180€/an “année suivante”)
-    try {
-      const items = await stripe.invoiceItems.list({
-        customer: sub.stripe_customer_id,
-        pending: true,
-        limit: 100,
-      });
-
-      const targets = items.data.filter((it) => {
-        const action = it.metadata?.action;
-        const desc = String(it.description || "").toLowerCase();
-        return action === "prepay_next_year" || desc.includes("prépaiement année suivante");
-      });
-
-      for (const it of targets) {
-        await stripe.invoiceItems.del(it.id);
-      }
-
-      if (targets.length) {
-        console.log("🧹 Pending prepay invoice items supprimés:", targets.length);
-      }
-    } catch (e) {
-      console.warn("🧹 purge pending invoice items skipped:", e?.message || e);
-    }
-
 
     // 3) Billing Portal : Stripe calcule prorata + affiche + paiement manuel
     const portalSession = await stripe.billingPortal.sessions.create({
@@ -2593,6 +2567,26 @@ app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
         error: "Company OK mais échec update profiles.company_id: " + profErr.message,
       });
     }
+
+    // ✅ NOUVEAU : sync Stripe customer immédiatement (garantit factures 100% à jour)
+    let stripe_synced = false;
+    try {
+      const { data: subRow, error: subErr } = await supabase
+        .from("subscriptions")
+        .select("stripe_customer_id")
+        .eq("user_id", owner_id)
+        .maybeSingle();
+
+      if (!subErr && subRow?.stripe_customer_id) {
+        await syncStripeCustomerBillingFromDb(subRow.stripe_customer_id, owner_id);
+        stripe_synced = true;
+      }
+    } catch (e) {
+      console.warn("⚠️ Stripe sync skipped (update-billing):", e);
+    }
+
+    return res.json({ ok: true, message: "Entreprise mise à jour", company, stripe_synced });
+
 
     return res.json({ ok: true, message: "Entreprise mise à jour", company });
   } catch (e) {

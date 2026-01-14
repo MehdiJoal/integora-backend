@@ -1648,24 +1648,56 @@ async function authEmailExists(emailNorm) {
 }
 
 
+
+
+
+
+
+async function retrieveProrationPreview(stripe, {
+  customerId,
+  subscriptionId,
+  subscriptionItemId,
+  newPriceId,
+}) {
+  const now = Math.floor(Date.now() / 1000);
+
+  // ✅ Nouvelle API : Create Preview Invoice
+  // subscription_details porte les infos de "simulation" d'update
+  const preview = await stripe.invoices.createPreview({
+    customer: customerId,
+    subscription: subscriptionId,
+    subscription_details: {
+      proration_behavior: "create_prorations",
+      proration_date: now,
+      items: [
+        {
+          id: subscriptionItemId,
+          price: newPriceId,
+          quantity: 1,
+        },
+      ],
+    },
+  });
+
+  return preview; // contient amount_due, currency, lines, etc.
+}
+
+
 // ==========================================
-// 🔁 UPGRADE STANDARD → PREMIUM (MANUEL + PRORATA)
-// ✅ Stripe calcule le prorata
-// ✅ l’utilisateur voit le montant
-// ✅ paiement manuel dans Stripe
-// ✅ aucune update silencieuse côté serveur
+// 🔁 UPGRADE STANDARD → PREMIUM (Checkout prorata)
+// ✅ Stripe calcule le prorata (retrieveUpcoming)
+// ✅ l’utilisateur paye via Stripe Checkout (payment)
+// ✅ après paiement, le webhook applique l’upgrade (sans prorata)
 // ==========================================
 app.post("/api/change-plan", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const { newPlan } = req.body;
 
-    // ✅ Upgrade uniquement standard -> premium
     if (newPlan !== "premium") {
       return res.status(400).json({ error: "Upgrade autorisé uniquement vers Premium" });
     }
 
-    // 1) Abonnement actuel (Supabase = vérité applicative)
     const { data: sub, error } = await supabaseAdmin
       .from("subscriptions")
       .select("stripe_subscription_id, stripe_customer_id, plan")
@@ -1680,7 +1712,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Upgrade possible uniquement depuis Standard" });
     }
 
-    // ✅✅✅ PATCH ICI : sync facturation Stripe AVANT portal (facture propre)
+    // ✅ sync facturation avant de créer un checkout
     try {
       await syncStripeCustomerBillingFromDb({
         userId,
@@ -1689,10 +1721,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       });
     } catch (e) {
       if (e?.code === "BILLING_INCOMPLETE") {
-        return res.status(400).json({
-          error: e.message,
-          code: "BILLING_INCOMPLETE",
-        });
+        return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
       }
       console.error("❌ sync billing (change-plan) error:", e);
       return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
@@ -1701,73 +1730,78 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
     const PREMIUM_PRICE_ID =
       process.env.STRIPE_PRICE_PREMIUM || "price_1SIoZGPGbG6oFrATq6020zVW";
 
-    const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+    const FRONTEND_URL = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
 
-    // 2) Récupérer l’item id de la subscription Stripe (obligatoire pour update_confirm)
+    // 1) récupérer subscription + item courant
     const stripeSub = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
     const itemId = stripeSub?.items?.data?.[0]?.id;
-
     if (!itemId) {
       return res.status(400).json({ error: "Subscription Stripe invalide (item manquant)" });
     }
 
-    // 3) PRORATA ONLY : on calcule le montant dû via upcoming invoice, puis on fait payer via Checkout (mode payment)
-    const prorationDate = Math.floor(Date.now() / 1000);
+    // 2) demander à Stripe le "prorata dû maintenant" (quote)
+    // IMPORTANT: on simule l’update (nouveau price) sans la faire encore
+    const now = Math.floor(Date.now() / 1000);
 
-    // Stripe calcule le prorata "théorique" pour passer standard -> premium
-    const upcoming = await stripe.invoices.retrieveUpcoming({
-      customer: sub.stripe_customer_id,
-      subscription: sub.stripe_subscription_id,
-      subscription_items: [{ id: itemId, price: PREMIUM_PRICE_ID, quantity: 1 }],
-      subscription_proration_date: prorationDate,
+    const preview = await retrieveProrationPreview(stripe, {
+      customerId: sub.stripe_customer_id,
+      subscriptionId: sub.stripe_subscription_id,
+      subscriptionItemId: itemId,
+      newPriceId: PREMIUM_PRICE_ID,
     });
 
-    const amountDue = typeof upcoming.amount_due === "number" ? upcoming.amount_due : 0;
+    const amountDue = typeof preview?.amount_due === "number" ? preview.amount_due : 0;
+    const currency = (preview?.currency || "eur").toLowerCase();
 
-    // Si Stripe estime qu'il n'y a rien à payer, on évite Checkout et on fait l'upgrade direct sans prorata
+
+    // Si Stripe dit 0 (rare mais possible), pas besoin de paiement → on peut appliquer direct via webhook-like
+    // (je te conseille quand même de gérer ce cas)
     if (amountDue <= 0) {
-      await stripe.subscriptions.update(sub.stripe_subscription_id, {
-        items: [{ id: itemId, price: PREMIUM_PRICE_ID, quantity: 1 }],
-        proration_behavior: "none",
-      });
-
       return res.json({
-        url: `${FRONTEND_URL}/app/profile.html?upgrade=success&skippedPayment=1`,
+        url: `${FRONTEND_URL}/app/profile.html?upgrade=free`,
       });
     }
 
-    // ✅ Checkout payment = l’utilisateur ne voit QUE le montant dû aujourd’hui
+    let receiptEmail = null;
+    try {
+      const customer = await stripe.customers.retrieve(sub.stripe_customer_id);
+      if (customer && !customer.deleted) {
+        receiptEmail = customer.email || null;
+      }
+    } catch (e) {
+      console.warn("⚠️ Unable to retrieve customer email for Stripe receipt:", e);
+    }
+
+
+    // 3) Checkout Session (payment) = l’utilisateur paye UNIQUEMENT le prorata
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer: sub.stripe_customer_id,
-      line_items: [{
-        price_data: {
-          currency: upcoming.currency || "eur",
-          product_data: { name: "INTEGORA — Upgrade Standard → Premium (prorata)" },
-          unit_amount: amountDue,
+      payment_intent_data: receiptEmail ? { receipt_email: receiptEmail } : undefined,
+      line_items: [
+        {
+          price_data: {
+            currency,
+            product_data: { name: "INTEGORA — Upgrade vers Premium (prorata)" },
+            unit_amount: amountDue,
+          },
+          quantity: 1,
         },
-        quantity: 1,
-      }],
+      ],
       success_url: `${FRONTEND_URL}/app/profile.html?upgrade=success`,
       cancel_url: `${FRONTEND_URL}/app/profile.html?upgrade=cancel`,
-
       metadata: {
-        action: "upgrade_prorata_only",
+        action: "upgrade_proration",
         user_id: userId,
-        stripe_subscription_id: sub.stripe_subscription_id,
+        subscription_id: sub.stripe_subscription_id,
         subscription_item_id: itemId,
         new_price_id: PREMIUM_PRICE_ID,
-        proration_date: String(prorationDate),
-        amount_due: String(amountDue),
-        currency: (upcoming.currency || "eur"),
       },
     });
 
-    return res.json({ url: session.url }); // ✅ même format frontend qu'avant
-
-
+    return res.json({ url: session.url });
   } catch (err) {
-    console.error("❌ change-plan portal error:", err?.raw?.message || err);
+    console.error("❌ change-plan checkout error:", err?.raw?.message || err);
     return res.status(500).json({ error: "Erreur upgrade" });
   }
 });
@@ -1866,9 +1900,24 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
     }
 
+    let receiptEmail = null;
+    try {
+      const customer = await stripe.customers.retrieve(sub.stripe_customer_id);
+      if (customer && !customer.deleted) {
+        receiptEmail = customer.email || null;
+      }
+    } catch (e) {
+      console.warn("⚠️ Unable to retrieve customer email for Stripe receipt:", e);
+    }
+
+
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer: sub.stripe_customer_id,
+
+      // ✅ AJOUT EXACT ICI : pour recevoir le reçu Stripe par email
+      payment_intent_data: receiptEmail ? { receipt_email: receiptEmail } : undefined,
+
       line_items: [{
         price_data: {
           currency: "eur",
@@ -1885,6 +1934,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
         plan: plan
       }
     });
+
 
     return res.json({ url: session.url });
 

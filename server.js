@@ -3058,6 +3058,37 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       return res.status(400).json({ error: "desired_plan invalide" });
     }
 
+    // ✅ CGUV obligatoires (preuve juridique côté serveur)
+    const termsAccepted = req.body?.termsAccepted === true;
+    const termsVersionRaw = String(req.body?.termsVersion || "").trim();
+
+    // 1) L'utilisateur doit accepter
+    if (!termsAccepted) {
+      return res.status(400).json({ error: "TERMS_REQUIRED" });
+    }
+
+    // 2) termsVersion doit exister (pas de fallback)
+    if (!termsVersionRaw) {
+      return res.status(400).json({ error: "terms_version manquante" });
+    }
+
+    // 3) Whitelist stricte : on accepte uniquement une date YYYY-MM-DD
+    //    (dans ton cas: "2025-11-12")
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(termsVersionRaw)) {
+      return res.status(400).json({ error: "terms_version invalide" });
+    }
+
+    // 4) Bonus sécurité : optionnel, tu verrouilles sur la version actuellement en prod
+    const CURRENT_TERMS_VERSION = "2025-11-12";
+    if (termsVersionRaw !== CURRENT_TERMS_VERSION) {
+      return res.status(400).json({ error: "terms_version non supportée" });
+    }
+
+    const termsVersion = termsVersionRaw; // valeur validée
+
+
+
+
     const first_name = cleanPersonName(req.body?.first_name, { max: 50 });
     const last_name = cleanPersonName(req.body?.last_name, { max: 50 });
     const company_name = cleanTextStrict(req.body?.company_name, { max: 120, allowEmpty: false });
@@ -3716,6 +3747,32 @@ app.post("/api/start-trial-invite", async (req, res) => {
     if (alreadyExists) {
       return res.status(409).json({ error: "ACCOUNT_EXISTS" });
     }
+
+    // ✅ CGUV obligatoires (preuve juridique côté serveur)
+    const termsAccepted = req.body?.termsAccepted === true;
+    const termsVersionRaw = String(req.body?.termsVersion || "").trim();
+
+    if (!termsAccepted) {
+      return res.status(400).json({ error: "TERMS_REQUIRED" });
+    }
+
+    if (!termsVersionRaw) {
+      return res.status(400).json({ error: "terms_version manquante" });
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(termsVersionRaw)) {
+      return res.status(400).json({ error: "terms_version invalide" });
+    }
+
+    // ✅ même verrouillage que la route payante
+    const CURRENT_TERMS_VERSION = "2025-11-12";
+    if (termsVersionRaw !== CURRENT_TERMS_VERSION) {
+      return res.status(400).json({ error: "terms_version non supportée" });
+    }
+
+    const termsVersion = termsVersionRaw;
+
+
 
     const first_name = cleanPersonName(req.body?.first_name, { max: 50 });
     const last_name = cleanPersonName(req.body?.last_name, { max: 50 });

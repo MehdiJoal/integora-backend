@@ -1711,21 +1711,61 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Subscription Stripe invalide (item manquant)" });
     }
 
+    // 3) PRORATA ONLY : on calcule le montant dû via upcoming invoice, puis on fait payer via Checkout (mode payment)
+    const prorationDate = Math.floor(Date.now() / 1000);
 
-    // 3) Billing Portal : Stripe calcule prorata + affiche + paiement manuel
-    const portalSession = await stripe.billingPortal.sessions.create({
+    // Stripe calcule le prorata "théorique" pour passer standard -> premium
+    const upcoming = await stripe.invoices.retrieveUpcoming({
       customer: sub.stripe_customer_id,
-      return_url: `${FRONTEND_URL}/app/profile.html?upgrade=return`,
-      flow_data: {
-        type: "subscription_update_confirm",
-        subscription_update_confirm: {
-          subscription: sub.stripe_subscription_id,
-          items: [{ id: itemId, price: PREMIUM_PRICE_ID, quantity: 1 }],
+      subscription: sub.stripe_subscription_id,
+      subscription_items: [{ id: itemId, price: PREMIUM_PRICE_ID, quantity: 1 }],
+      subscription_proration_date: prorationDate,
+    });
+
+    const amountDue = typeof upcoming.amount_due === "number" ? upcoming.amount_due : 0;
+
+    // Si Stripe estime qu'il n'y a rien à payer, on évite Checkout et on fait l'upgrade direct sans prorata
+    if (amountDue <= 0) {
+      await stripe.subscriptions.update(sub.stripe_subscription_id, {
+        items: [{ id: itemId, price: PREMIUM_PRICE_ID, quantity: 1 }],
+        proration_behavior: "none",
+      });
+
+      return res.json({
+        url: `${FRONTEND_URL}/app/profile.html?upgrade=success&skippedPayment=1`,
+      });
+    }
+
+    // ✅ Checkout payment = l’utilisateur ne voit QUE le montant dû aujourd’hui
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer: sub.stripe_customer_id,
+      line_items: [{
+        price_data: {
+          currency: upcoming.currency || "eur",
+          product_data: { name: "INTEGORA — Upgrade Standard → Premium (prorata)" },
+          unit_amount: amountDue,
         },
+        quantity: 1,
+      }],
+      success_url: `${FRONTEND_URL}/app/profile.html?upgrade=success`,
+      cancel_url: `${FRONTEND_URL}/app/profile.html?upgrade=cancel`,
+
+      metadata: {
+        action: "upgrade_prorata_only",
+        user_id: userId,
+        stripe_subscription_id: sub.stripe_subscription_id,
+        subscription_item_id: itemId,
+        new_price_id: PREMIUM_PRICE_ID,
+        proration_date: String(prorationDate),
+        amount_due: String(amountDue),
+        currency: (upcoming.currency || "eur"),
       },
     });
 
-    return res.json({ url: portalSession.url }); // ✅ garde "url" pour ton frontend actuel
+    return res.json({ url: session.url }); // ✅ même format frontend qu'avant
+
+
   } catch (err) {
     console.error("❌ change-plan portal error:", err?.raw?.message || err);
     return res.status(500).json({ error: "Erreur upgrade" });

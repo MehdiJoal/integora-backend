@@ -3522,6 +3522,18 @@ app.post("/api/finalize-pending", async (req, res) => {
       return res.status(403).json({ error: "Email mismatch" });
     }
 
+    // Créer upsert pour CGUV : on récupère la preuve depuis pending_signups
+    const termsAcceptedAt = pending.terms_accepted_at;
+    const termsVersion = pending.terms_version;
+
+    // 🔒 Sécurité ultime (normalement impossible si start-trial est clean)
+    if (!termsAcceptedAt || !termsVersion) {
+      return res.status(400).json({
+        error: "CGUV non acceptées dans pending_signups",
+      });
+    }
+
+
 
     // 3b) ✅ Créer/Upsert company + profile (service_role) avant subscription
 
@@ -3598,6 +3610,8 @@ app.post("/api/finalize-pending", async (req, res) => {
           first_name: pending.first_name || null,
           last_name: pending.last_name || null,
           company_id: companyId,
+          terms_accepted_at: termsAcceptedAt,
+          terms_version: termsVersion,
           updated_at: new Date().toISOString(),
         },
         { onConflict: "user_id" }

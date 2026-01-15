@@ -3183,6 +3183,8 @@ app.post("/api/start-paid-checkout", async (req, res) => {
           billing_postal_code,
           billing_city,
           billing_country,
+          terms_accepted_at: new Date().toISOString(),
+          terms_version: termsVersion,
 
           updated_at: new Date().toISOString()
         })
@@ -3210,6 +3212,8 @@ app.post("/api/start-paid-checkout", async (req, res) => {
           billing_city,
           billing_country,
           status: "pending",
+          terms_accepted_at: new Date().toISOString(),
+          terms_version: termsVersion,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         }])
@@ -3301,6 +3305,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       .update({
         stripe_session_id: session.id,
         stripe_customer_id: stripeCustomer.id, // ✅ IMPORTANT
+        terms_version: termsVersion,
         updated_at: new Date().toISOString()
       })
       .eq("id", pending_id);
@@ -3818,6 +3823,8 @@ app.post("/api/start-trial-invite", async (req, res) => {
           company_size: company_size ?? existingPending.company_size,
           desired_plan: "trial",
           status: "pending",
+          terms_accepted_at: new Date().toISOString(),
+          terms_version: termsVersion,
           updated_at: new Date().toISOString()
         })
         .eq("id", pending_id);
@@ -3839,6 +3846,8 @@ app.post("/api/start-trial-invite", async (req, res) => {
           company_size,
           desired_plan: "trial",
           status: "pending",
+          terms_accepted_at: new Date().toISOString(),
+          terms_version: termsVersion,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         }])

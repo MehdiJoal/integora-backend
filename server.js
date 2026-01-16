@@ -351,23 +351,63 @@ const supportLimiter = rateLimit({
 
 
 
-
-
-
-
 const globalLimiter = rateLimit({
-  skip: (req) => req.method === "OPTIONS",
-
-  windowMs: 1 * 60 * 1000, // 1 minute seulement
-  max: 300, // 300 requêtes par minute par IP
-
-  message: {
-    error: 'Trop de requêtes. Réessayez dans une minute.',
-    code: 'RATE_LIMIT_EXCEEDED'
-  },
+  windowMs: 60 * 1000,
+  max: 300,
   standardHeaders: true,
-  legacyHeaders: false
+  legacyHeaders: false,
+
+  // ✅ IMPORTANT: ne pas limiter les pages d'erreur + les assets statiques
+  skip: (req) => {
+    if (req.method === "OPTIONS") return true;
+
+    // Ne JAMAIS limiter les pages d'erreur (sinon boucle infinie sur /429.html)
+    const errorPages = new Set([
+      "/401.html",
+      "/403.html",
+      "/404.html",
+      "/429.html",
+      "/500.html",
+      "/subscription-expired.html",
+    ]);
+    if (errorPages.has(req.path)) return true;
+
+    // Ne pas limiter les assets statiques (sinon tu atteins vite la limite juste en chargeant une page)
+    if (
+      req.path.startsWith("/app/css") ||
+      req.path.startsWith("/app/js") ||
+      req.path.startsWith("/app/images") ||
+      req.path.startsWith("/app/assets") ||
+      req.path.startsWith("/app/fonts") ||
+      req.path.startsWith("/app/videos")
+    ) {
+      return true;
+    }
+
+    return false;
+  },
+
+  handler: (req, res) => {
+    const accept = req.headers.accept || "";
+    const wantsHtml = accept.includes("text/html");
+
+    // Optionnel : utile pour afficher un compte à rebours propre côté client
+    res.setHeader("Retry-After", "30");
+
+    res.status(429);
+
+    if (wantsHtml) {
+      return res.sendFile(path.join(FRONTEND_DIR, "429.html"));
+    }
+
+    return res.json({
+      error: "Trop de requêtes. Réessayez dans une minute.",
+      code: "RATE_LIMIT_EXCEEDED",
+    });
+  },
 });
+
+
 
 // 🔥 PROTECTION CONTRE LES ATTACKS CONNUES
 app.use(cookieParser());
@@ -1211,21 +1251,25 @@ function handleUnauthorized(req, res) {
   });
 }
 
+
 function handleAuthenticationError(req, res, error) {
-  res.clearCookie('auth_token');
+  res.clearCookie("auth_token");
 
-  const wantsHtml = req.headers.accept && req.headers.accept.includes('text/html');
-  const isAppRoute = req.path.startsWith('/app/');
+  const accept = req.headers.accept || "";
+  const wantsHtml = accept.includes("text/html");
 
-  if (wantsHtml && isAppRoute) {
-    return res.redirect('/login.html?next=' + encodeURIComponent(req.originalUrl));
+  if (wantsHtml) {
+    // Affiche une belle page 401 (avec next)
+    return res.redirect("/401.html?next=" + encodeURIComponent(req.originalUrl));
   }
 
-  return res.status(403).json({
-    error: "Token invalide ou expiré",
-    code: "INVALID_TOKEN"
+  // API/fetch
+  return res.status(401).json({
+    error: "Session expirée, reconnectez-vous.",
+    code: "SESSION_EXPIRED",
   });
 }
+
 
 
 

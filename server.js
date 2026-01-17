@@ -448,21 +448,150 @@ app.use("/app/assets", express.static(path.join(APP_DIR, "assets")));
 app.use("/app/fonts", express.static(path.join(APP_DIR, "fonts")));
 app.use("/app/videos", express.static(path.join(APP_DIR, "videos")));
 
-// ✅ Gate /app : protège UNIQUEMENT les pages HTML
+// ==================== PAGE-LEVEL ACCESS (SERVER) ====================
+
+// Rank des plans (simple et robuste)
+const __planRank = { trial: 0, standard: 1, premium: 2 };
+
+// Pages qui demandent un plan minimal (clé = nom du fichier sans .html)
+const PAGE_MIN_PLAN = {
+  // PREMIUM
+
+  //connaissance_des_collegues_irl
+  "le_pantheon_des_talents": "premium",
+
+
+  //creativite_irl
+  "le_labo_bizarre": "premium",
+
+  //manager autrement
+  "carte_rh_express": "premium",
+  "30_defis_pour_mieux_manager": "premium",
+
+  //bien_etre_irl
+  "instant_zen": "premium",
+  "quiz_bien_etre": "premium",
+
+  //competition_amicale
+  "challenge_des_tribus": "premium",
+
+
+
+
+
+  // STANDARD 
+
+  //connaissance_des_collegues_irl
+  "qui_est_qui": "standard",
+  "si_j_etais": "standard",
+  "c_est_moi_ou_pas": "standard",
+
+
+  //creativite_irl
+  "conference_absurde": "standard",
+  "histoire_impossible": "standard",
+  "a_vous_de_continuer": "standard",
+  "7_secondes_chrono": "standard",
+
+
+  //manager autrement
+  "un_mot_pour_avancer": "standard",
+  "la_boussole_en_main": "standard",
+  "ce_qu_on_ne_dit_pas_assez": "standard",
+
+
+  //bien_etre_irl
+  "chasse_au_bonheur": "standard",
+
+
+  //collaboration_irl
+  "le_relai_des_mimes": "standard",
+  "switch": "standard",
+
+
+  // RECRUTEMENT 
+  "fiche_de_poste": "standard",
+  "rediger_offre_recrutement": "standard",
+  "guide_recrutement": "standard",
+  "recrutement_collectif": "standard",
+  "communication_candidat": "standard",
+
+
+  // INTEGRAION 
+  "livret_accueil": "standard",
+  "processus_integration": "standard",
+  "parrain_marraine": "standard",
+  "tableau_pilotage_des_formations": "standard",
+  "intineraire_de_professionnalisation": "standard",
+
+
+
+
+};
+
+
+// Convertit un chemin /app/.../*.html en "nom de page" (sans dossier, sans .html, sans query/hash)
+// Exemple: "/manager_autrement/carte_rh_express.html?x=1#top" -> "carte_rh_express"
+function getPageNameFromAppPath(appPath) {
+  const clean = (appPath || "").split("?")[0].split("#")[0];
+  const parts = clean.split("/").filter(Boolean);
+  const last = parts[parts.length - 1] || "";
+  return last.replace(/\.html$/i, "");
+}
+
+function canAccessPageServer(user, pageName) {
+  const required = PAGE_MIN_PLAN[pageName];
+  if (!required) return true; // page non listée => autorisée
+
+  const userPlan = user?.subscription_type || "trial";
+  const userRank = __planRank[userPlan] ?? 0;
+  const reqRank = __planRank[required] ?? 999;
+
+  return userRank >= reqRank;
+}
+
+
+function hasAnyAuthToken(req) {
+  const authHeader = String(req.headers.authorization || "");
+  if (authHeader.toLowerCase().startsWith("bearer ")) return true;
+
+  const cookie = String(req.headers.cookie || "");
+  // Mets ici les noms de cookies que TON backend utilise réellement :
+  // (tu peux en laisser plusieurs, ça ne casse rien)
+  return (
+    cookie.includes("token=") ||
+    cookie.includes("access_token=") ||
+    cookie.includes("sb-access-token=") ||
+    cookie.includes("sb:token=")
+  );
+}
+
+
+
+// ✅ Gate /app : protège UNIQUEMENT les pages HTML + contrôle plan (server-side)
 app.use("/app", (req, res, next) => {
   const isAsset = /\.[a-z0-9]+$/i.test(req.path) && !req.path.endsWith(".html");
   if (isAsset) return next(); // les assets passent
 
   return authenticateToken(req, res, () => {
+    // 1) Abonnement actif requis pour tout /app (comme avant)
     if (!req.user?.has_active_subscription) {
-      console.log("🚨 /app bloqué : abonnement expiré pour", req.user?.email);
-      return res
-        .status(403)
-        .sendFile(path.join(FRONTEND_DIR, "subscription-expired.html"));
+      return res.status(403).sendFile(path.join(FRONTEND_DIR, "subscription-expired.html"));
     }
+
+    // 2) Contrôle plan par page
+    const pageName = getPageNameFromAppPath(req.path);
+
+    if (!canAccessPageServer(req.user, pageName)) {
+      // ✅ Objectif: ne JAMAIS afficher la page premium, même si l'URL est tapée
+      // On redirige vers 403.html (ton fichier est dans /frontend/403.html)
+      return res.redirect(302, "/403.html");
+    }
+
     return next();
   });
 });
+
 
 // ✅ Pages /app (sert les .html après gate)
 app.get("/app/*", (req, res) => {
@@ -736,78 +865,192 @@ app.get("/config.js", (req, res) => {
 
 
 
-// 🎯 PAGES AUTORISÉES AVEC MAPPAGE OPAQUE
-const pageMappings = {
-  // Pages publiques/membres unifiées
-  'home': { file: 'index', public: true, auth: false },
-  'products': { file: 'produit', public: true, auth: false },
-  'pricing': { file: 'tarif', public: true, auth: false },
-  'choice': { file: 'choix_irl_digital', public: true, auth: false },
+// ==================== ROUTES PROPRES (SLUG -> FICHIER) ====================
+// - public:true  => fichier dans /frontend (pas besoin de compte)
+// - public:false => fichier dans /frontend/app (compte + abonnement requis)
 
-  // Pages membres uniquement - NOMS OPAQUES
-  'dashboard': { file: 'index', public: false, auth: true, plans: ['trial', 'standard', 'premium'] },
-  'profile': { file: 'profile', public: false, auth: true, plans: ['trial', 'standard', 'premium'] },
-  'support': { file: 'supports', public: false, auth: true, plans: ['standard', 'premium'] },
-  'automation': { file: 'automation_basic', public: false, auth: true, plans: ['standard', 'premium'] },
-  'analytics': { file: 'analytics', public: false, auth: true, plans: ['premium'] },
-  'admin': { file: 'admin', public: false, auth: true, plans: ['premium'] }
+const ROUTES_PROPRES = {
+  // ==================== PUBLIC (frontend/) ====================
+  "accueil": { fichier: "index", public: true },
+  "produit": { fichier: "produit", public: true },
+  "tarifs": { fichier: "tarif", public: true },
+  "contact": { fichier: "contact", public: true },
+  "faq": { fichier: "faq", public: true },
+  "mentions-legales": { fichier: "mentions_legales", public: true },
+  "politique-de-confidentialite": { fichier: "politique_de_confidentialite", public: true },
+  "valeurs": { fichier: "valeur_adn", public: true },
+  "statut": { fichier: "status", public: true },
+  "bienvenue": { fichier: "welcome", public: true },
+
+  // Auth publiques
+  "connexion": { fichier: "login", public: true },
+  "inscription": { fichier: "inscription", public: true },
+  "mot-de-passe-oublie": { fichier: "forgot-password", public: true },
+  "reinitialiser-mdp": { fichier: "reset-password", public: true },
+  "creer-mot-de-passe": { fichier: "create-password", public: true },
+
+  // Pages système utiles en public (OK)
+  "email-envoye": { fichier: "email-sent", public: true },
+  "email-envoye-paiement": { fichier: "email-sent-paiement", public: true },
+  "paiement-redirect": { fichier: "paiement-redirect", public: true },
+  "abonnement-expire": { fichier: "subscription-expired", public: true },
+
+  // ⚠️ On NE mappe PAS les pages d'erreur (elles restent accessibles via /403.html etc.)
+  // 401.html / 403.html / 404.html / 429.html / 500.html
+
+
+  // ==================== PRIVE (frontend/app/) ====================
+  // ⭐ Alias marketing (recommandés)
+  "espace": { fichier: "choix_irl_digital", public: false },     // ton "accueil app"
+  "jeu-irl": { fichier: "jeu_irl", public: false },
+  "profil": { fichier: "profile", public: false },
+  "support": { fichier: "support", public: false },
+
+  // --- Hubs / catégories
+  "bien-etre": { fichier: "bien_etre_irl/bien_etre_irl", public: false },
+  "collaboration": { fichier: "collaboration_irl/collaboration_irl", public: false },
+  "competition-amicale": { fichier: "competition_amicale/competition_amicale", public: false },
+  "connaissance-collegues": { fichier: "connaissance_des_collegues_irl/connaissance_des_collegues_irl", public: false },
+  "creativite": { fichier: "creativite_irl/creativite_irl", public: false },
+  "integration": { fichier: "integration/page_integration", public: false },
+  "recrutement": { fichier: "recrutement/page_recrutement", public: false },
+  "manager": { fichier: "manager_autrement/manager_autrement", public: false },
+
+  // --- Bien-être IRL (pages)
+  "chasse-au-bonheur": { fichier: "bien_etre_irl/chasse_au_bonheur", public: false },
+  "instant-zen": { fichier: "bien_etre_irl/instant_zen", public: false },
+  "quiz-bien-etre": { fichier: "bien_etre_irl/quiz_bien_etre", public: false },
+
+  // --- Collaboration IRL
+  "le-relai-des-mimes": { fichier: "collaboration_irl/le_relai_des_mimes", public: false },
+  "switch": { fichier: "collaboration_irl/switch", public: false },
+
+  // --- Compétition amicale
+  "challenge-des-tribus": { fichier: "competition_amicale/challenge_des_tribus", public: false },
+
+  // --- Connaissance collègues IRL
+  "c-est-moi-ou-pas": { fichier: "connaissance_des_collegues_irl/c_est_moi_ou_pas", public: false },
+  "ile-deserte-corporate": { fichier: "connaissance_des_collegues_irl/ile_deserte_corporate", public: false },
+  "le-pantheon-des-talents": { fichier: "connaissance_des_collegues_irl/le_pantheon_des_talents", public: false },
+  "photo-de-voyage": { fichier: "connaissance_des_collegues_irl/photo_de_voyage", public: false },
+  "qui-est-qui": { fichier: "connaissance_des_collegues_irl/qui_est_qui", public: false },
+  "si-j-etais": { fichier: "connaissance_des_collegues_irl/si_j_etais", public: false },
+
+  // --- Créativité IRL
+  "7-secondes-chrono": { fichier: "creativite_irl/7_secondes_chrono", public: false },
+  "a-vous-de-continuer": { fichier: "creativite_irl/a_vous_de_continuer", public: false },
+  "conference-absurde": { fichier: "creativite_irl/conference_absurde", public: false },
+  "histoire-impossible": { fichier: "creativite_irl/histoire_impossible", public: false },
+  "invento": { fichier: "creativite_irl/invento", public: false },
+  "le-labo-bizarre": { fichier: "creativite_irl/le_labo_bizarre", public: false },
+
+  // --- Intégration
+  "livret-accueil": { fichier: "integration/livret_accueil", public: false },
+  "processus-integration": { fichier: "integration/processus_integration", public: false },
+  "parrain-marraine": { fichier: "integration/parrain_marraine", public: false },
+  "tableau-pilotage-formations": { fichier: "integration/tableau_pilotage_des_formations", public: false },
+  "itineraire-professionnalisation": { fichier: "integration/intineraire_de_professionnalisation", public: false },
+  "rapport-etonnement": { fichier: "integration/rapport_etonnement", public: false },
+
+  // --- Manager autrement
+  "30-defis-manager": { fichier: "manager_autrement/30_defis_pour_mieux_manager", public: false },
+  "cartes-rh-express": { fichier: "manager_autrement/carte_rh_express", public: false },
+  "ce-qu-on-ne-dit-pas-assez": { fichier: "manager_autrement/ce_qu_on_ne_dit_pas_assez", public: false },
+  "la-boussole-en-main": { fichier: "manager_autrement/la_boussole_en_main", public: false },
+  "thermometre-semaine": { fichier: "manager_autrement/le_thermometre_de_la_semaine", public: false },
+  "un-mot-pour-avancer": { fichier: "manager_autrement/un_mot_pour_avancer", public: false },
+
+  // --- Recrutement
+  "fiche-de-poste": { fichier: "recrutement/fiche_de_poste", public: false },
+  "rediger-offre-recrutement": { fichier: "recrutement/rediger_offre_recrutement", public: false },
+  "guide-recrutement": { fichier: "recrutement/guide_recrutement", public: false },
+  "recrutement-collectif": { fichier: "recrutement/recrutement_collectif", public: false },
+  "communication-candidat": { fichier: "recrutement/communication_candidat", public: false },
+  "grille-entretien": { fichier: "recrutement/grille_entretien", public: false },
+
+  // ==================== ALIAS "compat" (optionnel) ====================
+  // Tu peux les garder le temps de mettre à jour tes liens
+  "choix-irl-digital": { fichier: "choix_irl_digital", public: false },
+  "profile": { fichier: "profile", public: false },
 };
 
-// 🌐 ROUTE UNIVERSELLE - ARCHITECTURE INVISIBLE
-app.get("/:page", authenticateToken, async (req, res) => {
-  try {
-    const pageKey = req.params.page.replace('.html', '');
-    const pageConfig = pageMappings[pageKey];
 
-    // 🚨 PAGE INCONNUE = 404 IDENTIQUE
-    if (!pageConfig) {
-      console.log(`🚨 Tentative accès page inconnue: ${pageKey}`);
+
+
+// ==================== ROUTE UNIVERSELLE (SLUG) ====================
+// Sert soit /frontend/<fichier>.html (public)
+// soit /frontend/app/<fichier>.html (privé)
+// Sécurité privés : login requis + abonnement actif + PAGE_MIN_PLAN (plan par page)
+
+app.get("/:page", async (req, res) => {
+  try {
+    console.log("ROUTE_SLUG_OK =>", req.path);
+
+    const slug = String(req.params.page || "").replace(".html", "").toLowerCase();
+    const config = ROUTES_PROPRES[slug];
+    const RESERVED = new Set(["api", "app", "stripe", "health"]);
+    if (RESERVED.has(slug)) return res.status(404).sendFile(path.join(__dirname, "../frontend/404.html"));
+
+
+    // 1) slug inconnu => 404
+    if (!config) {
+      console.log(`🚨 Page inconnue: ${slug}`);
       return res.status(404).sendFile(path.join(__dirname, "../frontend/404.html"));
     }
 
-    const { file, public: isPublic, auth: requiresAuth, plans } = pageConfig;
+    const { fichier, public: estPublique } = config;
 
-    // ✅ PAGE PUBLIQUE - ACCÈS DIRECT
-    if (isPublic) {
-      const filePath = path.join(__dirname, `../frontend/${file}.html`);
+    // 2) Pages publiques => accès direct frontend/
+    if (estPublique) {
+      const filePath = path.join(__dirname, `../frontend/${fichier}.html`);
       return fs.existsSync(filePath)
         ? res.sendFile(filePath)
         : res.status(404).sendFile(path.join(__dirname, "../frontend/404.html"));
     }
 
-    // 🚨 PAGE PROTÉGÉE SANS AUTH
-    if (requiresAuth && !req.user) {
-      console.log(`🚨 Tentative accès non authentifié: ${pageKey}`);
-      return res.redirect(`/login?next=/${pageKey}`);
+    // 3) Pages privées => auth requise
+    // Si pas de token du tout => redirection UX vers login (au lieu d'un 401 JSON)
+    if (!hasAnyAuthToken(req)) {
+      console.log(`🚨 Accès non authentifié (aucun token): ${slug}`);
+      return res.redirect(`/login?next=/${slug}`);
     }
 
-    // 🚨 VERIFICATION ABONNEMENT
-    if (plans && !plans.includes(req.user.subscription_type)) {
-      console.log(`🚨 Plan insuffisant: ${pageKey} pour ${req.user.email}`);
-      return res.status(403).sendFile(path.join(__dirname, "../frontend/403.html"));
-    }
+    return authenticateToken(req, res, () => {
+      if (!req.user) {
+        console.log(`🚨 Accès non authentifié (token invalide/expiré): ${slug}`);
+        return res.redirect(`/login?next=/${slug}`);
+      }
 
-    // 🚨 ABONNEMENT INACTIF (sauf trial)
-    if (req.user.subscription_type !== 'trial' && !req.user.has_active_subscription) {
-      console.log(`🚨 Abonnement inactif: ${pageKey} pour ${req.user.email}`);
-      return res.status(403).sendFile(path.join(__dirname, "../frontend/subscription-expired.html"));
-    }
+      // 4) Abonnement actif requis
+      if (!req.user.has_active_subscription) {
+        console.log(`🚨 Abonnement inactif: ${slug} pour ${req.user.email}`);
+        return res.status(403).sendFile(path.join(__dirname, "../frontend/subscription-expired.html"));
+      }
 
-    // ✅ ACCÈS AUTORISÉ
-    const filePath = path.join(__dirname, `../frontend/app/${file}.html`);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).sendFile(path.join(__dirname, "../frontend/404.html"));
-    }
+      // 5) Contrôle plan (PAGE_MIN_PLAN)
+      const pageName = String(fichier).split("/").pop();
+      if (!canAccessPageServer(req.user, pageName)) {
+        console.log(`🚨 Plan insuffisant (PAGE_MIN_PLAN): ${slug} pour ${req.user.email}`);
+        return res.redirect(302, "/403.html");
+      }
 
-    console.log(`✅ Accès autorisé: ${pageKey} pour ${req.user.email}`);
-    res.sendFile(filePath);
+      // 6) Serve page privée
+      const filePathPriv = path.join(__dirname, `../frontend/app/${fichier}.html`);
+      if (!fs.existsSync(filePathPriv)) {
+        console.log(`🚨 Fichier introuvable: ${filePathPriv}`);
+        return res.status(404).sendFile(path.join(__dirname, "../frontend/404.html"));
+      }
+
+      console.log(`✅ Accès autorisé: ${slug} (${fichier}) pour ${req.user.email}`);
+      return res.sendFile(filePathPriv);
+    });
+
 
   } catch (error) {
-    console.error('💥 Erreur route universelle:', error);
-    res.status(500).sendFile(path.join(__dirname, "../frontend/500.html"));
+    console.error("💥 Erreur route universelle:", error);
+    return res.status(500).sendFile(path.join(__dirname, "../frontend/500.html"));
   }
 });
-
 
 
 
@@ -1157,6 +1400,33 @@ async function applyPendingPrepaymentIfNeeded(userId) {
 
 
 
+// ✅ OPTIM PERF: throttle du RPC + cache court verify-token
+const __prepayCooldown = global.__prepayCooldown || (global.__prepayCooldown = new Map());
+const __authCache = global.__authCache || (global.__authCache = new Map());
+
+function shouldRunPrepay(userId, ms = 60000) {
+  const now = Date.now();
+  const last = __prepayCooldown.get(userId) || 0;
+  if (now - last < ms) return false;
+  __prepayCooldown.set(userId, now);
+  return true;
+}
+
+function cacheGet(key) {
+  const hit = __authCache.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt < Date.now()) {
+    __authCache.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+
+function cacheSet(key, value, ttlMs = 4000) {
+  __authCache.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
+
 // Middleware d'authentification
 // server.js - NOUVELLE VERSION authenticateToken
 async function resolveUserFromCookie(req) {
@@ -1165,11 +1435,21 @@ async function resolveUserFromCookie(req) {
 
   // 1) JWT
   const decoded = jwt.verify(token, SECRET_KEY);
-  await applyPendingPrepaymentIfNeeded(decoded.id);
+
+  // ✅ RPC prépayment: non bloquant + throttle
+  if (shouldRunPrepay(decoded.id, 60000)) {
+    applyPendingPrepaymentIfNeeded(decoded.id).catch(() => { });
+  }
 
   // 2) Session DB
   const tokenHash = hashToken(token);
 
+  // ✅ Cache court (évite rafales)
+  const cacheKey = `${decoded.id}:${tokenHash}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  // ✅ IMPORTANT: on garde EXACTEMENT tes filtres stricts
   const { data: session, error: sessionError } = await supabaseAdmin
     .from("token_sessions")
     .select("user_id, expires_at, is_active, revoked_at")
@@ -1177,10 +1457,25 @@ async function resolveUserFromCookie(req) {
     .eq("user_id", decoded.id)
     .eq("is_active", true)
     .is("revoked_at", null)
-    .gt("expires_at", new Date().toISOString())
-    .single();
+    .maybeSingle(); // ✅ pas de throw si 0 ligne
 
-  if (sessionError || !session) throw new Error("INVALID_SESSION");
+  if (sessionError || !session) {
+    console.warn("❌ INVALID_SESSION", {
+      sessionError: sessionError?.message,
+      user_id: decoded.id,
+    });
+    throw new Error("INVALID_SESSION");
+  }
+
+  // ✅ expires_at : si null => on ne bloque pas ici
+  if (session.expires_at) {
+    const expiresMs = Date.parse(session.expires_at);
+    if (Number.isFinite(expiresMs) && expiresMs < Date.now()) {
+      console.warn("⏳ Session expirée (token_sessions)", { expires_at: session.expires_at });
+      throw new Error("INVALID_SESSION");
+    }
+  }
+
 
   // tracking (non bloquant)
   supabaseAdmin
@@ -1191,19 +1486,26 @@ async function resolveUserFromCookie(req) {
     .then(() => { })
     .catch(() => { });
 
-  // 3) Profil + abo
+  // 3) Profil + abo (parallèle)
   const [profileResult, subscriptionResult] = await Promise.all([
-    supabase
+    supabaseAdmin
       .from("profiles")
-      .select("first_name, last_name, company_id, avatar_url")
+      .select("user_id, first_name, last_name, company_id, avatar_url, terms_accepted_at, terms_version")
       .eq("user_id", decoded.id)
-      .single(),
+      .maybeSingle(),
     getActiveSubscription(decoded.id),
   ]);
 
-  if (profileResult.error || !profileResult.data) throw new Error("PROFILE_NOT_FOUND");
 
-  return {
+  if (profileResult.error || !profileResult.data) {
+    console.warn("❌ PROFILE_NOT_FOUND", {
+      error: profileResult.error?.message,
+      user_id: decoded.id,
+    });
+    throw new Error("PROFILE_NOT_FOUND");
+  }
+
+  const user = {
     id: decoded.id,
     email: decoded.email,
     first_name: profileResult.data.first_name,
@@ -1213,7 +1515,11 @@ async function resolveUserFromCookie(req) {
     subscription_type: subscriptionResult.plan,
     has_active_subscription: subscriptionResult.hasActiveSubscription,
   };
+
+  cacheSet(cacheKey, user, 15000);
+  return user;
 }
+
 
 async function authenticateToken(req, res, next) {
   try {

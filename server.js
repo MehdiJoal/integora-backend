@@ -440,13 +440,49 @@ app.use((req, res, next) => {
   return publicStatic(req, res, next);
 });
 
-// ✅ Assets /app/* (css/js/images/fonts/videos)
-app.use("/app/css", express.static(path.join(APP_DIR, "css")));
-app.use("/app/js", express.static(path.join(APP_DIR, "js")));
-app.use("/app/images", express.static(path.join(APP_DIR, "images")));
-app.use("/app/assets", express.static(path.join(APP_DIR, "assets")));
-app.use("/app/fonts", express.static(path.join(APP_DIR, "fonts")));
-app.use("/app/videos", express.static(path.join(APP_DIR, "videos")));
+// ✅ Assets /app/* (css/js/images/fonts/videos) — CACHE LONG uniquement pour le LOGO
+const ONE_YEAR_MS = 1000 * 60 * 60 * 24 * 365;
+
+// CSS/JS : cache modéré (tu peux les modifier)
+app.use("/app/css", express.static(path.join(APP_DIR, "css"), { maxAge: "7d", etag: true }));
+app.use("/app/js", express.static(path.join(APP_DIR, "js"), { maxAge: "7d", etag: true }));
+
+// Images "générales" (hors assets) : cache moyen
+app.use("/app/images", express.static(path.join(APP_DIR, "images"), { maxAge: "30d", etag: true }));
+
+// ✅ IMPORTANT : cache LONG uniquement pour le dossier logo
+// => /app/assets/logo/logo.webp sera "figé" et instant en navigation
+app.use(
+  "/app/assets/logo",
+  express.static(path.join(APP_DIR, "assets", "logo"), {
+    maxAge: ONE_YEAR_MS,
+    immutable: true,
+    etag: true,
+  }),
+);
+
+// ✅ Le reste de /app/assets (jeux, illustrations, etc.) : cache NORMAL
+// => si tu remplaces une image sans changer son nom, elle se mettra à jour bien plus vite
+app.use(
+  "/app/assets",
+  express.static(path.join(APP_DIR, "assets"), {
+    maxAge: "30d",
+    etag: true,
+  }),
+);
+
+// Fonts : cache long OK (elles changent rarement)
+app.use(
+  "/app/fonts",
+  express.static(path.join(APP_DIR, "fonts"), {
+    maxAge: ONE_YEAR_MS,
+    immutable: true,
+    etag: true,
+  }),
+);
+
+app.use("/app/videos", express.static(path.join(APP_DIR, "videos"), { maxAge: "30d", etag: true }));
+
 
 // ==================== PAGE-LEVEL ACCESS (SERVER) ====================
 

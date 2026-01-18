@@ -2163,19 +2163,44 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer: sub.stripe_customer_id,
+
+      // ✅ force l’UI Checkout en FR (et aide souvent les libellés)
+      locale: "fr",
+
+      // ✅ reçu Stripe (optionnel mais ok)
       payment_intent_data: receiptEmail ? { receipt_email: receiptEmail } : undefined,
+
+      // ✅ IMPORTANT : demande à Stripe de créer une FACTURE liée à ce paiement (pas de out_of_band)
+      invoice_creation: {
+        enabled: true,
+        invoice_data: {
+          // ✅ ce texte ressort sur la facture
+          description: "INTEGORA — Upgrade Standard → Premium (prorata)",
+          metadata: {
+            action: "upgrade_proration",
+            user_id: userId,
+            plan: "premium",
+            subscription_id: sub.stripe_subscription_id,
+          },
+        },
+      },
+
+
       line_items: [
         {
           price_data: {
             currency,
-            product_data: { name: "INTEGORA — Upgrade vers Premium (prorata)" },
+            product_data: { name: "INTEGORA — Upgrade Standard → Premium (prorata)" },
             unit_amount: amountDue,
           },
           quantity: 1,
         },
       ],
+
       success_url: `${FRONTEND_URL}/app/profile.html?upgrade=success`,
       cancel_url: `${FRONTEND_URL}/app/profile.html?upgrade=cancel`,
+
+      // ✅ garde ton metadata (ça sert pour checkout.session.completed)
       metadata: {
         action: "upgrade_proration",
         user_id: userId,
@@ -2184,6 +2209,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
         new_price_id: PREMIUM_PRICE_ID,
       },
     });
+
 
     return res.json({ url: session.url });
   } catch (err) {
@@ -2297,29 +2323,77 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     }
 
 
+
+
+
+    // 0) Bloquer si un prépaiement non consommé existe déjà
+    const { data: pending, error: pendingErr } = await supabase
+      .from("subscription_prepayments")
+      .select("id, checkout_session_id, applied_invoice_id, created_at")
+      .eq("user_id", userId)
+      .is("consumed_at", null)
+      .limit(1)
+      .maybeSingle();
+
+    if (pendingErr) {
+      console.error("prepay_next_year: lookup pending error", pendingErr);
+      return res.status(500).json({ error: "pending_lookup_failed" });
+    }
+
+    if (pending?.id) {
+      return res.status(409).json({
+        error: "prepay_already_exists",
+        message: "Vous avez déjà un prépaiement en attente. Il sera appliqué automatiquement au prochain renouvellement.",
+      });
+    }
+
+
     const session = await stripe.checkout.sessions.create({
+
       mode: "payment",
       customer: sub.stripe_customer_id,
 
-      // ✅ AJOUT EXACT ICI : pour recevoir le reçu Stripe par email
+      // ✅ UI Checkout en FR
+      locale: "fr",
+
+      // ✅ reçu Stripe
       payment_intent_data: receiptEmail ? { receipt_email: receiptEmail } : undefined,
 
-      line_items: [{
-        price_data: {
-          currency: "eur",
-          product_data: { name: `INTEGORA - Prépaiement année suivante (${plan})` },
-          unit_amount: AMOUNT_BY_PLAN[plan],
+      // ✅ IMPORTANT : Checkout crée une FACTURE Stripe liée au paiement
+      invoice_creation: {
+        enabled: true,
+        invoice_data: {
+          description: `INTEGORA — Pré-paiement année suivante (${plan})`,
+          metadata: {
+            action: "prepay_next_year",
+            user_id: userId,
+            plan: plan,
+          },
         },
-        quantity: 1
-      }],
+      },
+
+
+      line_items: [
+        {
+          price_data: {
+            currency: "eur",
+            product_data: { name: `INTEGORA — Pré-paiement année suivante (${plan})` },
+            unit_amount: AMOUNT_BY_PLAN[plan],
+          },
+          quantity: 1,
+        },
+      ],
+
       success_url: `${FRONTEND_URL}/app/profile.html?prepay=success`,
       cancel_url: `${FRONTEND_URL}/app/profile.html?prepay=cancel`,
+
       metadata: {
         action: "prepay_next_year",
         user_id: userId,
-        plan: plan
-      }
+        plan: plan,
+      },
     });
+
 
 
     return res.json({ url: session.url });
@@ -2941,11 +3015,17 @@ app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
     // company_size est NOT NULL dans ta table, donc on le garde si existant sinon requis
     const company_size_in = cleanTextStrict(body.company_size, { max: 30, allowEmpty: true });
 
-    // SIRET : strict 14 chiffres (ou vide)
-    const company_siret = cleanDigitsStrict(body.company_siret, { min: 14, max: 14, allowEmpty: true });
-    if (company_siret === "") {
-      return res.status(400).json({ ok: false, error: "SIRET invalide : 14 chiffres requis." });
+    // ✅ SIRET : OBLIGATOIRE — strict 14 chiffres (pas vide, pas null)
+    const company_siret = cleanDigitsStrict(body.company_siret, { min: 14, max: 14, allowEmpty: false });
+
+    // cleanDigitsStrict peut renvoyer null/"" selon ton implémentation → on fail-hard dans tous les cas
+    if (!company_siret || company_siret === "") {
+      return res.status(400).json({
+        ok: false,
+        error: "Veuillez indiquer un SIRET valide (14 chiffres) pour continuer.",
+      });
     }
+
 
     // Adresse : min 6 (cohérent avec ta contrainte SQL) / max 140
     const billing_street = cleanAddress(body.billing_street, { min: 6, max: 140, allowEmpty: true });

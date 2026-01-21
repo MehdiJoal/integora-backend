@@ -518,7 +518,7 @@ const CGUV_FILENAME = `cguv_integora_v${CURRENT_TERMS_VERSION}.pdf`;
 
 app.get("/legal/cguv", (req, res) => {
   // PDF stocké dans: frontend/app/assets/pages_publiques/
-  const filePath = path.join(APP_DIR, "assets", "pages_publiques", CGUV_FILENAME);
+  const filePath = path.join(APP_DIR, "..", "public", "legal", CGUV_FILENAME);
 
   if (!fs.existsSync(filePath)) {
     return res.status(404).send("CGUV introuvables");

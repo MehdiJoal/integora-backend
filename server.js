@@ -448,28 +448,56 @@ app.use("/app/css", express.static(path.join(APP_DIR, "css"), { maxAge: "7d", et
 app.use("/app/js", express.static(path.join(APP_DIR, "js"), { maxAge: "7d", etag: true }));
 
 // Images "générales" (hors assets) : cache moyen
-app.use("/app/images", express.static(path.join(APP_DIR, "images"), { maxAge: "30d", etag: true }));
+app.use(
+  "/app/images",
+  express.static(path.join(APP_DIR, "images"), {
+    etag: false,
+    lastModified: false,
+    maxAge: 0,
+    setHeaders(res) {
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.setHeader("Surrogate-Control", "no-store");
+    },
+  })
+);
 
 // ✅ IMPORTANT : cache LONG uniquement pour le dossier logo
 // => /app/assets/logo/logo.webp sera "figé" et instant en navigation
 app.use(
   "/app/assets/logo",
   express.static(path.join(APP_DIR, "assets", "logo"), {
-    maxAge: ONE_YEAR_MS,
-    immutable: true,
-    etag: true,
-  }),
+    etag: false,
+    lastModified: false,
+    maxAge: 0,
+    setHeaders(res) {
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.setHeader("Surrogate-Control", "no-store");
+    },
+  })
 );
+
 
 // ✅ Le reste de /app/assets (jeux, illustrations, etc.) : cache NORMAL
 // => si tu remplaces une image sans changer son nom, elle se mettra à jour bien plus vite
 app.use(
   "/app/assets",
   express.static(path.join(APP_DIR, "assets"), {
-    maxAge: "30d",
-    etag: true,
-  }),
+    etag: false,
+    lastModified: false,
+    maxAge: 0,
+    setHeaders(res) {
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.setHeader("Surrogate-Control", "no-store");
+    },
+  })
 );
+
 
 // Fonts : cache long OK (elles changent rarement)
 app.use(
@@ -482,6 +510,28 @@ app.use(
 );
 
 app.use("/app/videos", express.static(path.join(APP_DIR, "videos"), { maxAge: "30d", etag: true }));
+
+
+// ==================== CGUV (PDF) ====================
+const CURRENT_TERMS_VERSION = "2026-01-20"; // <-- mets TA date
+const CGUV_FILENAME = `cguv_integora_v${CURRENT_TERMS_VERSION}.pdf`;
+
+app.get("/legal/cguv", (req, res) => {
+  // PDF stocké dans: frontend/app/assets/pages_publiques/
+  const filePath = path.join(APP_DIR, "assets", "pages_publiques", CGUV_FILENAME);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).send("CGUV introuvables");
+  }
+
+  // Important: éviter le cache si tu remplaces un doc
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+
+  return res.sendFile(filePath);
+});
 
 
 // ==================== PAGE-LEVEL ACCESS (SERVER) ====================
@@ -3545,7 +3595,6 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     }
 
     // 4) Bonus sécurité : optionnel, tu verrouilles sur la version actuellement en prod
-    const CURRENT_TERMS_VERSION = "2025-11-12";
     if (termsVersionRaw !== CURRENT_TERMS_VERSION) {
       return res.status(400).json({ error: "terms_version non supportée" });
     }
@@ -4250,7 +4299,6 @@ app.post("/api/start-trial-invite", async (req, res) => {
     }
 
     // ✅ même verrouillage que la route payante
-    const CURRENT_TERMS_VERSION = "2025-11-12";
     if (termsVersionRaw !== CURRENT_TERMS_VERSION) {
       return res.status(400).json({ error: "terms_version non supportée" });
     }

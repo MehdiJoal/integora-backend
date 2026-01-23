@@ -12,6 +12,14 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
 }
 
 
+console.log("🔎 ENV CHECK", {
+  nodeEnv: process.env.NODE_ENV,
+  stripeMode: process.env.STRIPE_MODE,
+  isLiveKey: process.env.STRIPE_SECRET_KEY?.startsWith("sk_live_"),
+  priceStandard: process.env.STRIPE_PRICE_STANDARD,
+  pricePremium: process.env.STRIPE_PRICE_PREMIUM,
+  frontendUrl: process.env.FRONTEND_URL,
+});
 
 
 console.log("✅ Variables d'environnement chargées avec succès");
@@ -1305,6 +1313,7 @@ async function syncStripeCustomerBillingFromDb({ userId, stripeCustomerId, requi
   // 5) Update Stripe customer (facture)
   await stripe.customers.update(stripeCustomerId, {
     name: customerName,
+    preferred_locales: ["fr"],
     address: {
       line1: street || undefined,
       postal_code: postal || undefined,
@@ -2097,6 +2106,17 @@ async function retrieveProrationPreview(stripe, {
 }) {
   const now = Math.floor(Date.now() / 1000);
 
+  console.log("🔍 CHANGE PLAN LIVE CHECK", {
+    stripeMode: STRIPE_MODE,
+    user_id,
+    subscriptionId: sub.stripe_subscription_id,
+    customerId: sub.stripe_customer_id,
+    currentPrice: sub.stripe_price_id,
+    targetPrice: STRIPE_PRICE_PREMIUM,
+    isLiveKey: STRIPE_SECRET_KEY.startsWith("sk_live"),
+  });
+
+
   // ✅ Nouvelle API : Create Preview Invoice
   // subscription_details porte les infos de "simulation" d'update
   const preview = await stripe.invoices.createPreview({
@@ -2163,8 +2183,11 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
     }
 
-    const PREMIUM_PRICE_ID =
-      process.env.STRIPE_PRICE_PREMIUM || "price_1SIoZGPGbG6oFrATq6020zVW";
+    const PREMIUM_PRICE_ID = STRIPE_PRICE_PREMIUM;
+    if (!PREMIUM_PRICE_ID) {
+      return res.status(500).json({ error: "STRIPE_PRICE_PREMIUM manquant (mode " + STRIPE_MODE + ")" });
+    }
+
 
     const FRONTEND_URL = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
 
@@ -2263,6 +2286,18 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
 
     return res.json({ url: session.url });
   } catch (err) {
+
+    console.error("❌ change-plan checkout error (LIVE)", {
+      message: e?.message,
+      type: e?.type,
+      code: e?.code,
+      raw: e,
+    });
+
+    return res.status(500).json({
+      error: "stripe_error",
+      message: e?.message || "Unknown Stripe error",
+    });
     console.error("❌ change-plan checkout error:", err?.raw?.message || err);
     return res.status(500).json({ error: "Erreur upgrade" });
   }
@@ -2278,10 +2313,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
 // ==========================================
 
 // 💰 Montants en centimes par plan
-const AMOUNT_BY_PLAN = {
-  standard: 12000,
-  premium: 18000,
-};
+
 
 app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) => {
   try {
@@ -2310,17 +2342,19 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       return res.status(500).json({ error: "Erreur vérification prépaiement" });
     }
 
-    if (pendingPrepay && pendingPrepay.length > 0) {
-      return res.status(400).json({ error: "Pré-paiement déjà effectué pour l’année suivante." });
+    if (pendingPrepay?.length) {
+      return res.status(409).json({
+        error: "prepay_already_exists",
+        message: "Vous avez déjà un prépaiement en attente. Il sera appliqué automatiquement au prochain renouvellement.",
+      });
     }
 
     const requestedPlan = String(req.body?.plan ?? "").trim().toLowerCase();
-
     if (requestedPlan !== "standard" && requestedPlan !== "premium") {
-      return res.status(400).json({
-        error: "Plan invalide. Le body doit contenir plan=standard ou plan=premium.",
-      });
+      return res.status(400).json({ error: "Plan invalide. plan=standard ou plan=premium" });
     }
+
+
 
     const plan = requestedPlan;
 
@@ -2397,6 +2431,8 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       });
     }
 
+    const priceId = plan === "premium" ? STRIPE_PRICE_PREMIUM : STRIPE_PRICE_STANDARD;
+    if (!priceId) return res.status(500).json({ error: "Missing Stripe price for plan" });
 
     const session = await stripe.checkout.sessions.create({
 
@@ -2407,7 +2443,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       locale: "fr",
 
       // ✅ reçu Stripe
-      payment_intent_data: receiptEmail ? { receipt_email: receiptEmail } : undefined,
+      customer_email: receiptEmail ?? undefined,
 
       // ✅ IMPORTANT : Checkout crée une FACTURE Stripe liée au paiement
       invoice_creation: {
@@ -2423,16 +2459,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       },
 
 
-      line_items: [
-        {
-          price_data: {
-            currency: "eur",
-            product_data: { name: `INTEGORA — Pré-paiement année suivante (${plan})` },
-            unit_amount: AMOUNT_BY_PLAN[plan],
-          },
-          quantity: 1,
-        },
-      ],
+      line_items: [{ price: priceId, quantity: 1 }],
 
       success_url: `${FRONTEND_URL}/app/profile.html?prepay=success`,
       cancel_url: `${FRONTEND_URL}/app/profile.html?prepay=cancel`,
@@ -3571,6 +3598,7 @@ const STRIPE_PRICE_PREMIUM =
   STRIPE_MODE === "live"
     ? (process.env.STRIPE_PRICE_PREMIUM_LIVE || process.env.STRIPE_PRICE_PREMIUM)
     : (process.env.STRIPE_PRICE_PREMIUM_TEST || process.env.STRIPE_PRICE_PREMIUM);
+
 
 if (!STRIPE_SECRET_KEY) console.error("❌ Missing STRIPE secret key (resolved)");
 if (!STRIPE_PRICE_STANDARD) console.error("❌ Missing STRIPE standard price (resolved)");

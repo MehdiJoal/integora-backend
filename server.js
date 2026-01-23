@@ -3551,7 +3551,31 @@ function toIsoFromStripeTs(ts) {
 
 
 // ✅ ENDPOINT PAIEMENT STRIPE POUR STANDARD/PREMIUM
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+// ==================== STRIPE CONFIG (TEST/LIVE) ====================
+const STRIPE_MODE =
+  (process.env.STRIPE_MODE || "").toLowerCase() ||
+  (process.env.NODE_ENV === "production" ? "live" : "test");
+
+const STRIPE_SECRET_KEY =
+  STRIPE_MODE === "live"
+    ? (process.env.STRIPE_SECRET_KEY_LIVE || process.env.STRIPE_SECRET_KEY)
+    : (process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY);
+
+const STRIPE_PRICE_STANDARD =
+  STRIPE_MODE === "live"
+    ? (process.env.STRIPE_PRICE_STANDARD_LIVE || process.env.STRIPE_PRICE_STANDARD)
+    : (process.env.STRIPE_PRICE_STANDARD_TEST || process.env.STRIPE_PRICE_STANDARD);
+
+const STRIPE_PRICE_PREMIUM =
+  STRIPE_MODE === "live"
+    ? (process.env.STRIPE_PRICE_PREMIUM_LIVE || process.env.STRIPE_PRICE_PREMIUM)
+    : (process.env.STRIPE_PRICE_PREMIUM_TEST || process.env.STRIPE_PRICE_PREMIUM);
+
+if (!STRIPE_SECRET_KEY) console.error("❌ Missing STRIPE secret key (resolved)");
+if (!STRIPE_PRICE_STANDARD) console.error("❌ Missing STRIPE standard price (resolved)");
+if (!STRIPE_PRICE_PREMIUM) console.error("❌ Missing STRIPE premium price (resolved)");
+
+const stripe = require("stripe")(STRIPE_SECRET_KEY);
 
 app.post("/api/start-paid-checkout", async (req, res) => {
   console.log("🟡 [START-PAID] Reçu:", JSON.stringify(req.body, null, 2));
@@ -3746,10 +3770,11 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
     // ✅ 2) Price mapping (ENV)
     const priceIds = {
-      standard: process.env.STRIPE_PRICE_STANDARD,
-      premium: process.env.STRIPE_PRICE_PREMIUM
+      standard: STRIPE_PRICE_STANDARD,
+      premium: STRIPE_PRICE_PREMIUM,
     };
     const priceId = priceIds[desired_plan];
+
 
     if (!priceId) {
       return res.status(500).json({

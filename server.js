@@ -1803,8 +1803,13 @@ app.get("/api/payment-method/status", authenticateToken, async (req, res) => {
     }
 
     // Stripe truth
-    const customer = await stripe.customers.retrieve(sub.stripe_customer_id);
+    const ensured = await ensureStripeCustomer({
+      userId,
+      email: req.user?.email ?? null,
+      existingCustomerId: sub.stripe_customer_id,
+    });
 
+    const customer = await stripe.customers.retrieve(ensured.customerId);
     // Optionnel : regarde aussi la subscription (certaines configs mettent default PM au niveau subscription)
     let subscriptionDefaultPm = null;
     if (sub.stripe_subscription_id) {
@@ -2168,13 +2173,22 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Upgrade possible uniquement depuis Standard" });
     }
 
+    // ✅ garantir un customer valide dans le mode courant (test/live)
+    const ensured = await ensureStripeCustomer({
+      userId,
+      email: req.user?.email ?? null,
+      existingCustomerId: sub.stripe_customer_id,
+    });
+
+
     // ✅ sync facturation avant de créer un checkout
     try {
       await syncStripeCustomerBillingFromDb({
         userId,
-        stripeCustomerId: sub.stripe_customer_id,
+        stripeCustomerId: ensured.customerId,
         requireComplete: true,
       });
+
     } catch (e) {
       if (e?.code === "BILLING_INCOMPLETE") {
         return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
@@ -2191,6 +2205,9 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
 
     const FRONTEND_URL = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
 
+
+
+
     // 1) récupérer subscription + item courant
     const stripeSub = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
     const itemId = stripeSub?.items?.data?.[0]?.id;
@@ -2203,7 +2220,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
     const now = Math.floor(Date.now() / 1000);
 
     const preview = await retrieveProrationPreview(stripe, {
-      customerId: sub.stripe_customer_id,
+      customerId: ensured.customerId,
       subscriptionId: sub.stripe_subscription_id,
       subscriptionItemId: itemId,
       newPriceId: PREMIUM_PRICE_ID,
@@ -2223,7 +2240,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
 
     let receiptEmail = null;
     try {
-      const customer = await stripe.customers.retrieve(sub.stripe_customer_id);
+      const customer = await stripe.customers.retrieve(ensured.customerId);
       if (customer && !customer.deleted) {
         receiptEmail = customer.email || null;
       }
@@ -2235,7 +2252,8 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
     // 3) Checkout Session (payment) = l’utilisateur paye UNIQUEMENT le prorata
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      customer: sub.stripe_customer_id,
+      customer: ensured.customerId,
+
 
       // ✅ force l’UI Checkout en FR (et aide souvent les libellés)
       locale: "fr",
@@ -2262,13 +2280,19 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       line_items: [
         {
           price_data: {
-            currency,
-            product_data: { name: "INTEGORA — Upgrade Standard → Premium (prorata)" },
-            unit_amount: amountDue,
+            currency: "eur",
+            unit_amount: plan === "premium" ? 50 : 50, // 0,50€
+            product_data: {
+              name:
+                plan === "premium"
+                  ? "INTEGORA Premium — Pré-paiement année suivante"
+                  : "INTEGORA Standard — Pré-paiement année suivante",
+            },
           },
           quantity: 1,
         },
       ],
+
 
       success_url: `${FRONTEND_URL}/app/profile.html?upgrade=success`,
       cancel_url: `${FRONTEND_URL}/app/profile.html?upgrade=cancel`,
@@ -2346,14 +2370,35 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       });
     }
 
+    // ✅ 1) plan demandé
     const requestedPlan = String(req.body?.plan ?? "").trim().toLowerCase();
     if (requestedPlan !== "standard" && requestedPlan !== "premium") {
-      return res.status(400).json({ error: "Plan invalide. plan=standard ou plan=premium" });
+      return res.status(400).json({ error: "Plan invalide" });
+    }
+    const plan = requestedPlan;
+
+    // ✅ 2) garantir un customer valide (test/live)
+    const ensured = await ensureStripeCustomer({
+      userId,
+      email: req.user?.email ?? null,
+      existingCustomerId: sub.stripe_customer_id,
+    });
+
+    // ✅ 3) sync facturation AVANT checkout (adresse + SIRET + raison sociale)
+    try {
+      await syncStripeCustomerBillingFromDb({
+        userId,
+        stripeCustomerId: ensured.customerId,
+        requireComplete: true,
+      });
+    } catch (e) {
+      if (e?.code === "BILLING_INCOMPLETE") {
+        return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
+      }
+      console.error("❌ sync billing (prepay) error:", e);
+      return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
     }
 
-
-
-    const plan = requestedPlan;
 
     const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
@@ -2375,27 +2420,12 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       }
     }
 
-    // ✅✅✅ PATCH ICI : sync facturation Stripe AVANT checkout (prépay)
-    try {
-      await syncStripeCustomerBillingFromDb({
-        userId,
-        stripeCustomerId: sub.stripe_customer_id,
-        requireComplete: true,
-      });
-    } catch (e) {
-      if (e?.code === "BILLING_INCOMPLETE") {
-        return res.status(400).json({
-          error: e.message,
-          code: "BILLING_INCOMPLETE",
-        });
-      }
-      console.error("❌ sync billing (prepay) error:", e);
-      return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
-    }
+    // Email reçu Stripe (optionnel)
+
 
     let receiptEmail = null;
     try {
-      const customer = await stripe.customers.retrieve(sub.stripe_customer_id);
+      const customer = await stripe.customers.retrieve(ensured.customerId);
       if (customer && !customer.deleted) {
         receiptEmail = customer.email || null;
       }
@@ -2410,12 +2440,17 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
           const c = await stripe.customers.retrieve(existingCustomerId);
           if (c && !c.deleted) return { customerId: existingCustomerId, created: false };
         } catch (err) {
-          if (err?.code !== "resource_missing") throw err;
+          const isMissing =
+            err?.code === "resource_missing" ||
+            err?.raw?.code === "resource_missing" ||
+            err?.type === "StripeInvalidRequestError";
+          if (!isMissing) throw err;
           console.warn("⚠️ Stripe customer introuvable dans ce mode, on recrée", {
             userId,
             existingCustomerId,
           });
         }
+
       }
 
       const created = await stripe.customers.create({
@@ -2466,14 +2501,9 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     // ✅ 2) email : utilise celui du user (ou receiptEmail si c'est ton email fiable)
     const userEmail = receiptEmail ?? null; // ou req.user.email si tu l'as
 
-    // ✅ 3) garantir un customer valide (test/live)
-    const ensured = await ensureStripeCustomer({
-      userId,
-      email: userEmail,
-      existingCustomerId: stripeCustomerId,
-    });
 
-    // ✅ 4) sync billing AVANT checkout (facture complète : raison sociale, SIRET, adresse)
+
+    // ✅ 3) sync billing AVANT checkout (facture complète : raison sociale, SIRET, adresse)
     await syncStripeCustomerBillingFromDb({
       userId,
       stripeCustomerId: ensured.customerId,
@@ -2495,7 +2525,21 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
         },
       },
 
-      line_items: [{ price: priceId, quantity: 1 }],
+      line_items: [
+        {
+          price_data: {
+            currency: "eur",
+            unit_amount: plan === "premium" ? 100 : 50, // premium 1,00€ / standard 0,50€
+            product_data: {
+              name:
+                plan === "premium"
+                  ? "INTEGORA Premium — Pré-paiement année suivante"
+                  : "INTEGORA Standard — Pré-paiement année suivante",
+            },
+          },
+          quantity: 1,
+        },
+      ],
 
       success_url: `${FRONTEND_URL}/app/profile.html?prepay=success`,
       cancel_url: `${FRONTEND_URL}/app/profile.html?prepay=cancel`,

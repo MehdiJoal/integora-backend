@@ -2285,22 +2285,19 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
 
 
     return res.json({ url: session.url });
-  } catch (err) {
-
-    console.error("❌ change-plan checkout error (LIVE)", {
+  } catch (e) {
+    console.error("❌ change-plan checkout error", {
       message: e?.message,
       type: e?.type,
       code: e?.code,
-      raw: e,
+      rawType: e?.rawType,
+      param: e?.param,
+      requestId: e?.requestId,
     });
-
-    return res.status(500).json({
-      error: "stripe_error",
-      message: e?.message || "Unknown Stripe error",
-    });
-    console.error("❌ change-plan checkout error:", err?.raw?.message || err);
-    return res.status(500).json({ error: "Erreur upgrade" });
+    return res.status(500).json({ error: "stripe_error" });
   }
+
+
 });
 
 
@@ -2407,6 +2404,33 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     }
 
 
+    async function ensureStripeCustomer({ userId, email, existingCustomerId }) {
+      if (existingCustomerId) {
+        try {
+          const c = await stripe.customers.retrieve(existingCustomerId);
+          if (c && !c.deleted) return { customerId: existingCustomerId, created: false };
+        } catch (err) {
+          if (err?.code !== "resource_missing") throw err;
+          console.warn("⚠️ Stripe customer introuvable dans ce mode, on recrée", {
+            userId,
+            existingCustomerId,
+          });
+        }
+      }
+
+      const created = await stripe.customers.create({
+        email: email || undefined,
+        preferred_locales: ["fr"],
+        metadata: { user_id: userId, source: "ensureStripeCustomer" },
+      });
+
+      await supabaseAdmin
+        .from("subscriptions")
+        .update({ stripe_customer_id: created.id })
+        .eq("user_id", userId);
+
+      return { customerId: created.id, created: true };
+    }
 
 
 
@@ -2434,30 +2458,42 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     const priceId = plan === "premium" ? STRIPE_PRICE_PREMIUM : STRIPE_PRICE_STANDARD;
     if (!priceId) return res.status(500).json({ error: "Missing Stripe price for plan" });
 
+
+
+    // ✅ 1) stripe_customer_id depuis la DB
+    const stripeCustomerId = sub?.stripe_customer_id || null;
+
+    // ✅ 2) email : utilise celui du user (ou receiptEmail si c'est ton email fiable)
+    const userEmail = receiptEmail ?? null; // ou req.user.email si tu l'as
+
+    // ✅ 3) garantir un customer valide (test/live)
+    const ensured = await ensureStripeCustomer({
+      userId,
+      email: userEmail,
+      existingCustomerId: stripeCustomerId,
+    });
+
+    // ✅ 4) sync billing AVANT checkout (facture complète : raison sociale, SIRET, adresse)
+    await syncStripeCustomerBillingFromDb({
+      userId,
+      stripeCustomerId: ensured.customerId,
+      requireComplete: true,
+    });
+
+
     const session = await stripe.checkout.sessions.create({
-
       mode: "payment",
-      customer: sub.stripe_customer_id,
+      customer: ensured.customerId,
 
-      // ✅ UI Checkout en FR
       locale: "fr",
 
-      // ✅ reçu Stripe
-      customer_email: receiptEmail ?? undefined,
-
-      // ✅ IMPORTANT : Checkout crée une FACTURE Stripe liée au paiement
       invoice_creation: {
         enabled: true,
         invoice_data: {
           description: `INTEGORA — Pré-paiement année suivante (${plan})`,
-          metadata: {
-            action: "prepay_next_year",
-            user_id: userId,
-            plan: plan,
-          },
+          metadata: { action: "prepay_next_year", user_id: userId, plan },
         },
       },
-
 
       line_items: [{ price: priceId, quantity: 1 }],
 
@@ -2613,6 +2649,13 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
     }
 
 
+    console.log("🧪 PREPAY DEBUG", {
+      userId,
+      plan,
+      stripeMode: process.env.STRIPE_MODE,
+      customerId: ensured.customerId,
+      hadExistingCustomerId: !!stripeCustomerId,
+    });
 
     // 4) créer Checkout Session subscription (PARAMS STRIPE VALIDES)
     const session = await stripe.checkout.sessions.create({

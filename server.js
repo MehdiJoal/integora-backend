@@ -3690,8 +3690,16 @@ if (!STRIPE_PRICE_PREMIUM) console.error("❌ Missing STRIPE premium price (reso
 
 const stripe = require("stripe")(STRIPE_SECRET_KEY);
 
+
+
+
 app.post("/api/start-paid-checkout", async (req, res) => {
   console.log("🟡 [START-PAID] Reçu:", JSON.stringify(req.body, null, 2));
+  console.log("🧾 [START-PAID] STRIPE_MODE =", STRIPE_MODE);
+  console.log("🧾 [START-PAID] STRIPE_SECRET_KEY starts live =", STRIPE_SECRET_KEY?.startsWith("sk_live"));
+  console.log("🧾 [START-PAID] STRIPE_SECRET_KEY starts test =", STRIPE_SECRET_KEY?.startsWith("sk_test"));
+  console.log("🧾 [START-PAID] HOST =", req.headers.host);
+  console.log("🧾 [START-PAID] ORIGIN =", req.headers.origin);
 
   try {
     const emailNorm = normalizeEmail(req.body?.email);

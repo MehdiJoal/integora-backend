@@ -2542,9 +2542,10 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
 
     // 2) price mapping
     const PRICE_BY_PLAN = {
-      standard: process.env.STRIPE_PRICE_STANDARD || "price_1SIoYxPGbG6oFrATaa6wtYvX",
-      premium: process.env.STRIPE_PRICE_PREMIUM || "price_1SIoZGPGbG6oFrATq6020zVW",
+      standard: STRIPE_PRICE_STANDARD,
+      premium: STRIPE_PRICE_PREMIUM,
     };
+
     const priceId = PRICE_BY_PLAN[desiredPlan];
     if (!priceId) return res.status(500).json({ error: "PriceId Stripe manquant" });
 

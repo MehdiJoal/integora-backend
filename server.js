@@ -2144,6 +2144,42 @@ async function retrieveProrationPreview(stripe, {
 }
 
 
+async function ensureStripeCustomer({ userId, email, existingCustomerId }) {
+  if (existingCustomerId) {
+    try {
+      const c = await stripe.customers.retrieve(existingCustomerId);
+      if (c && !c.deleted) return { customerId: existingCustomerId, created: false };
+    } catch (err) {
+      const isMissing =
+        err?.code === "resource_missing" ||
+        err?.raw?.code === "resource_missing" ||
+        err?.type === "StripeInvalidRequestError";
+      if (!isMissing) throw err;
+      console.warn("⚠️ Stripe customer introuvable dans ce mode, on recrée", {
+        userId,
+        existingCustomerId,
+      });
+    }
+
+  }
+
+  const created = await stripe.customers.create({
+    email: email || undefined,
+    preferred_locales: ["fr"],
+    metadata: { user_id: userId, source: "ensureStripeCustomer" },
+  });
+
+  await supabaseAdmin
+    .from("subscriptions")
+    .update({ stripe_customer_id: created.id })
+    .eq("user_id", userId);
+
+  return { customerId: created.id, created: true };
+}
+
+
+
+
 // ==========================================
 // 🔁 UPGRADE STANDARD → PREMIUM (Checkout prorata)
 // ✅ Stripe calcule le prorata (retrieveUpcoming)
@@ -2253,19 +2289,15 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer: ensured.customerId,
-
-
-      // ✅ force l’UI Checkout en FR (et aide souvent les libellés)
       locale: "fr",
 
-      // ✅ reçu Stripe (optionnel mais ok)
-      payment_intent_data: receiptEmail ? { receipt_email: receiptEmail } : undefined,
+      payment_intent_data: receiptEmail
+        ? { receipt_email: receiptEmail }
+        : undefined,
 
-      // ✅ IMPORTANT : demande à Stripe de créer une FACTURE liée à ce paiement (pas de out_of_band)
       invoice_creation: {
         enabled: true,
         invoice_data: {
-          // ✅ ce texte ressort sur la facture
           description: "INTEGORA — Upgrade Standard → Premium (prorata)",
           metadata: {
             action: "upgrade_proration",
@@ -2276,36 +2308,30 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
         },
       },
 
-
       line_items: [
         {
           price_data: {
-            currency: "eur",
-            unit_amount: plan === "premium" ? 50 : 50, // 0,50€
+            currency,              // <= "eur" depuis preview.currency
+            unit_amount: amountDue, // ✅ LE prorata réel (en cents)
             product_data: {
-              name:
-                plan === "premium"
-                  ? "INTEGORA Premium — Pré-paiement année suivante"
-                  : "INTEGORA Standard — Pré-paiement année suivante",
+              name: "INTEGORA — Prorata upgrade Standard → Premium",
             },
           },
           quantity: 1,
         },
       ],
 
-
       success_url: `${FRONTEND_URL}/app/profile.html?upgrade=success`,
       cancel_url: `${FRONTEND_URL}/app/profile.html?upgrade=cancel`,
 
-      // ✅ garde ton metadata (ça sert pour checkout.session.completed)
       metadata: {
         action: "upgrade_proration",
         user_id: userId,
         subscription_id: sub.stripe_subscription_id,
-        subscription_item_id: itemId,
         new_price_id: PREMIUM_PRICE_ID,
       },
     });
+
 
 
     return res.json({ url: session.url });
@@ -2433,39 +2459,6 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       console.warn("⚠️ Unable to retrieve customer email for Stripe receipt:", e);
     }
 
-
-    async function ensureStripeCustomer({ userId, email, existingCustomerId }) {
-      if (existingCustomerId) {
-        try {
-          const c = await stripe.customers.retrieve(existingCustomerId);
-          if (c && !c.deleted) return { customerId: existingCustomerId, created: false };
-        } catch (err) {
-          const isMissing =
-            err?.code === "resource_missing" ||
-            err?.raw?.code === "resource_missing" ||
-            err?.type === "StripeInvalidRequestError";
-          if (!isMissing) throw err;
-          console.warn("⚠️ Stripe customer introuvable dans ce mode, on recrée", {
-            userId,
-            existingCustomerId,
-          });
-        }
-
-      }
-
-      const created = await stripe.customers.create({
-        email: email || undefined,
-        preferred_locales: ["fr"],
-        metadata: { user_id: userId, source: "ensureStripeCustomer" },
-      });
-
-      await supabaseAdmin
-        .from("subscriptions")
-        .update({ stripe_customer_id: created.id })
-        .eq("user_id", userId);
-
-      return { customerId: created.id, created: true };
-    }
 
 
 

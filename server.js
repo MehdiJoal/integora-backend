@@ -2104,26 +2104,26 @@ async function authEmailExists(emailNorm) {
 
 
 async function retrieveProrationPreview(stripe, {
+  userId,
   customerId,
   subscriptionId,
   subscriptionItemId,
   newPriceId,
+  currentPriceId,
 }) {
   const now = Math.floor(Date.now() / 1000);
 
   console.log("🔍 CHANGE PLAN LIVE CHECK", {
     stripeMode: STRIPE_MODE,
-    user_id,
-    subscriptionId: sub.stripe_subscription_id,
-    customerId: sub.stripe_customer_id,
-    currentPrice: sub.stripe_price_id,
-    targetPrice: STRIPE_PRICE_PREMIUM,
-    isLiveKey: STRIPE_SECRET_KEY.startsWith("sk_live"),
+    user_id: userId,
+    customerId,
+    subscriptionId,
+    subscriptionItemId,
+    currentPrice: currentPriceId || null,
+    targetPrice: newPriceId,
+    isLiveKey: STRIPE_SECRET_KEY?.startsWith("sk_live"),
   });
 
-
-  // ✅ Nouvelle API : Create Preview Invoice
-  // subscription_details porte les infos de "simulation" d'update
   const preview = await stripe.invoices.createPreview({
     customer: customerId,
     subscription: subscriptionId,
@@ -2140,8 +2140,9 @@ async function retrieveProrationPreview(stripe, {
     },
   });
 
-  return preview; // contient amount_due, currency, lines, etc.
+  return preview;
 }
+
 
 
 async function ensureStripeCustomer({ userId, email, existingCustomerId }) {
@@ -2256,11 +2257,14 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
     const now = Math.floor(Date.now() / 1000);
 
     const preview = await retrieveProrationPreview(stripe, {
+      userId,
       customerId: ensured.customerId,
       subscriptionId: sub.stripe_subscription_id,
       subscriptionItemId: itemId,
       newPriceId: PREMIUM_PRICE_ID,
+      currentPriceId: stripeSub?.items?.data?.[0]?.price?.id,
     });
+
 
     const amountDue = typeof preview?.amount_due === "number" ? preview.amount_due : 0;
     const currency = (preview?.currency || "eur").toLowerCase();

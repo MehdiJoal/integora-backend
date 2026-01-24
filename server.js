@@ -4443,6 +4443,10 @@ app.post("/api/finalize-pending", async (req, res) => {
 
 app.post("/api/start-trial-invite", async (req, res) => {
   console.log("🟣 [TRIAL] Reçu:", JSON.stringify(req.body, null, 2));
+  console.log("[ENV] NODE_ENV =", process.env.NODE_ENV);
+  console.log("[ENV] FRONTEND_URL =", process.env.FRONTEND_URL);
+  console.log("[ENV] SUPABASE_URL =", process.env.SUPABASE_URL);
+  console.log("[ENV] SUPABASE_SERVICE_ROLE_KEY ?", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
 
   try {
     const emailNorm = normalizeEmail(req.body?.email);
@@ -4572,6 +4576,8 @@ app.post("/api/start-trial-invite", async (req, res) => {
     // 2) invite email
     const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
     const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
+    console.log("🧪 [TRIAL] pending_id =", pending_id);
+    console.log("🧪 [TRIAL] redirectTo =", redirectTo);
 
     const { data: inviteData, error: inviteErr } =
       await supabaseAdmin.auth.admin.inviteUserByEmail(emailNorm, {

@@ -2218,21 +2218,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
     });
 
 
-    // ✅ sync facturation avant de créer un checkout
-    try {
-      await syncStripeCustomerBillingFromDb({
-        userId,
-        stripeCustomerId: ensured.customerId,
-        requireComplete: true,
-      });
 
-    } catch (e) {
-      if (e?.code === "BILLING_INCOMPLETE") {
-        return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
-      }
-      console.error("❌ sync billing (change-plan) error:", e);
-      return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
-    }
 
     const PREMIUM_PRICE_ID = STRIPE_PRICE_PREMIUM;
     if (!PREMIUM_PRICE_ID) {
@@ -2246,10 +2232,52 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
 
 
     // 1) récupérer subscription + item courant
-    const stripeSub = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
+    const subscriptionId = sub.stripe_subscription_id;
+    const customerId = sub.stripe_customer_id;
+
+    // 1) Récup subscription Stripe
+    const stripeSub = await stripe.subscriptions.retrieve(subscriptionId);
+
+    // 2) Customer réel de la subscription
+    const subCustomerId = typeof stripeSub.customer === "string" ? stripeSub.customer : null;
+    if (!subCustomerId) {
+      return res.status(400).json({ error: "Stripe subscription has no customer" });
+    }
+
+    // 3) Si DB customer != Stripe customer, on resync DB (optionnel mais top)
+    if (customerId !== subCustomerId) {
+      console.log("🛠️ Resync stripe_customer_id from subscription.customer", {
+        dbCustomerId: customerId,
+        stripeCustomerId: subCustomerId,
+      });
+
+      await supabaseAdmin
+        .from("subscriptions")
+        .update({ stripe_customer_id: subCustomerId })
+        .eq("user_id", userId);
+    }
+
+    const customerIdForUpgrade = subCustomerId;
+
     const itemId = stripeSub?.items?.data?.[0]?.id;
     if (!itemId) {
       return res.status(400).json({ error: "Subscription Stripe invalide (item manquant)" });
+    }
+
+    // ✅ sync facturation avant de créer un checkout
+    try {
+      await syncStripeCustomerBillingFromDb({
+        userId,
+        stripeCustomerId: customerIdForUpgrade,
+        requireComplete: true,
+      });
+
+    } catch (e) {
+      if (e?.code === "BILLING_INCOMPLETE") {
+        return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
+      }
+      console.error("❌ sync billing (change-plan) error:", e);
+      return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
     }
 
     // 2) demander à Stripe le "prorata dû maintenant" (quote)
@@ -2258,7 +2286,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
 
     const preview = await retrieveProrationPreview(stripe, {
       userId,
-      customerId: ensured.customerId,
+      customerId: customerIdForUpgrade,
       subscriptionId: sub.stripe_subscription_id,
       subscriptionItemId: itemId,
       newPriceId: PREMIUM_PRICE_ID,
@@ -2292,7 +2320,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
     // 3) Checkout Session (payment) = l’utilisateur paye UNIQUEMENT le prorata
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      customer: ensured.customerId,
+      customer: customerIdForUpgrade,
       locale: "fr",
 
       payment_intent_data: receiptEmail
@@ -2333,6 +2361,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
         user_id: userId,
         subscription_id: sub.stripe_subscription_id,
         new_price_id: PREMIUM_PRICE_ID,
+        subscription_item_id: itemId,
       },
     });
 

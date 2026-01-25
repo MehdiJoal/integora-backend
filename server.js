@@ -2383,8 +2383,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       // ✅ TVA auto (Stripe Tax)
       automatic_tax: { enabled: true },
       billing_address_collection: "required",
-      customer_update: { address: "auto" },
-
+      customer_update: { name: "auto", address: "auto" },
 
 
       payment_intent_data: receiptEmail
@@ -2625,8 +2624,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       locale: "fr",
       automatic_tax: { enabled: true },
       billing_address_collection: "required",
-      customer_update: { address: "auto" },
-
+      customer_update: { name: "auto", address: "auto" },
 
       invoice_creation: {
         enabled: true,
@@ -2817,7 +2815,8 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
       billing_address_collection: "required",
 
       tax_id_collection: { enabled: true },
-      customer_update: { address: "auto" },
+      customer_update: { name: "auto", address: "auto" },
+
 
 
 
@@ -4048,7 +4047,8 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       billing_address_collection: "required",
 
       tax_id_collection: { enabled: true },
-      customer_update: { address: "auto" },
+      customer_update: { name: "auto", address: "auto" },
+
 
 
 

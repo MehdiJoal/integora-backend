@@ -2364,7 +2364,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       // ✅ TVA auto (Stripe Tax)
       automatic_tax: { enabled: true },
       billing_address_collection: "required",
-      customer_update: { address: "auto", name: "auto" },
+      customer_update: { address: "auto" },
 
 
 
@@ -2604,7 +2604,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       locale: "fr",
       automatic_tax: { enabled: true },
       billing_address_collection: "required",
-      customer_update: { address: "auto", name: "auto" },
+      customer_update: { address: "auto" },
 
 
       invoice_creation: {
@@ -2781,6 +2781,28 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
       userId,
     });
 
+    // ====== B2B : raison sociale sur facture ("Facturer à") ======
+    const companyLabel =
+      (company?.legal_name && String(company.legal_name).trim()) ||
+      (company?.display_name && String(company.display_name).trim()) ||
+      null;
+
+    if (companyLabel) {
+      await stripe.customers.update(customerId, {
+        name: companyLabel, // ✅ affiché dans "Facturer à"
+        invoice_settings: {
+          custom_fields: [
+            { name: "Raison sociale", value: companyLabel },
+            ...(company?.company_siret
+              ? [{ name: "SIRET", value: String(company.company_siret).replace(/\s+/g, "") }]
+              : []),
+          ],
+        },
+      });
+    }
+
+
+
 
     // 4) créer Checkout Session subscription (PARAMS STRIPE VALIDES)
     const session = await stripe.checkout.sessions.create({
@@ -2792,9 +2814,9 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
       automatic_tax: { enabled: true },
       billing_address_collection: "required",
 
-      // ✅ B2B : collecte TVA intracom + adresse si besoin
       tax_id_collection: { enabled: true },
-      customer_update: { address: "auto", name: "auto" },
+      customer_update: { address: "auto" },
+
 
 
       line_items: [{ price: priceId, quantity: 1 }],
@@ -3985,9 +4007,12 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       },
       invoice_settings: {
         custom_fields: [
-          { name: "SIRET", value: company_siret },
+          { name: "Raison sociale", value: String(company_name || "").slice(0, 120) },
+          { name: "SIRET", value: String(company_siret || "").replace(/\s+/g, "") },
         ],
       },
+
+
       metadata: {
         source: "integora_signup",
         pending_id,
@@ -3996,6 +4021,12 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       },
     });
 
+    // ====== B2B : raison sociale sur facture ("Facturer à") ======
+    if (company_name) {
+      await stripe.customers.update(stripeCustomer.id, {
+        name: String(company_name).trim(), // ✅ affiché dans "Facturer à"
+      });
+    }
 
 
     // ✅ 4) Créer session Stripe (facture = infos Customer)
@@ -4008,9 +4039,9 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       automatic_tax: { enabled: true },
       billing_address_collection: "required",
 
-      // ✅ B2B : collecte TVA intracom + adresse
       tax_id_collection: { enabled: true },
-      customer_update: { address: "auto", name: "auto" },
+      customer_update: { address: "auto" },
+
 
 
       payment_method_collection: "always",

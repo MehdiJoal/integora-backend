@@ -1322,10 +1322,16 @@ async function syncStripeCustomerBillingFromDb({ userId, stripeCustomerId, requi
     },
     invoice_settings: {
       custom_fields: [
+        ...(legalName ? [{ name: "Raison sociale", value: String(legalName).slice(0, 120) }] : []),
         ...(siret ? [{ name: "SIRET", value: siret }] : []),
         ...(siren ? [{ name: "SIREN", value: siren }] : []),
-      ],
+        ...(((prof?.first_name || prof?.last_name) ? [{
+          name: "Contact",
+          value: `${prof?.first_name || ""} ${prof?.last_name || ""}`.trim().slice(0, 120),
+        }] : [])),
+      ].slice(0, 4), // ⚠️ Stripe max 4 custom fields
     },
+
     metadata: {
       source: "integora_profile_billing",
       user_id: userId,
@@ -1493,6 +1499,19 @@ async function applyPendingPrepaymentIfNeeded(userId) {
   }
 }
 
+// recupérer contact depuis table profiles 
+async function getContactNameFromProfiles(userId) {
+  const { data, error } = await supabaseAdmin
+    .from("profiles")
+    .select("first_name, last_name")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error || !data) return null;
+
+  const full = `${data.first_name ?? ""} ${data.last_name ?? ""}`.trim();
+  return full.length ? full : null;
+}
 
 
 // ✅ OPTIM PERF: throttle du RPC + cache court verify-token
@@ -2355,7 +2374,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       console.warn("⚠️ Unable to retrieve customer email for Stripe receipt:", e);
     }
 
-
+    const contactName = await getContactNameFromProfiles(userId);
     // 3) Checkout Session (payment) = l’utilisateur paye UNIQUEMENT le prorata
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
@@ -2384,6 +2403,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
           },
         },
       },
+
 
       line_items: [
         {
@@ -2597,6 +2617,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       });
     }
 
+    const contactName = await getContactNameFromProfiles(userId);
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
@@ -2781,25 +2802,6 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
       userId,
     });
 
-    // ====== B2B : raison sociale sur facture ("Facturer à") ======
-    const companyLabel =
-      (company?.legal_name && String(company.legal_name).trim()) ||
-      (company?.display_name && String(company.display_name).trim()) ||
-      null;
-
-    if (companyLabel) {
-      await stripe.customers.update(customerId, {
-        name: companyLabel, // ✅ affiché dans "Facturer à"
-        invoice_settings: {
-          custom_fields: [
-            { name: "Raison sociale", value: companyLabel },
-            ...(company?.company_siret
-              ? [{ name: "SIRET", value: String(company.company_siret).replace(/\s+/g, "") }]
-              : []),
-          ],
-        },
-      });
-    }
 
 
 
@@ -3996,37 +3998,43 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
 
     // ✅ 3) Créer un Customer Stripe AVANT checkout (pour facture parfaite)
+    const contactName =
+      `${first_name ?? ""} ${last_name ?? ""}`.trim() || null;
+
+    const siret = company_siret ? String(company_siret).replace(/\s+/g, "") : null;
+    const siren = siret && siret.length >= 9 ? siret.slice(0, 9) : null;
+
     const stripeCustomer = await stripe.customers.create({
       email: emailNorm,
-      name: company_name,
+      name: String(company_name || "").slice(0, 120),
+      preferred_locales: ["fr"],
+
       address: {
         line1: billing_street,
         postal_code: billing_postal_code,
         city: billing_city,
         country: billingCountryIso2,
       },
+
+      // ✅ Ce bloc fait apparaître "Raison sociale / SIRET / SIREN / Contact" en haut à droite
+      // ⚠️ max 4 champs Stripe
       invoice_settings: {
         custom_fields: [
           { name: "Raison sociale", value: String(company_name || "").slice(0, 120) },
-          { name: "SIRET", value: String(company_siret || "").replace(/\s+/g, "") },
-        ],
+          ...(siret ? [{ name: "SIRET", value: siret }] : []),
+          ...(siren ? [{ name: "SIREN", value: siren }] : []),
+          ...(contactName ? [{ name: "Contact", value: contactName.slice(0, 120) }] : []),
+        ].slice(0, 4),
       },
-
 
       metadata: {
         source: "integora_signup",
         pending_id,
         company_name,
-        company_siret,
+        company_siret: siret || "",
       },
     });
 
-    // ====== B2B : raison sociale sur facture ("Facturer à") ======
-    if (company_name) {
-      await stripe.customers.update(stripeCustomer.id, {
-        name: String(company_name).trim(), // ✅ affiché dans "Facturer à"
-      });
-    }
 
 
     // ✅ 4) Créer session Stripe (facture = infos Customer)

@@ -1710,6 +1710,45 @@ function requireSubscription(allowedPlans) {
 }
 
 
+// ✅ ENDPOINT PAIEMENT STRIPE POUR STANDARD/PREMIUM
+// ==================== STRIPE CONFIG (TEST/LIVE) ====================
+const STRIPE_MODE = (process.env.STRIPE_MODE ?? (process.env.NODE_ENV === "production" ? "live" : "test")).toLowerCase();
+
+const STRIPE_SECRET_KEY =
+  STRIPE_MODE === "live"
+    ? (process.env.STRIPE_SECRET_KEY_LIVE || process.env.STRIPE_SECRET_KEY)
+    : (process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY);
+
+const STRIPE_PRICE_STANDARD =
+  STRIPE_MODE === "live"
+    ? (process.env.STRIPE_PRICE_STANDARD_LIVE || process.env.STRIPE_PRICE_STANDARD)
+    : (process.env.STRIPE_PRICE_STANDARD_TEST || process.env.STRIPE_PRICE_STANDARD);
+
+const STRIPE_PRICE_PREMIUM =
+  STRIPE_MODE === "live"
+    ? (process.env.STRIPE_PRICE_PREMIUM_LIVE || process.env.STRIPE_PRICE_PREMIUM)
+    : (process.env.STRIPE_PRICE_PREMIUM_TEST || process.env.STRIPE_PRICE_PREMIUM);
+
+const STANDARD_PREPAY_PRICE_ID =
+  STRIPE_MODE === "live"
+    ? (process.env.STANDARD_PREPAY_PRICE_ID_LIVE || "")
+    : (process.env.STANDARD_PREPAY_PRICE_ID_TEST || "");
+
+const PREMIUM_PREPAY_PRICE_ID =
+  STRIPE_MODE === "live"
+    ? (process.env.PREMIUM_PREPAY_PRICE_ID_LIVE || "")
+    : (process.env.PREMIUM_PREPAY_PRICE_ID_TEST || "");
+
+if (!STRIPE_SECRET_KEY) console.error("❌ Missing STRIPE secret key (resolved)");
+if (!STRIPE_PRICE_STANDARD) console.error("❌ Missing STRIPE standard price (resolved)");
+if (!STRIPE_PRICE_PREMIUM) console.error("❌ Missing STRIPE premium price (resolved)");
+if (!STANDARD_PREPAY_PRICE_ID) console.error("❌ Missing STANDARD_PREPAY price id (resolved)");
+if (!PREMIUM_PREPAY_PRICE_ID) console.error("❌ Missing PREMIUM_PREPAY price id (resolved)");
+
+const stripe = require("stripe")(STRIPE_SECRET_KEY);
+
+
+
 // ✅ ROUTE POUR RÉCUPÉRER L'ABONNEMENT UTILISATEUR
 app.get('/api/my-subscription', authenticateToken, async (req, res) => {
   try {
@@ -2322,6 +2361,9 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       mode: "payment",
       customer: customerIdForUpgrade,
       locale: "fr",
+      // ✅ TVA auto (Stripe Tax)
+      automatic_tax: { enabled: true },
+
 
       payment_intent_data: receiptEmail
         ? { receipt_email: receiptEmail }
@@ -2343,15 +2385,18 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       line_items: [
         {
           price_data: {
-            currency,              // <= "eur" depuis preview.currency
-            unit_amount: amountDue, // ✅ LE prorata réel (en cents)
+            currency,
+            unit_amount: amountDue,
+            tax_behavior: "exclusive",
             product_data: {
               name: "INTEGORA — Prorata upgrade Standard → Premium",
+              tax_code: "txcd_10103000",
             },
           },
           quantity: 1,
         },
       ],
+
 
       success_url: `${FRONTEND_URL}/app/profile.html?upgrade=success`,
       cancel_url: `${FRONTEND_URL}/app/profile.html?upgrade=cancel`,
@@ -2536,12 +2581,25 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       requireComplete: true,
     });
 
+    const prepayPriceId =
+      plan === "premium" ? PREMIUM_PREPAY_PRICE_ID : STANDARD_PREPAY_PRICE_ID;
+
+    console.log("🧪 prepay resolved", { STRIPE_MODE, plan, prepayPriceId });
+
+    if (!prepayPriceId) {
+      return res.status(500).json({
+        error: "Missing prepay price id",
+        plan,
+        STRIPE_MODE,
+      });
+    }
+
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer: ensured.customerId,
-
       locale: "fr",
+      automatic_tax: { enabled: true },
 
       invoice_creation: {
         enabled: true,
@@ -2553,16 +2611,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
 
       line_items: [
         {
-          price_data: {
-            currency: "eur",
-            unit_amount: plan === "premium" ? 100 : 50, // premium 1,00€ / standard 0,50€
-            product_data: {
-              name:
-                plan === "premium"
-                  ? "INTEGORA Premium — Pré-paiement année suivante"
-                  : "INTEGORA Standard — Pré-paiement année suivante",
-            },
-          },
+          price: prepayPriceId,   // ✅ on utilise un Price Stripe existant (one-off)
           quantity: 1,
         },
       ],
@@ -2573,13 +2622,12 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       metadata: {
         action: "prepay_next_year",
         user_id: userId,
-        plan: plan,
+        plan,
       },
     });
 
-
-
     return res.json({ url: session.url });
+
 
   } catch (err) {
     console.error("❌ prepay-next-year error:", err);
@@ -2719,18 +2767,28 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
     }
 
 
-    console.log("🧪 PREPAY DEBUG", {
+    // 🧪 DEBUG
+    console.log("🧪 SUBSCRIBE DEBUG (/api/subscribe/session)", {
+      desiredPlan,
+      priceId,
+      customerId,
       userId,
-      plan,
-      stripeMode: process.env.STRIPE_MODE,
-      customerId: ensured.customerId,
-      hadExistingCustomerId: !!stripeCustomerId,
     });
+
 
     // 4) créer Checkout Session subscription (PARAMS STRIPE VALIDES)
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer: customerId,
+      locale: "fr",
+
+      // ✅ TVA auto (Stripe Tax)
+      automatic_tax: { enabled: true },
+
+      // ✅ B2B : collecte TVA intracom + adresse si besoin
+      tax_id_collection: { enabled: true },
+      customer_update: { address: "auto", name: "auto" },
+
 
       line_items: [{ price: priceId, quantity: 1 }],
 
@@ -3691,33 +3749,6 @@ function toIsoFromStripeTs(ts) {
 }
 
 
-// ✅ ENDPOINT PAIEMENT STRIPE POUR STANDARD/PREMIUM
-// ==================== STRIPE CONFIG (TEST/LIVE) ====================
-const STRIPE_MODE =
-  (process.env.STRIPE_MODE || "").toLowerCase() ||
-  (process.env.NODE_ENV === "production" ? "live" : "test");
-
-const STRIPE_SECRET_KEY =
-  STRIPE_MODE === "live"
-    ? (process.env.STRIPE_SECRET_KEY_LIVE || process.env.STRIPE_SECRET_KEY)
-    : (process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY);
-
-const STRIPE_PRICE_STANDARD =
-  STRIPE_MODE === "live"
-    ? (process.env.STRIPE_PRICE_STANDARD_LIVE || process.env.STRIPE_PRICE_STANDARD)
-    : (process.env.STRIPE_PRICE_STANDARD_TEST || process.env.STRIPE_PRICE_STANDARD);
-
-const STRIPE_PRICE_PREMIUM =
-  STRIPE_MODE === "live"
-    ? (process.env.STRIPE_PRICE_PREMIUM_LIVE || process.env.STRIPE_PRICE_PREMIUM)
-    : (process.env.STRIPE_PRICE_PREMIUM_TEST || process.env.STRIPE_PRICE_PREMIUM);
-
-
-if (!STRIPE_SECRET_KEY) console.error("❌ Missing STRIPE secret key (resolved)");
-if (!STRIPE_PRICE_STANDARD) console.error("❌ Missing STRIPE standard price (resolved)");
-if (!STRIPE_PRICE_PREMIUM) console.error("❌ Missing STRIPE premium price (resolved)");
-
-const stripe = require("stripe")(STRIPE_SECRET_KEY);
 
 
 
@@ -3964,6 +3995,15 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer: stripeCustomer.id,
+      locale: "fr",
+
+      // ✅ TVA auto (Stripe Tax)
+      automatic_tax: { enabled: true },
+
+      // ✅ B2B : collecte TVA intracom + adresse
+      tax_id_collection: { enabled: true },
+      customer_update: { address: "auto", name: "auto" },
+
 
       payment_method_collection: "always",
       line_items: [{ price: priceId, quantity: 1 }],

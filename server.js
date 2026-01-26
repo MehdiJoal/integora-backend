@@ -440,6 +440,27 @@ app.use('/api/resend-activation', authLimiter);
 const FRONTEND_DIR = path.join(__dirname, "../frontend");
 const APP_DIR = path.join(FRONTEND_DIR, "app");
 
+
+// ==================== STATIC VITE "public/" (LOCAL) ====================
+const PUBLIC_DIR = path.join(FRONTEND_DIR, "public");
+
+// Sert /assets/* (images, vidéos, etc.) comme Vite/Vercel
+app.use(
+  "/assets",
+  express.static(path.join(PUBLIC_DIR, "assets"), {
+    etag: true,
+    maxAge: 0, // en dev on évite les caches
+  })
+);
+
+// (optionnel mais utile) favicon
+app.get("/favicon.ico", (req, res) => {
+  const fav = path.join(PUBLIC_DIR, "favicon.ico");
+  return res.sendFile(fav);
+});
+
+
+
 // ✅ Public: tout le frontend SAUF /app/*
 const publicStatic = express.static(FRONTEND_DIR, { index: false });
 

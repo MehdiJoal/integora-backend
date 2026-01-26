@@ -2,30 +2,58 @@
 
 require('dotenv').config();
 
+// ==========================
+// 🔧 LOGS (SERVER)
+// ==========================
+const IS_PROD = process.env.NODE_ENV === "production";
+
+function devOnly(req, res, next) {
+  if (IS_PROD) return res.status(404).send("Not found");
+  return next();
+}
+
+// ✅ Autorise l’expo de liens sensibles uniquement en DEV (optionnellement protégé par secret)
+function devToolsAllowed(req) {
+  if (IS_PROD) return false;
+
+  // Si tu n’as pas de secret configuré => autorisé en dev
+  const expected = process.env.DEV_TOOLS_SECRET;
+  if (!expected) return true;
+
+  const got = String(req.headers["x-dev-secret"] || "");
+  return got === expected;
+}
+
+
+// (optionnel) petit helper pour ne jamais log d’email
+const safeUserTag = (u) => (u?.id ? `user_id=${u.id}` : "user_id=unknown");
+
+// Niveau: error | warn | info | debug
+const LOG_LEVEL = (process.env.LOG_LEVEL || (IS_PROD ? "warn" : "debug")).toLowerCase();
+const rank = { error: 0, warn: 1, info: 2, debug: 3 };
+const can = (lvl) => (rank[lvl] ?? 99) <= (rank[LOG_LEVEL] ?? 1);
+
+const log = {
+  error: (...a) => console.error(...a),
+  warn: (...a) => { if (can("warn")) console.warn(...a); },
+  info: (...a) => { if (can("info")) console.log(...a); },
+  debug: (...a) => { if (can("debug")) console.log(...a); },
+};
+
+
 // Vérification CRITIQUE - doit être fait immédiatement
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("❌ ERREUR CRITIQUE: Variables Supabase manquantes !");
-  console.error("   SUPABASE_URL:", process.env.SUPABASE_URL ? "✅ Définie" : "❌ MANQUANTE");
-  console.error("   SUPABASE_SERVICE_ROLE_KEY:", process.env.SUPABASE_SERVICE_ROLE_KEY ? "✅ Définie" : "❌ MANQUANTE");
-  console.error("💡 Vérifie que ton fichier .env est dans le même dossier que server.js");
+  log.error("❌ ERREUR CRITIQUE: Variables Supabase manquantes !");
+  log.error("   SUPABASE_URL:", process.env.SUPABASE_URL ? "✅ Définie" : "❌ MANQUANTE");
+  log.error("   SUPABASE_SERVICE_ROLE_KEY:", process.env.SUPABASE_SERVICE_ROLE_KEY ? "✅ Définie" : "❌ MANQUANTE");
+  log.error("💡 Vérifie que ton fichier .env est dans le même dossier que server.js");
   process.exit(1);
 }
 
 
-console.log("🔎 ENV CHECK", {
-  nodeEnv: process.env.NODE_ENV,
-  stripeMode: process.env.STRIPE_MODE,
-  isLiveKey: process.env.STRIPE_SECRET_KEY?.startsWith("sk_live_"),
-  priceStandard: process.env.STRIPE_PRICE_STANDARD,
-  pricePremium: process.env.STRIPE_PRICE_PREMIUM,
-  frontendUrl: process.env.FRONTEND_URL,
-});
 
 
-console.log("✅ Variables d'environnement chargées avec succès");
-console.log("🧪 SUPABASE_URL USED:", process.env.SUPABASE_URL);
-console.log("🧪 ANON prefix:", (process.env.SUPABASE_ANON_KEY || "").slice(0, 12));
-console.log("🧪 SERVICE_ROLE prefix:", (process.env.SUPABASE_SERVICE_ROLE_KEY || "").slice(0, 12));
+log.info(`[BOOT] env=${process.env.NODE_ENV} (LOG_LEVEL=${LOG_LEVEL})`);
 
 
 const express = require("express");
@@ -84,7 +112,7 @@ const RESEND_FROM = process.env.RESEND_FROM || "INTEGORA <noreply@integora.fr>";
 
 async function sendResendEmail({ to, subject, html }) {
   if (!RESEND_API_KEY) {
-    console.warn("⚠️ RESEND_API_KEY manquante : email non envoyé.");
+    log.warn("⚠️ RESEND_API_KEY manquante : email non envoyé.");
     return { skipped: true, reason: "missing_resend_api_key" };
   }
 
@@ -139,7 +167,6 @@ const SUBSCRIPTION_TYPES = {
 // ==========================================
 // 🗄️ INITIALISATION SUPABASE
 // ==========================================
-console.log("🔄 Tentative de création du client Supabase...");
 
 try {
   // ⚠️ CE DOIT ÊTRE LA SERVICE_ROLE_KEY
@@ -154,9 +181,7 @@ try {
       }
     }
   );
-  console.log("✅ Supabase client ADMIN créé avec succès!");
 } catch (error) {
-  console.log("❌ Erreur création client Supabase:", error.message);
   process.exit(1);
 }
 
@@ -168,7 +193,6 @@ try {
 // 🗄️ DEUX CLIENTS SUPABASE - SOLUTION DÉFINITIVE
 // ==========================================
 
-console.log("🔄 Création des clients Supabase...");
 
 // 1. CLIENT AUTH (pour l'authentification Supabase) - ANON_KEY
 const supabaseAuth = createClient(
@@ -197,9 +221,6 @@ const supabaseAdmin = createClient(
 
 
 
-console.log("✅ Clients Supabase créés:");
-console.log("   - Auth Client (anon): ✅");
-console.log("   - Admin Client (service_role): ✅");
 
 
 
@@ -215,7 +236,6 @@ async function withRetry(fn, { retries = 3, baseDelayMs = 500 } = {}) {
       if (attempt === retries) break;
 
       const sleep = baseDelayMs * attempt; // 500ms, 1s, 1.5s...
-      console.log(`🔄 Réessai ${attempt}/${retries} dans ${sleep}ms...`);
       await new Promise(r => setTimeout(r, sleep));
     }
   }
@@ -229,18 +249,12 @@ app.get('/api/health/supabase', async (req, res) => {
     // ✅ Test simple: lister les buckets
     const { data, error } = await supabase.storage.listBuckets();
 
-    console.log("🧪 authEmailExists: checking email=", target, "page=", page);
-    console.log("🧪 supabaseAdmin url =", process.env.SUPABASE_URL);
 
     if (error) {
-      console.error("❌ authEmailExists listUsers error:", error);
+      log.error("❌ authEmailExists listUsers error:", error);
       // SAFE MODE : si on ne peut pas vérifier, on bloque
       return true;
     }
-
-    console.log("🧪 listUsers error =", error);
-    console.log("🧪 listUsers count =", data?.users?.length);
-    console.log("🧪 sample emails =", (data?.users || []).slice(0, 3).map(u => u.email));
 
 
     res.json({
@@ -249,13 +263,19 @@ app.get('/api/health/supabase', async (req, res) => {
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    console.error('🔴 Health check Supabase KO:', error.message);
-    res.status(500).json({
+    log.error('🔴 Health check Supabase KO:', error);
+
+    if (IS_PROD) {
+      return res.status(500).json({ ok: false, error: "SUPABASE_UNAVAILABLE" });
+    }
+
+    return res.status(500).json({
       ok: false,
-      error: 'Supabase indisponible',
-      details: error.message
+      error: "Supabase indisponible",
+      details: error.message,
     });
   }
+
 });
 
 
@@ -812,7 +832,7 @@ function validateCSRF(req, res, next) {
   // On protège uniquement les méthodes qui modifient
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
 
-  console.log("🧪 CSRF CHECK", {
+  log.debug("🧪 CSRF CHECK", {
     method: req.method,
     path: req.path,
     url: req.url,
@@ -845,7 +865,7 @@ function validateCSRF(req, res, next) {
   const cookieToken = req.cookies['XSRF-TOKEN'];
 
   if (!headerToken || !cookieToken || headerToken !== cookieToken) {
-    console.log("🚨 CSRF Token invalide", {
+    log.warn("🚨 CSRF Token invalide", {
       method: req.method,
       path: req.path,
       url: req.url,
@@ -879,7 +899,7 @@ function ensureCsrfToken(req, res, next) {
 
     return next();
   } catch (e) {
-    console.error("❌ ensureCsrfToken error:", e);
+    log.error("❌ ensureCsrfToken error:", e);
     return next();
   }
 }
@@ -912,7 +932,7 @@ if (process.env.NODE_ENV === "production") {
 }
 
 if (process.env.NODE_ENV !== "production") {
-  app.get("/dev/recovery-link", async (req, res) => {
+  app.get("/dev/recovery-link", devOnly, async (req, res) => {
     try {
       const email = String(req.query.email || "").trim().toLowerCase();
       if (!email) return res.status(400).json({ error: "email manquant" });
@@ -954,21 +974,31 @@ app.use((error, req, res, next) => {
 });
 
 
-// ✅ CONFIG FRONT 
+// ✅ CONFIG FRONT (prod-safe)
 app.get("/config.js", (req, res) => {
-  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
-
-  // ✅ Autoriser explicitement le chargement cross-origin du script
-  res.setHeader("Access-Control-Allow-Origin", "*");
-
-  // ✅ Évite certains blocages CORP/COEP
-  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-
-  // (optionnel mais safe)
-  res.setHeader("Cache-Control", "no-store");
-
   const SUPABASE_URL = process.env.SUPABASE_URL || "";
   const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
+
+  // Autorise uniquement ton front + local
+  const allowedOrigins = new Set([
+    "https://integora-frontend.vercel.app",
+    "http://localhost:3000",
+  ]);
+
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else {
+    // Si pas d'Origin (ex: curl) => on ne met PAS ACAO:*
+    // et si origin inconnu => pas de cross-origin
+  }
+
+  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+
+  // Optionnel : évite certains blocages, ok à garder
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
 
   res.send(`
     window.APP_CONFIG = {
@@ -1099,7 +1129,7 @@ const ROUTES_PROPRES = {
 
 app.get("/:page", async (req, res) => {
   try {
-    console.log("ROUTE_SLUG_OK =>", req.path);
+    log.debug("ROUTE_SLUG_OK =>", req.path);
 
     const slug = String(req.params.page || "").replace(".html", "").toLowerCase();
     const config = ROUTES_PROPRES[slug];
@@ -1109,7 +1139,6 @@ app.get("/:page", async (req, res) => {
 
     // 1) slug inconnu => 404
     if (!config) {
-      console.log(`🚨 Page inconnue: ${slug}`);
       return res.status(404).sendFile(path.join(__dirname, "../frontend/404.html"));
     }
 
@@ -1126,43 +1155,40 @@ app.get("/:page", async (req, res) => {
     // 3) Pages privées => auth requise
     // Si pas de token du tout => redirection UX vers login (au lieu d'un 401 JSON)
     if (!hasAnyAuthToken(req)) {
-      console.log(`🚨 Accès non authentifié (aucun token): ${slug}`);
+      log.warn(`🚨 Accès non authentifié (aucun token): ${slug}`);
       return res.redirect(`/login?next=/${slug}`);
     }
 
     return authenticateToken(req, res, () => {
       if (!req.user) {
-        console.log(`🚨 Accès non authentifié (token invalide/expiré): ${slug}`);
+        log.warn(`🚨 Accès non authentifié (token invalide/expiré): ${slug}`);
         return res.redirect(`/login?next=/${slug}`);
       }
 
       // 4) Abonnement actif requis
       if (!req.user.has_active_subscription) {
-        console.log(`🚨 Abonnement inactif: ${slug} pour ${req.user.email}`);
+        log.warn(`🚨 Abonnement inactif: ${slug} (${safeUserTag(req.user)})`);
         return res.status(403).sendFile(path.join(__dirname, "../frontend/subscription-expired.html"));
       }
 
       // 5) Contrôle plan (PAGE_MIN_PLAN)
       const pageName = String(fichier).split("/").pop();
       if (!canAccessPageServer(req.user, pageName)) {
-        console.log(`🚨 Plan insuffisant (PAGE_MIN_PLAN): ${slug} pour ${req.user.email}`);
         return res.redirect(302, "/403.html");
       }
 
       // 6) Serve page privée
       const filePathPriv = path.join(__dirname, `../frontend/app/${fichier}.html`);
       if (!fs.existsSync(filePathPriv)) {
-        console.log(`🚨 Fichier introuvable: ${filePathPriv}`);
         return res.status(404).sendFile(path.join(__dirname, "../frontend/404.html"));
       }
 
-      console.log(`✅ Accès autorisé: ${slug} (${fichier}) pour ${req.user.email}`);
       return res.sendFile(filePathPriv);
     });
 
 
   } catch (error) {
-    console.error("💥 Erreur route universelle:", error);
+    log.error("💥 Erreur route universelle:", error);
     return res.status(500).sendFile(path.join(__dirname, "../frontend/500.html"));
   }
 });
@@ -1284,7 +1310,7 @@ async function syncStripeCustomerBillingFromDb({ userId, stripeCustomerId, requi
     .maybeSingle();
 
   if (profErr) {
-    console.warn("⚠️ syncStripeCustomerBillingFromDb: profiles read error:", profErr);
+    log.warn("⚠️ syncStripeCustomerBillingFromDb: profiles read error:", profErr);
     if (requireComplete) throw new Error("Erreur lecture profil/entreprise");
     return { ok: false, reason: "db_read_error" };
   }
@@ -1434,7 +1460,6 @@ async function getActiveSubscription(userId) {
     .single();
 
   if (error || !sub) {
-    console.log('❌ [SUBSCRIPTION] Aucun abonnement trouvé, fallback trial');
     return {
       plan: 'trial',
       hasActiveSubscription: false,
@@ -1505,17 +1530,16 @@ async function applyPendingPrepaymentIfNeeded(userId) {
     });
 
     if (error) {
-      console.warn("⚠️ apply_pending_prepayment error:", error.message);
+      log.warn("⚠️ apply_pending_prepayment error:", error.message);
       return { ok: false, reason: "rpc_error" };
     }
 
     if (data?.ok) {
-      console.log("✅ Prépayment appliqué automatiquement:", data);
     }
 
     return data ?? { ok: false, reason: "no_data" };
   } catch (e) {
-    console.warn("⚠️ applyPendingPrepaymentIfNeeded exception:", e);
+    log.warn("⚠️ applyPendingPrepaymentIfNeeded exception:", e);
     return { ok: false, reason: "exception" };
   }
 }
@@ -1595,7 +1619,7 @@ async function resolveUserFromCookie(req) {
     .maybeSingle(); // ✅ pas de throw si 0 ligne
 
   if (sessionError || !session) {
-    console.warn("❌ INVALID_SESSION", {
+    log.warn("❌ INVALID_SESSION", {
       sessionError: sessionError?.message,
       user_id: decoded.id,
     });
@@ -1606,7 +1630,7 @@ async function resolveUserFromCookie(req) {
   if (session.expires_at) {
     const expiresMs = Date.parse(session.expires_at);
     if (Number.isFinite(expiresMs) && expiresMs < Date.now()) {
-      console.warn("⏳ Session expirée (token_sessions)", { expires_at: session.expires_at });
+      log.warn("⏳ Session expirée (token_sessions)", { expires_at: session.expires_at });
       throw new Error("INVALID_SESSION");
     }
   }
@@ -1633,7 +1657,7 @@ async function resolveUserFromCookie(req) {
 
 
   if (profileResult.error || !profileResult.data) {
-    console.warn("❌ PROFILE_NOT_FOUND", {
+    log.warn("❌ PROFILE_NOT_FOUND", {
       error: profileResult.error?.message,
       user_id: decoded.id,
     });
@@ -1659,15 +1683,6 @@ async function resolveUserFromCookie(req) {
 async function authenticateToken(req, res, next) {
   try {
     req.user = await resolveUserFromCookie(req);
-
-    console.log(
-      "✅ AUTH RÉUSSIE - User:",
-      req.user.email,
-      "Plan:",
-      req.user.subscription_type,
-      "Actif:",
-      req.user.has_active_subscription
-    );
 
     next();
   } catch (error) {
@@ -1779,11 +1794,11 @@ const PREMIUM_PREPAY_PRICE_ID =
     ? (process.env.PREMIUM_PREPAY_PRICE_ID_LIVE || "")
     : (process.env.PREMIUM_PREPAY_PRICE_ID_TEST || "");
 
-if (!STRIPE_SECRET_KEY) console.error("❌ Missing STRIPE secret key (resolved)");
-if (!STRIPE_PRICE_STANDARD) console.error("❌ Missing STRIPE standard price (resolved)");
-if (!STRIPE_PRICE_PREMIUM) console.error("❌ Missing STRIPE premium price (resolved)");
-if (!STANDARD_PREPAY_PRICE_ID) console.error("❌ Missing STANDARD_PREPAY price id (resolved)");
-if (!PREMIUM_PREPAY_PRICE_ID) console.error("❌ Missing PREMIUM_PREPAY price id (resolved)");
+if (!STRIPE_SECRET_KEY) log.error("❌ Missing STRIPE secret key (resolved)");
+if (!STRIPE_PRICE_STANDARD) log.error("❌ Missing STRIPE standard price (resolved)");
+if (!STRIPE_PRICE_PREMIUM) log.error("❌ Missing STRIPE premium price (resolved)");
+if (!STANDARD_PREPAY_PRICE_ID) log.error("❌ Missing STANDARD_PREPAY price id (resolved)");
+if (!PREMIUM_PREPAY_PRICE_ID) log.error("❌ Missing PREMIUM_PREPAY price id (resolved)");
 
 const stripe = require("stripe")(STRIPE_SECRET_KEY);
 
@@ -1792,7 +1807,6 @@ const stripe = require("stripe")(STRIPE_SECRET_KEY);
 // ✅ ROUTE POUR RÉCUPÉRER L'ABONNEMENT UTILISATEUR
 app.get('/api/my-subscription', authenticateToken, async (req, res) => {
   try {
-    console.log('📡 [SERVER] Récupération abonnement pour user:', req.user.id);
 
     const userId = req.user.id;
 
@@ -1805,22 +1819,16 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
 
     if (error) {
       if (error.code === 'PGRST116') { // Aucune ligne trouvée
-        console.log('📭 [SERVER] Aucun abonnement trouvé pour user:', userId);
         return res.status(404).json({
           error: 'Aucun abonnement trouvé',
           user_id: userId
         });
       }
-      console.error('❌ [SERVER] Erreur Supabase:', error);
+      log.error('❌ [SERVER] Erreur Supabase:', error);
       return res.status(500).json({ error: 'Erreur base de données' });
     }
 
-    console.log('✅ [SERVER] Abonnement trouvé:', {
-      user_id: userId,
-      plan: subscription.plan,
-      status: subscription.status,
-      period_end: subscription.current_period_end
-    });
+
 
     // ✅ info prépaiement (année suivante)
     const { data: prepaid, error: prepaidErr } = await supabaseAdmin
@@ -1832,7 +1840,7 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
       .maybeSingle();
 
 
-    if (prepaidErr) console.warn("⚠️ prepaid query:", prepaidErr);
+    if (prepaidErr) log.warn("⚠️ prepaid query:", prepaidErr);
 
     const period_end = subscription.current_period_end || subscription.trial_end || null;
 
@@ -1854,7 +1862,7 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ [SERVER] Erreur récupération abonnement:', error);
+    log.error('❌ [SERVER] Erreur récupération abonnement:', error);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -1909,7 +1917,7 @@ app.get("/api/payment-method/status", authenticateToken, async (req, res) => {
       subscriptionDefaultPm,
     });
   } catch (e) {
-    console.error("❌ /api/payment-method/status:", e);
+    log.error("❌ /api/payment-method/status:", e);
     return res.status(500).json({ error: "Erreur status paiement" });
   }
 });
@@ -1918,95 +1926,109 @@ app.get("/api/payment-method/status", authenticateToken, async (req, res) => {
 
 
 
-
-// ✅ ROUTE POUR CONFIRMER LA SUPPRESSION (via le lien email)
-// Dans ta route /api/request-account-deletion
-app.post('/api/request-account-deletion', authenticateToken, async (req, res) => {
+app.post("/api/request-account-deletion", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const { email } = req.body;
 
-    console.log('📧 [SERVER] Demande suppression compte user:', userId);
-
     // Vérifier l'email
     if (email !== req.user.email) {
-      return res.status(400).json({ error: 'Email incorrect' });
+      return res.status(400).json({ error: "Email incorrect" });
     }
 
-    // 🔥 GÉNÉRER UN TOKEN DE SUPPRESSION
+    // 🔥 Générer un token de suppression
     const deletionToken = jwt.sign(
       {
         user_id: userId,
-        email: email,
-        action: 'delete_account',
-        timestamp: Date.now()
+        email,
+        action: "delete_account",
+        timestamp: Date.now(),
       },
       process.env.JWT_SECRET,
-      { expiresIn: '1h' }
+      { expiresIn: "1h" }
     );
 
-    // 🔥 CONSTRUIRE LE LIEN DE CONFIRMATION
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    // 🔥 Construire le lien de confirmation
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
     const confirmationLink = `${frontendUrl}/confirm-deletion.html?token=${deletionToken}`;
 
-    console.log('🔗 [SERVER] Lien généré:', confirmationLink);
-
-    // 🔥 APPEL EDGE FUNCTION AVEC SERVICE ROLE KEY
-    console.log('📡 [SERVER] Appel Edge Function...');
-
-    const edgeResponse = await fetch(`${process.env.SUPABASE_URL}/functions/v1/send-deletion-email`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        user_id: userId,
-        email: email,
-        confirmation_link: confirmationLink
-      })
-    });
-
-    console.log('📡 [SERVER] Réponse Edge Function status:', edgeResponse.status);
+    // 🔥 Appel Edge Function
+    const edgeResponse = await fetch(
+      `${process.env.SUPABASE_URL}/functions/v1/send-deletion-email`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          user_id: userId,
+          email,
+          confirmation_link: confirmationLink,
+        }),
+      }
+    );
 
     const edgeResult = await edgeResponse.json();
-    console.log('📡 [SERVER] Réponse Edge Function:', edgeResult);
 
+    // ❌ Edge a échoué
     if (!edgeResponse.ok) {
-      console.error('❌ [SERVER] Erreur Edge Function:', edgeResult);
+      log.error("❌ [SERVER] Erreur Edge Function:", edgeResult);
 
-      // ⚠️ MODE SECOURS : Retourner le lien directement
+      // ✅ PROD : ne jamais renvoyer le lien
+      if (IS_PROD) {
+        return res.status(502).json({
+          success: false,
+          error: "EMAIL_SEND_FAILED",
+          message:
+            "Impossible d’envoyer l’email de confirmation. Réessayez dans quelques minutes.",
+        });
+      }
+
+      // ✅ DEV uniquement : on peut renvoyer le lien pour débug
       return res.json({
         success: true,
-        message: 'Lien de suppression généré (mode secours)',
+        message: "Lien de suppression généré (dev uniquement)",
         link: confirmationLink,
-        test_mode: true
+        test_mode: true,
       });
     }
 
-    console.log('✅ [SERVER] Email envoyé avec succès');
-
-    res.json({
+    // ✅ OK : email envoyé
+    return res.json({
       success: true,
-      message: 'Email de confirmation envoyé'
+      message: "Email de confirmation envoyé",
     });
-
   } catch (error) {
-    console.error('❌ [SERVER] Erreur demande suppression:', error);
+    log.error("❌ [SERVER] Erreur demande suppression:", error);
 
-    // ⚠️ MODE SECOURS EN CAS D'ERREUR
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    // ✅ PROD : pas de détails techniques, pas de lien
+    if (IS_PROD) {
+      return res.status(500).json({
+        success: false,
+        error: "SERVER_ERROR",
+        message:
+          "Une erreur est survenue. Réessayez dans quelques minutes.",
+      });
+    }
+
+    // DEV : fallback lien (optionnel)
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
     const confirmationLink = `${frontendUrl}/confirm-deletion.html?token=fallback_${Date.now()}`;
 
-    res.json({
+    return res.json({
       success: true,
-      message: 'Lien de suppression généré (mode erreur)',
+      message: "Lien de suppression généré (dev uniquement)",
       link: confirmationLink,
       test_mode: true,
-      error: error.message
+      error: error.message,
     });
   }
 });
+
+
+
+
 
 // ✅ ROUTE POUR CONFIRMER LA SUPPRESSION (AVEC ARCHIVAGE)
 app.post('/api/confirm-account-deletion', async (req, res) => {
@@ -2027,7 +2049,6 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
     const userId = decoded.user_id;
     const userEmail = decoded.email;
 
-    console.log('🚨 [SERVER] Confirmation suppression user:', userId);
 
     // 🔥 1. RÉCUPÉRER TOUTES LES DONNÉES POUR ARCHIVAGE
     const { data: profileData } = await supabaseAdmin
@@ -2081,7 +2102,7 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
       });
 
     if (archiveError) {
-      console.error('❌ [SERVER] Erreur archivage:', archiveError);
+      log.error('❌ [SERVER] Erreur archivage:', archiveError);
     }
 
     // 🔥 3. SUPPRIMER L'ABONNEMENT STRIPE
@@ -2094,7 +2115,7 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
         }
       }
     } catch (stripeError) {
-      console.warn('⚠️ [SERVER] Erreur nettoyage Stripe:', stripeError);
+      log.warn('⚠️ [SERVER] Erreur nettoyage Stripe:', stripeError);
     }
 
     // 🔥 4. SUPPRESSION DES DONNÉES (dans l'ordre logique)
@@ -2114,11 +2135,10 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
     const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(userId);
 
     if (deleteError) {
-      console.error('❌ [SERVER] Erreur suppression user auth:', deleteError);
+      log.error('❌ [SERVER] Erreur suppression user auth:', deleteError);
       return res.status(500).json({ error: 'Erreur suppression compte' });
     }
 
-    console.log('✅ [SERVER] Compte archivé et supprimé user:', userId);
 
     res.json({
       success: true,
@@ -2128,7 +2148,7 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ [SERVER] Erreur confirmation suppression:', error);
+    log.error('❌ [SERVER] Erreur confirmation suppression:', error);
 
     if (error.name === 'TokenExpiredError') {
       return res.status(400).json({ error: 'Lien expiré, veuillez refaire une demande' });
@@ -2192,16 +2212,7 @@ async function retrieveProrationPreview(stripe, {
 }) {
   const now = Math.floor(Date.now() / 1000);
 
-  console.log("🔍 CHANGE PLAN LIVE CHECK", {
-    stripeMode: STRIPE_MODE,
-    user_id: userId,
-    customerId,
-    subscriptionId,
-    subscriptionItemId,
-    currentPrice: currentPriceId || null,
-    targetPrice: newPriceId,
-    isLiveKey: STRIPE_SECRET_KEY?.startsWith("sk_live"),
-  });
+
 
   const preview = await stripe.invoices.createPreview({
     customer: customerId,
@@ -2235,7 +2246,7 @@ async function ensureStripeCustomer({ userId, email, existingCustomerId }) {
         err?.raw?.code === "resource_missing" ||
         err?.type === "StripeInvalidRequestError";
       if (!isMissing) throw err;
-      console.warn("⚠️ Stripe customer introuvable dans ce mode, on recrée", {
+      log.warn("⚠️ Stripe customer introuvable dans ce mode, on recrée", {
         userId,
         existingCustomerId,
       });
@@ -2325,10 +2336,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
 
     // 3) Si DB customer != Stripe customer, on resync DB (optionnel mais top)
     if (customerId !== subCustomerId) {
-      console.log("🛠️ Resync stripe_customer_id from subscription.customer", {
-        dbCustomerId: customerId,
-        stripeCustomerId: subCustomerId,
-      });
+
 
       await supabaseAdmin
         .from("subscriptions")
@@ -2355,7 +2363,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       if (e?.code === "BILLING_INCOMPLETE") {
         return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
       }
-      console.error("❌ sync billing (change-plan) error:", e);
+      log.error("❌ sync billing (change-plan) error:", e);
       return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
     }
 
@@ -2392,7 +2400,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
         receiptEmail = customer.email || null;
       }
     } catch (e) {
-      console.warn("⚠️ Unable to retrieve customer email for Stripe receipt:", e);
+      log.warn("⚠️ Unable to retrieve customer email for Stripe receipt:", e);
     }
 
     const contactName = await getContactNameFromProfiles(userId);
@@ -2457,7 +2465,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
 
     return res.json({ url: session.url });
   } catch (e) {
-    console.error("❌ change-plan checkout error", {
+    log.error("❌ change-plan checkout error", {
       message: e?.message,
       type: e?.type,
       code: e?.code,
@@ -2506,7 +2514,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       .limit(1);
 
     if (prepayErr) {
-      console.error("❌ prepay-next-year pending check error:", prepayErr);
+      log.error("❌ prepay-next-year pending check error:", prepayErr);
       return res.status(500).json({ error: "Erreur vérification prépaiement" });
     }
 
@@ -2542,7 +2550,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       if (e?.code === "BILLING_INCOMPLETE") {
         return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
       }
-      console.error("❌ sync billing (prepay) error:", e);
+      log.error("❌ sync billing (prepay) error:", e);
       return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
     }
 
@@ -2577,7 +2585,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
         receiptEmail = customer.email || null;
       }
     } catch (e) {
-      console.warn("⚠️ Unable to retrieve customer email for Stripe receipt:", e);
+      log.warn("⚠️ Unable to retrieve customer email for Stripe receipt:", e);
     }
 
 
@@ -2593,7 +2601,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       .maybeSingle();
 
     if (pendingErr) {
-      console.error("prepay_next_year: lookup pending error", pendingErr);
+      log.error("prepay_next_year: lookup pending error", pendingErr);
       return res.status(500).json({ error: "pending_lookup_failed" });
     }
 
@@ -2627,7 +2635,6 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     const prepayPriceId =
       plan === "premium" ? PREMIUM_PREPAY_PRICE_ID : STANDARD_PREPAY_PRICE_ID;
 
-    console.log("🧪 prepay resolved", { STRIPE_MODE, plan, prepayPriceId });
 
     if (!prepayPriceId) {
       return res.status(500).json({
@@ -2676,7 +2683,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
 
 
   } catch (err) {
-    console.error("❌ prepay-next-year error:", err);
+    log.error("❌ prepay-next-year error:", err);
     return res.status(500).json({ error: "Erreur création session Stripe" });
   }
 });
@@ -2733,7 +2740,7 @@ app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res)
     });
 
   } catch (err) {
-    console.error("❌ toggle-renewal error:", err);
+    log.error("❌ toggle-renewal error:", err);
     res.status(500).json({ error: "Erreur renouvellement" });
   }
 });
@@ -2808,13 +2815,13 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
           code: "BILLING_INCOMPLETE",
         });
       }
-      console.error("❌ sync billing (subscribe/session) error:", e);
+      log.error("❌ sync billing (subscribe/session) error:", e);
       return res.status(500).json({ ok: false, error: "Erreur sync facturation (Stripe)" });
     }
 
 
     // 🧪 DEBUG
-    console.log("🧪 SUBSCRIBE DEBUG (/api/subscribe/session)", {
+    log.debug("🧪 SUBSCRIBE DEBUG (/api/subscribe/session)", {
       desiredPlan,
       priceId,
       customerId,
@@ -2869,7 +2876,7 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
     return res.json({ url: session.url });
 
   } catch (e) {
-    console.error("❌ /api/subscribe/session:", e?.raw?.message || e);
+    log.error("❌ /api/subscribe/session:", e?.raw?.message || e);
     return res.status(500).json({
       error: "Erreur création session Stripe",
       details: e?.raw?.message || e.message
@@ -2913,7 +2920,6 @@ app.post("/login", async (req, res) => {
     }
 
     if (!isProduction) {
-      console.log("🔐 Tentative de connexion (opaque) pour:", String(email).trim().toLowerCase());
     }
 
     // ✅ 1) AUTHENTIFICATION avec client AUTH
@@ -2926,7 +2932,6 @@ app.post("/login", async (req, res) => {
     // 🚫 Toujours opaque : jamais renvoyer authError.message
     if (authError || !authData?.user) {
       if (!isProduction) {
-        console.log("❌ Login refusé (opaque). Reason:", authError?.message || "no_user");
       }
       return res.status(401).json({
         success: false,
@@ -3004,7 +3009,7 @@ app.post("/login", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("💥 Erreur login:", error);
+    log.error("💥 Erreur login:", error);
     return res.status(500).json({
       success: false,
       error: "Erreur serveur lors de la connexion.",
@@ -3013,28 +3018,13 @@ app.post("/login", async (req, res) => {
 });
 
 
-// ✅ ROUTE DE DEBUG COOKIES
-app.get("/api/debug-cookies", (req, res) => {
-
-
-  res.json({
-    cookies: req.cookies,
-    headers: req.headers,
-    message: "Debug cookies"
-  });
-});
-
 // 🧪 ROUTE DE TEST - À ajouter temporairement
 app.post("/test-supabase", async (req, res) => {
 
   const { email, password } = req.body;
 
   try {
-    // Test 1: Vérifier la configuration Supabase
-    console.log("🔧 Configuration Supabase:", {
-      url: process.env.SUPABASE_URL ? "✅ Définie" : "❌ Manquante",
-      key: process.env.SUPABASE_SERVICE_ROLE_KEY ? "✅ Définie" : "❌ Manquante"
-    });
+
 
     // Test 2: Tester l'authentification
     const { data, error } = await supabase.auth.signInWithPassword({
@@ -3042,15 +3032,10 @@ app.post("/test-supabase", async (req, res) => {
       password: password || "test123"
     });
 
-    console.log("📋 Résultat test auth:", {
-      success: !error,
-      error: error?.message,
-      user_id: data?.user?.id
-    });
+
 
     // Test 3: Vérifier si l'utilisateur existe dans auth.users
     if (email) {
-      console.log("🔍 Recherche utilisateur dans auth.users...");
       // Note: On ne peut pas directement query auth.users, donc on teste avec signIn
     }
 
@@ -3067,28 +3052,13 @@ app.post("/test-supabase", async (req, res) => {
     });
 
   } catch (error) {
-    console.log("💥 Erreur test:", error);
-    res.status(500).json({ error: error.message });
+    log.error("❌ Erreur serveur:", error);
+    if (IS_PROD) return res.status(500).json({ error: "SERVER_ERROR" });
+    return res.status(500).json({ error: error.message });
   }
 });
 
 
-// 🧪 ROUTE TEST COOKIE - À AJOUTER AVANT /verify-token
-app.post("/test-cookie", (req, res) => {
-
-  if (req.cookies?.auth_token) {
-    try {
-      const decoded = jwt.verify(req.cookies.auth_token, SECRET_KEY);
-      console.log('✅ [TEST] Token JWT valide:', decoded);
-      return res.json({ valid: true, hasCookie: true, tokenValid: true });
-    } catch (error) {
-      console.log('❌ [TEST] Token JWT invalide:', error.message);
-      return res.json({ valid: false, hasCookie: true, tokenValid: false });
-    }
-  }
-
-  res.json({ valid: false, hasCookie: false, tokenValid: false });
-});
 
 
 // 📌 VÉRIFICATION DU TOKEN
@@ -3112,7 +3082,6 @@ app.get('/api/test-service-role', async (req, res) => {
       .select('count')
       .limit(1);
 
-    console.log('🔑 Test Service Role - Lecture:', testError ? '❌ ' + testError.message : '✅ Succès');
 
     // Test 2: Écriture
     const { error: insertError } = await supabase
@@ -3124,7 +3093,6 @@ app.get('/api/test-service-role', async (req, res) => {
         is_active: true
       });
 
-    console.log('🔑 Test Service Role - Écriture:', insertError ? '❌ ' + insertError.message : '✅ Succès');
 
     res.json({
       read: testError ? testError.message : 'OK',
@@ -3132,7 +3100,9 @@ app.get('/api/test-service-role', async (req, res) => {
     });
 
   } catch (error) {
-    res.json({ error: error.message });
+    log.error("❌ Erreur serveur:", error);
+    if (IS_PROD) return res.status(500).json({ error: "SERVER_ERROR" });
+    return res.status(500).json({ error: error.message });
   }
 });
 // ---------------------------
@@ -3148,7 +3118,9 @@ app.get("/test-supabase", async (req, res) => {
       error: error?.message
     });
   } catch (error) {
-    res.json({ error: error.message });
+    log.error("❌ Erreur serveur:", error);
+    if (IS_PROD) return res.status(500).json({ error: "SERVER_ERROR" });
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -3157,7 +3129,6 @@ app.get("/test-supabase", async (req, res) => {
 
 // ✅ Route de santé pour debug
 app.get('/api/health', (req, res) => {
-  console.log('🔧 [API Health] Test route appelée');
   res.json({
     ok: true,
     scope: 'server.js-inline',
@@ -3168,7 +3139,6 @@ app.get('/api/health', (req, res) => {
 
 // ✅ ROUTE MY-PROFILE - VÉRIFIEZ QU'ELLE RETOURNE avatar_url
 app.get('/api/my-profile', authenticateToken, async (req, res) => {
-  console.log('👤 [API My-Profile] Début - User ID:', req.user?.id);
 
   try {
     const { data: profile, error } = await supabase
@@ -3177,11 +3147,7 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
       .eq('user_id', req.user.id)
       .single();
 
-    console.log('📊 [API My-Profile] Résultat Supabase:', {
-      hasData: !!profile,
-      error: error?.message,
-      avatar_url: profile?.avatar_url // ← Doit être présent
-    });
+
 
     if (error || !profile) {
       return res.status(404).json({ error: 'Profil non trouvé' });
@@ -3198,11 +3164,10 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
       avatar_url: profile.avatar_url  // ⚠️ CRITIQUE : toujours inclure
     };
 
-    console.log('✅ [API My-Profile] Succès - avatar_url:', responseData.avatar_url);
     res.json(responseData);
 
   } catch (error) {
-    console.error('💥 [API My-Profile] Exception:', error);
+    log.error('💥 [API My-Profile] Exception:', error);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -3210,7 +3175,6 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
 
 // ✅ Lecture des infos entreprise (companies) -> auto-remplissage profile.html
 app.get("/api/my-company", authenticateToken, async (req, res) => {
-  console.log("🏢 [API My-Company] User ID:", req.user?.id);
 
   try {
     const { data: company, error } = await supabase
@@ -3222,14 +3186,14 @@ app.get("/api/my-company", authenticateToken, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      console.error("❌ [API My-Company] Supabase error:", error);
+      log.error("❌ [API My-Company] Supabase error:", error);
       return res.status(400).json({ ok: false, error: error.message });
     }
 
     // Si pas encore de company : on renvoie un objet vide (pas une 404)
     return res.json(company || {});
   } catch (e) {
-    console.error("💥 [API My-Company] Exception:", e);
+    log.error("💥 [API My-Company] Exception:", e);
     return res.status(500).json({ ok: false, error: "Erreur serveur my-company" });
   }
 });
@@ -3237,8 +3201,6 @@ app.get("/api/my-company", authenticateToken, async (req, res) => {
 
 // ✅ Mise à jour du profil (POST au lieu de PUT pour CSRF)
 app.post('/api/update-profile', authenticateToken, async (req, res) => {
-  console.log('✏️ [API Update-Profile] Début - User ID:', req.user?.id);
-  console.log('📦 [API Update-Profile] Données reçues:', req.body);
 
   try {
     const { firstName, lastName, phone, companyId } = req.body;
@@ -3254,7 +3216,6 @@ app.post('/api/update-profile', authenticateToken, async (req, res) => {
       updated_at: new Date().toISOString()
     };
 
-    console.log('🔄 [API Update-Profile] Données à mettre à jour:', updateData);
 
     const { data, error } = await supabase
       .from('profiles')
@@ -3264,14 +3225,13 @@ app.post('/api/update-profile', authenticateToken, async (req, res) => {
       .single();
 
     if (error) {
-      console.error('❌ [API Update-Profile] Erreur Supabase:', error);
+      log.error('❌ [API Update-Profile] Erreur Supabase:', error);
       return res.status(400).json({
         ok: false,
         error: 'Échec de la mise à jour: ' + error.message
       });
     }
 
-    console.log('✅ [API Update-Profile] Succès - Données mises à jour:', data);
     res.json({
       ok: true,
       message: 'Profil mis à jour avec succès',
@@ -3284,7 +3244,7 @@ app.post('/api/update-profile', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('💥 [API Update-Profile] Exception:', error);
+    log.error('💥 [API Update-Profile] Exception:', error);
     res.status(500).json({
       ok: false,
       error: 'Erreur serveur lors de la mise à jour du profil'
@@ -3295,8 +3255,6 @@ app.post('/api/update-profile', authenticateToken, async (req, res) => {
 
 
 app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
-  console.log("🏢 [API update-billing] User:", req.user?.id);
-  console.log("📦 [API update-billing] Body:", req.body);
 
   try {
     const owner_id = req.user.id;
@@ -3438,7 +3396,7 @@ app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
         stripe_synced = true;
       }
     } catch (e) {
-      console.warn("⚠️ Stripe sync skipped (update-billing):", e);
+      log.warn("⚠️ Stripe sync skipped (update-billing):", e);
     }
 
     return res.json({ ok: true, message: "Entreprise mise à jour", company, stripe_synced });
@@ -3446,7 +3404,7 @@ app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
 
     return res.json({ ok: true, message: "Entreprise mise à jour", company });
   } catch (e) {
-    console.error("💥 [API update-billing] Exception:", e);
+    log.error("💥 [API update-billing] Exception:", e);
     return res.status(500).json({ ok: false, error: "Erreur serveur update-billing" });
   }
 });
@@ -3643,13 +3601,13 @@ app.get("/api/my-avatar-url", authenticateToken, async (req, res) => {
 
     if (signErr) {
       // 🔎 te donne un log explicite pour ne plus être dans le flou
-      console.error("❌ /api/my-avatar-url createSignedUrl error:", signErr, "path:", path);
+      log.error("❌ /api/my-avatar-url createSignedUrl error:", signErr, "path:", path);
       return res.status(500).json({ ok: false, error: signErr.message, path });
     }
 
     return res.json({ ok: true, url: signed.signedUrl, path });
   } catch (e) {
-    console.error("💥 /api/my-avatar-url exception:", e);
+    log.error("💥 /api/my-avatar-url exception:", e);
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -3710,7 +3668,6 @@ app.get('/api/public/preview/*', async (req, res) => {
 
     const { data, error } = await supabase.storage.from('public').download(pathInBucket);
     if (error || !data) {
-      console.log('❌ [Public Preview] Fichier non trouvé:', pathInBucket);
       return res.status(404).send('Not found');
     }
 
@@ -3719,7 +3676,6 @@ app.get('/api/public/preview/*', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     return res.send(Buffer.from(await data.arrayBuffer()));
   } catch (e) {
-    console.error('💥 [Public Preview] Erreur:', e);
     return res.status(500).send('Server error');
   }
 });
@@ -3739,7 +3695,6 @@ app.get('/api/assets/:id', authenticateToken, async (req, res) => {
     );
 
     if (assetErr || !asset || !asset.is_active) {
-      console.log('❌ [Protected Asset] Asset non trouvé ou inactif:', assetId);
       return serveFallbackImage(res);
     }
 
@@ -3751,7 +3706,6 @@ app.get('/api/assets/:id', authenticateToken, async (req, res) => {
     );
 
     if (dlErr || !file) {
-      console.log('❌ [Protected Asset] Erreur download:', dlErr);
       return serveFallbackImage(res);
     }
 
@@ -3766,14 +3720,13 @@ app.get('/api/assets/:id', authenticateToken, async (req, res) => {
     return res.send(buf);
 
   } catch (error) {
-    console.error('💥 [Protected Asset] Erreur finale:', error);
+    log.error('💥 [Protected Asset] Erreur finale:', error);
     return serveFallbackImage(res);
   }
 });
 
 // 🖼️ FONCTION FALLBACK MANQUANTE - AJOUTE-LA !
 function serveFallbackImage(res) {
-  console.log('🔄 Utilisation de l\'image de fallback');
   return res.status(404).json({
     error: 'Asset non disponible',
     code: 'ASSET_NOT_FOUND'
@@ -3805,12 +3758,7 @@ function toIsoFromStripeTs(ts) {
 
 
 app.post("/api/start-paid-checkout", async (req, res) => {
-  console.log("🟡 [START-PAID] Reçu:", JSON.stringify(req.body, null, 2));
-  console.log("🧾 [START-PAID] STRIPE_MODE =", STRIPE_MODE);
-  console.log("🧾 [START-PAID] STRIPE_SECRET_KEY starts live =", STRIPE_SECRET_KEY?.startsWith("sk_live"));
-  console.log("🧾 [START-PAID] STRIPE_SECRET_KEY starts test =", STRIPE_SECRET_KEY?.startsWith("sk_test"));
-  console.log("🧾 [START-PAID] HOST =", req.headers.host);
-  console.log("🧾 [START-PAID] ORIGIN =", req.headers.origin);
+
 
   try {
     const emailNorm = normalizeEmail(req.body?.email);
@@ -3928,7 +3876,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       .maybeSingle();
 
     if (existingErr) {
-      console.error("❌ pending_signups select error:", existingErr);
+      log.error("❌ pending_signups select error:", existingErr);
       return res.status(500).json({ error: "Erreur lecture pending_signups", details: existingErr.message });
     }
 
@@ -3937,7 +3885,6 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     if (existingPending) {
       pending_id = existingPending.id;
 
-      console.log("ℹ️ pending existant réutilisé:", pending_id);
 
       // Optionnel mais utile : mettre à jour les infos du pending (si l'utilisateur a changé)
       const { error: updErr } = await supabaseAdmin
@@ -3962,7 +3909,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
         .eq("id", pending_id);
 
       if (updErr) {
-        console.error("❌ pending_signups update error:", updErr);
+        log.error("❌ pending_signups update error:", updErr);
         return res.status(500).json({ error: "Erreur update pending_signup", details: updErr.message });
       }
 
@@ -3992,12 +3939,11 @@ app.post("/api/start-paid-checkout", async (req, res) => {
         .single();
 
       if (pendingErr || !pending) {
-        console.error("❌ pending_signups insert error:", pendingErr);
+        log.error("❌ pending_signups insert error:", pendingErr);
         return res.status(500).json({ error: "Impossible de créer pending_signup", details: pendingErr?.message });
       }
 
       pending_id = pending.id;
-      console.log("✅ pending créé:", pending_id);
     }
 
     // ✅ 2) Price mapping (ENV)
@@ -4110,7 +4056,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
 
     if (sessUpdErr) {
-      console.error("❌ pending_signups update stripe_session_id error:", sessUpdErr);
+      log.error("❌ pending_signups update stripe_session_id error:", sessUpdErr);
       return res.status(500).json({ error: "Erreur update stripe_session_id", details: sessUpdErr.message });
     }
 
@@ -4121,7 +4067,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     });
 
   } catch (e) {
-    console.error("❌ [START-PAID] error:", e);
+    log.error("❌ [START-PAID] error:", e);
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
@@ -4129,7 +4075,6 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
 
 app.post("/api/complete-signup", async (req, res) => {
-  console.log("🟢 [COMPLETE] Reçu:", JSON.stringify(req.body, null, 2));
 
   try {
     const { pending_id, session_id } = req.body;
@@ -4214,11 +4159,16 @@ app.post("/api/complete-signup", async (req, res) => {
           return res.status(500).json({ error: "Missing set_password_link" });
         }
 
+        if (!devToolsAllowed(req)) {
+          return res.json({ ok: true, account_exists: true });
+        }
+
         return res.json({
           ok: true,
           account_exists: true,
           set_password_link: setPasswordLink,
         });
+
       }
 
       // autres erreurs -> on garde 409
@@ -4254,15 +4204,13 @@ app.post("/api/complete-signup", async (req, res) => {
     });
 
   } catch (e) {
-    console.error("❌ [COMPLETE] error:", e);
+    log.error("❌ [COMPLETE] error:", e);
     return res.status(500).send(`Erreur complete-signup: ${e.message}`);
   }
 });
 
 //remplir table subscriptions quand la personne clique sur le mail
 app.post("/api/finalize-pending", async (req, res) => {
-  console.log("🟦 FINALIZE-PENDING HIT");
-  console.log("🟦 FINALIZE body:", JSON.stringify(req.body));
 
   try {
     const pending_id = String(req.body?.pending_id || "").trim();
@@ -4271,22 +4219,17 @@ app.post("/api/finalize-pending", async (req, res) => {
     // 1) Vérifier session Supabase (user connecté via lien email)
     const auth = req.headers.authorization || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-    console.log("🧪 FINALIZE auth header present:", Boolean(auth));
-    console.log("🧪 FINALIZE token length:", token ? token.length : 0);
-    console.log("🧪 FINALIZE token preview:", token ? token.slice(0, 20) + "..." : "null");
+    log.debug("🧪 FINALIZE auth header present:", Boolean(auth));
+    log.debug("🧪 FINALIZE token length:", token ? token.length : 0);
 
     if (!token) return res.status(401).json({ error: "Missing bearer token" });
 
     // ✅ AJOUT ICI
     const payload = decodeJwtPayload(token);
-    console.log("🧪 FINALIZE jwt iss:", payload?.iss);
-    console.log("🧪 FINALIZE jwt sub:", payload?.sub);
-    console.log("🧪 FINALIZE jwt aud:", payload?.aud);
-    console.log("🧪 FINALIZE jwt exp:", payload?.exp);
 
     // puis ton getUser existant
     const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
-    console.log("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
+    log.debug("🧪 FINALIZE getUser has user:", Boolean(userData?.user));
 
 
     const user = userData?.user;
@@ -4299,9 +4242,7 @@ app.post("/api/finalize-pending", async (req, res) => {
       .eq("id", pending_id)
       .single();
 
-    console.log("🟦 FINALIZE pending.desired_plan:", pending?.desired_plan);
-    console.log("🟦 FINALIZE pending.user_id:", pending?.user_id);
-    console.log("🟦 FINALIZE user.id (auth):", user.id);
+    log.debug("🟦 FINALIZE pending.desired_plan:", pending?.desired_plan);
 
 
     if (pErr || !pending) return res.status(404).json({ error: "pending introuvable" });
@@ -4353,10 +4294,6 @@ app.post("/api/finalize-pending", async (req, res) => {
       const hasStripeCustomer = !!pending.stripe_customer_id;
       const hasStripeSub = !!pending.stripe_subscription_id;
 
-      console.log("🟦 PAY GATE plan:", plan);
-      console.log("🟦 PAY GATE stripe_customer_id:", pending.stripe_customer_id);
-      console.log("🟦 PAY GATE stripe_subscription_id:", pending.stripe_subscription_id);
-      console.log("🟦 PAY GATE pending.status:", pending.status);
 
       // ✅ Condition “READY” = IDs Stripe présents
       if (!hasStripeCustomer || !hasStripeSub) {
@@ -4418,15 +4355,15 @@ app.post("/api/finalize-pending", async (req, res) => {
       .single();
 
     if (profErr) {
-      console.error("❌ profiles upsert error:", profErr);
+      log.error("❌ profiles upsert error:", profErr);
       return res.status(500).json({ error: `profiles: ${profErr.message}` });
     }
 
 
 
     // 4) Créer subscription AU MOMENT DU CLIC
-    console.log("🟦 FINALIZE desired_plan:", pending.desired_plan);
-    console.log("🟦 FINALIZE will create subscription?", pending.desired_plan === "trial");
+    log.debug("🟦 FINALIZE desired_plan:", pending.desired_plan);
+    log.debug("🟦 FINALIZE will create subscription?", pending.desired_plan === "trial");
 
     if (pending.desired_plan === "trial") {
       const now = new Date();
@@ -4442,7 +4379,6 @@ app.post("/api/finalize-pending", async (req, res) => {
         updated_at: now.toISOString(),
       };
 
-      console.log("🟦 FINALIZE subscriptions upsert payload:", payload);
 
       const { data: subSaved, error: upErr } = await supabaseAdmin
         .from("subscriptions")
@@ -4451,11 +4387,10 @@ app.post("/api/finalize-pending", async (req, res) => {
         .single();
 
       if (upErr) {
-        console.error("❌ subscriptions upsert error:", upErr);
+        log.error("❌ subscriptions upsert error:", upErr);
         return res.status(500).json({ error: `subscriptions: ${upErr.message}` });
       }
 
-      console.log("✅ subscriptions upsert OK:", subSaved);
     } else {
 
       // ✅ Payant (standard/premium) : la subscription doit déjà exister (créée par webhook Stripe)
@@ -4468,7 +4403,6 @@ app.post("/api/finalize-pending", async (req, res) => {
       if (subErr) return res.status(500).json({ error: subErr.message });
 
       if (!subRow) {
-        console.log("🟧 FINALIZE no subscriptions row yet -> creating fallback from pending");
 
         const { data: createdSub, error: createErr } = await supabaseAdmin
           .from("subscriptions")
@@ -4488,11 +4422,11 @@ app.post("/api/finalize-pending", async (req, res) => {
           .single();
 
         if (createErr) {
-          console.error("❌ FINALIZE fallback subscriptions upsert error:", createErr);
+          log.error("❌ FINALIZE fallback subscriptions upsert error:", createErr);
           return res.status(500).json({ error: `subscriptions: ${createErr.message}` });
         }
+        log.debug("FINALIZE upsert subscriptions", { hasPayload: Boolean(payload), plan: payload?.plan });
 
-        console.log("✅ FINALIZE fallback subscriptions created:", createdSub);
       }
 
     }
@@ -4540,9 +4474,12 @@ app.post("/api/finalize-pending", async (req, res) => {
     }
 
 
+    if (!devToolsAllowed(req)) {
+      return res.json({ ok: true });
+    }
     return res.json({ ok: true, set_password_link: setPasswordLink });
   } catch (e) {
-    console.error("❌ /api/finalize-pending:", e);
+    log.error("❌ /api/finalize-pending:", e);
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
@@ -4550,11 +4487,7 @@ app.post("/api/finalize-pending", async (req, res) => {
 
 
 app.post("/api/start-trial-invite", async (req, res) => {
-  console.log("🟣 [TRIAL] Reçu:", JSON.stringify(req.body, null, 2));
-  console.log("[ENV] NODE_ENV =", process.env.NODE_ENV);
-  console.log("[ENV] FRONTEND_URL =", process.env.FRONTEND_URL);
-  console.log("[ENV] SUPABASE_URL =", process.env.SUPABASE_URL);
-  console.log("[ENV] SUPABASE_SERVICE_ROLE_KEY ?", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+
 
   try {
     const emailNorm = normalizeEmail(req.body?.email);
@@ -4621,7 +4554,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
       .maybeSingle();
 
     if (existingErr) {
-      console.error("❌ pending_signups select error:", existingErr);
+      log.error("❌ pending_signups select error:", existingErr);
       return res.status(500).json({ error: "Erreur lecture pending_signups", details: existingErr.message });
     }
 
@@ -4645,7 +4578,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
         .eq("id", pending_id);
 
       if (updErr) {
-        console.error("❌ pending_signups update error:", updErr);
+        log.error("❌ pending_signups update error:", updErr);
         return res.status(500).json({ error: "Erreur update pending_signup trial", details: updErr.message });
       }
 
@@ -4670,7 +4603,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
         .single();
 
       if (pendingErr || !pending) {
-        console.error("❌ pending_signups insert error:", pendingErr);
+        log.error("❌ pending_signups insert error:", pendingErr);
         return res.status(500).json({
           error: "Impossible de créer pending_signup trial",
           details: pendingErr?.message
@@ -4684,8 +4617,6 @@ app.post("/api/start-trial-invite", async (req, res) => {
     // 2) invite email
     const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
     const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
-    console.log("🧪 [TRIAL] pending_id =", pending_id);
-    console.log("🧪 [TRIAL] redirectTo =", redirectTo);
 
     const { data: inviteData, error: inviteErr } =
       await supabaseAdmin.auth.admin.inviteUserByEmail(emailNorm, {
@@ -4702,7 +4633,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
 
     if (inviteErr) {
       const msg = String(inviteErr.message || "");
-      console.error("❌ inviteUserByEmail error:", inviteErr);
+      log.error("❌ inviteUserByEmail error:", inviteErr);
 
       if (msg.toLowerCase().includes("already been registered")) {
         const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
@@ -4726,11 +4657,16 @@ app.post("/api/start-trial-invite", async (req, res) => {
           return res.status(500).json({ error: "Missing set_password_link" });
         }
 
+        if (!devToolsAllowed(req)) {
+          return res.json({ ok: true, account_exists: true });
+        }
+
         return res.json({
           ok: true,
           account_exists: true,
           set_password_link: setPasswordLink,
         });
+
       }
 
       return res.status(409).json({ error: msg });
@@ -4754,7 +4690,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
     });
 
   } catch (e) {
-    console.error("❌ [TRIAL] error:", e);
+    log.error("❌ [TRIAL] error:", e);
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
@@ -4815,11 +4751,16 @@ app.post("/api/resend-activation", async (req, res) => {
           return res.status(500).json({ error: "Missing set_password_link" });
         }
 
+        if (!devToolsAllowed(req)) {
+          return res.json({ ok: true, account_exists: true });
+        }
+
         return res.json({
           ok: true,
           account_exists: true,
           set_password_link: setPasswordLink,
         });
+
       }
 
       // autres erreurs -> on garde 409
@@ -4939,7 +4880,7 @@ app.post(
 
       if (ticketErr) {
         // Log complet côté serveur uniquement
-        console.error("❌ support_tickets insert error:", ticketErr);
+        log.error("❌ support_tickets insert error:", ticketErr);
 
         // Message générique côté client (anti fuite SQL / schéma)
         return res.status(500).json({
@@ -4971,7 +4912,7 @@ app.post(
           .upload(storagePath, f.buffer, { contentType: f.mimetype, upsert: false });
 
         if (upErr) {
-          console.warn("PJ upload error:", upErr.message);
+          log.warn("PJ upload error:", upErr.message);
           continue;
         }
 
@@ -5146,7 +5087,7 @@ app.post(
       return res.json({ ok: true, ticket_id: ticket.id });
 
     } catch (e) {
-      console.error("❌ /api/support/ticket:", e);
+      log.error("❌ /api/support/ticket:", e);
       return res.status(500).json({ error: "Erreur serveur" });
     }
 
@@ -5273,7 +5214,7 @@ app.post("/api/contact/ticket", contactPublicLimiter, async (req, res) => {
       .single();
 
     if (ticketErr) {
-      console.error("❌ contact_tickets insert error:", ticketErr);
+      log.error("❌ contact_tickets insert error:", ticketErr);
       return res.status(500).json({ error: "Erreur technique lors de l'envoi." });
     }
 
@@ -5408,7 +5349,7 @@ app.post("/api/contact/ticket", contactPublicLimiter, async (req, res) => {
     return res.json({ ok: true, ticket_id: ticket.id });
 
   } catch (e) {
-    console.error("❌ /api/contact/ticket:", e);
+    log.error("❌ /api/contact/ticket:", e);
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
@@ -5450,9 +5391,9 @@ app.post("/api/logout", async (req, res) => {
 // Démarrage du serveur
 const FINAL_PORT = process.env.PORT || 3000;
 app.listen(FINAL_PORT, () => {
-  console.log(`🚀 Serveur démarré sur http://localhost:${FINAL_PORT}`);
-  console.log(`📊 Types d'abonnements gérés: ${Object.values(SUBSCRIPTION_TYPES).join(', ')}`);
-  console.log('🛡️ Architecture invisible activée');
-  console.log('🔒 Rate limiting: Activé');
-  console.log('📡 Headers de sécurité: Activés');
+  log.debug(`🚀 Serveur démarré sur http://localhost:${FINAL_PORT}`);
+  log.debug(`📊 Types d'abonnements gérés: ${Object.values(SUBSCRIPTION_TYPES).join(', ')}`);
+  log.debug('🛡️ Architecture invisible activée');
+  log.debug('🔒 Rate limiting: Activé');
+  log.debug('📡 Headers de sécurité: Activés');
 });

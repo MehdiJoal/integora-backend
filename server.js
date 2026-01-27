@@ -909,7 +909,11 @@ function validateCSRF(req, res, next) {
     '/api/contact/ticket'
   ]);
 
+  // ✅ Important : exempt doit être testé sur p (déjà nettoyé)
   if (exempt.has(p)) return next();
+
+  // ✅ Pour debug (tu peux retirer plus tard)
+  log.debug("🛡️ CSRF protected route", { p, method: req.method });
 
   const headerToken = req.headers['x-csrf-token'];
   const cookieToken = req.cookies['XSRF-TOKEN'];

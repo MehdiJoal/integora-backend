@@ -957,6 +957,15 @@ function ensureCsrfToken(req, res, next) {
   }
 }
 
+function requireCsrf(req, res, next) {
+  const headerToken = req.headers["x-csrf-token"];
+  const cookieToken = req.cookies?.["XSRF-TOKEN"];
+
+  if (!headerToken || !cookieToken || headerToken !== cookieToken) {
+    return res.status(403).json({ error: "Token CSRF invalide", code: "CSRF_INVALID" });
+  }
+  return next();
+}
 
 
 // ➕ Monte-les AVANT tes routes protégées
@@ -3268,7 +3277,7 @@ app.get("/api/my-company", authenticateToken, async (req, res) => {
 
 
 // ✅ Mise à jour du profil (POST au lieu de PUT pour CSRF)
-app.post('/api/update-profile', authenticateToken, async (req, res) => {
+app.post('/api/update-profile', authenticateToken, requireCsrf, async (req, res) => {
 
   try {
     const { firstName, lastName, phone, companyId } = req.body;

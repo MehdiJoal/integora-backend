@@ -308,6 +308,14 @@ app.get('/api/health/supabase', async (req, res) => {
 // Deploiement Vercel voir la vrai IP
 app.set('trust proxy', 1);
 
+app.use((req, res, next) => {
+  res.setHeader(
+    "Permissions-Policy",
+    "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), usb=(), fullscreen=(self)"
+  );
+  next();
+});
+
 // JWT secret : obligatoire en prod, fallback random seulement en dev
 const SECRET_KEY = (() => {
   const env = (process.env.NODE_ENV || "development").toLowerCase();

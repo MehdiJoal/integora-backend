@@ -870,13 +870,23 @@ app.use(requireJson);
 function validateCSRF(req, res, next) {
   // On protège uniquement les méthodes qui modifient
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  // ✅ SAFE: req.path peut être undefined selon le contexte (proxy, libs, tests)
+  const p =
+    typeof req.path === "string"
+      ? req.path
+      : (typeof req.originalUrl === "string"
+        ? req.originalUrl.split("?")[0]
+        : "");
+
+  if (!p.startsWith("/api/")) return next();
 
   log.debug("🧪 CSRF CHECK", {
     method: req.method,
-    path: req.path,
+    path: p,
     url: req.url,
     originalUrl: req.originalUrl,
   });
+
 
   // ✅ Routes publiques (signup / paiement) : pas de CSRF, sinon blocage
   const exempt = new Set([
@@ -899,7 +909,7 @@ function validateCSRF(req, res, next) {
     '/api/contact/ticket'
   ]);
 
-  if (exempt.has(req.path)) return next();
+  if (exempt.has(p)) return next();
 
   const headerToken = req.headers['x-csrf-token'];
   const cookieToken = req.cookies['XSRF-TOKEN'];

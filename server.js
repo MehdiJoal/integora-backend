@@ -7,6 +7,13 @@ require('dotenv').config();
 // ==========================
 const IS_PROD = process.env.NODE_ENV === "production";
 
+function setNoStore(res) {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+}
+
+
 function devOnly(req, res, next) {
   if (IS_PROD) return res.status(404).send("Not found");
   return next();
@@ -1716,11 +1723,21 @@ async function authenticateToken(req, res, next) {
   try {
     req.user = await resolveUserFromCookie(req);
 
+    // ✅ SAFE: req.path peut être undefined selon le contexte
+    const p = typeof req.path === "string"
+      ? req.path
+      : (typeof req.originalUrl === "string" ? req.originalUrl : "");
+
+    if (p.startsWith("/api/")) {
+      setNoStore(res);
+    }
+
     next();
   } catch (error) {
     handleAuthenticationError(req, res, error);
   }
 }
+
 
 
 // Fonctions utilitaires

@@ -304,10 +304,9 @@ app.set('trust proxy', 1);
 // JWT secret : obligatoire en prod, fallback random seulement en dev
 const SECRET_KEY = (() => {
   const env = (process.env.NODE_ENV || "development").toLowerCase();
-  const isProd = env === "production";
   const fromEnv = process.env.JWT_SECRET;
 
-  if (isProd && !fromEnv) {
+  if (IS_PROD && !fromEnv) {
     console.error("❌ JWT_SECRET manquant en production. Ajoute la variable d'environnement JWT_SECRET.");
     process.exit(1);
   }
@@ -923,11 +922,10 @@ function ensureCsrfToken(req, res, next) {
     const token = crypto.randomBytes(32).toString("hex");
 
     // Render + Vercel = https => secure + SameSite=None
-    const isProd = process.env.NODE_ENV === "production";
     res.cookie("XSRF-TOKEN", token, {
       httpOnly: false,                 // doit être lisible par le frontend si besoin
-      secure: isProd,                  // true en prod (https), false en local
-      sameSite: isProd ? "none" : "lax",
+      secure: IS_PROD,
+      sameSite: IS_PROD ? "none" : "lax",
       path: "/"
     });
 
@@ -1745,24 +1743,24 @@ function handleUnauthorized(req, res) {
 function handleAuthenticationError(req, res, error) {
   res.clearCookie("auth_token", {
     path: "/",
-    secure: isProd,
-    sameSite: isProd ? "none" : "lax",
+    secure: IS_PROD,
+    sameSite: IS_PROD ? "none" : "lax",
+
   });
 
   const accept = req.headers.accept || "";
   const wantsHtml = accept.includes("text/html");
 
   if (wantsHtml) {
-    // Affiche une belle page 401 (avec next)
     return res.redirect("/401.html?next=" + encodeURIComponent(req.originalUrl));
   }
 
-  // API/fetch
   return res.status(401).json({
     error: "Session expirée, reconnectez-vous.",
     code: "SESSION_EXPIRED",
   });
 }
+
 
 
 
@@ -3025,11 +3023,10 @@ app.post("/login", async (req, res) => {
     ]);
 
     // ✅ 5) COOKIE
-    const isProd = process.env.NODE_ENV === "production";
     res.cookie("auth_token", token, {
       httpOnly: true,
-      secure: isProd,
-      sameSite: isProd ? "none" : "lax",
+      secure: IS_PROD,
+      sameSite: IS_PROD ? "none" : "lax",
       maxAge: 24 * 60 * 60 * 1000,
       path: "/",
     });
@@ -5425,11 +5422,10 @@ app.post("/api/logout", async (req, res) => {
   }
 
   // ✅ SUPPRIMER LE COOKIE
-  const isProd = process.env.NODE_ENV === "production";
   res.clearCookie("auth_token", {
     path: "/",
-    secure: isProd,
-    sameSite: isProd ? "none" : "lax",
+    secure: IS_PROD,
+    sameSite: IS_PROD ? "none" : "lax",
   });
 
 

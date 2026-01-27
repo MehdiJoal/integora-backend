@@ -24,6 +24,13 @@ function devToolsAllowed(req) {
   return got === expected;
 }
 
+// ✅ Détails d'erreur visibles seulement en DEV (jamais en PROD)
+function safeDetails(err) {
+  if (IS_PROD) return undefined;
+  return err?.raw?.message || err?.message || String(err);
+}
+
+
 
 // (optionnel) petit helper pour ne jamais log d’email
 const safeUserTag = (u) => (u?.id ? `user_id=${u.id}` : "user_id=unknown");
@@ -58,6 +65,8 @@ log.info(`[BOOT] env=${process.env.NODE_ENV} (LOG_LEVEL=${LOG_LEVEL})`);
 
 const express = require("express");
 const app = express();
+app.disable("x-powered-by");
+
 
 // ==================== CORS (TOUT EN HAUT) ====================
 const ALLOWED_ORIGINS = new Set([
@@ -272,7 +281,7 @@ app.get('/api/health/supabase', async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: "Supabase indisponible",
-      details: error.message,
+      details: safeDetails(error),
     });
   }
 
@@ -282,7 +291,19 @@ app.get('/api/health/supabase', async (req, res) => {
 // Deploiement Vercel voir la vrai IP
 app.set('trust proxy', 1);
 
-const SECRET_KEY = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
+// JWT secret : obligatoire en prod, fallback random seulement en dev
+const SECRET_KEY = (() => {
+  const env = (process.env.NODE_ENV || "development").toLowerCase();
+  const isProd = env === "production";
+  const fromEnv = process.env.JWT_SECRET;
+
+  if (isProd && !fromEnv) {
+    console.error("❌ JWT_SECRET manquant en production. Ajoute la variable d'environnement JWT_SECRET.");
+    process.exit(1);
+  }
+  return fromEnv || crypto.randomBytes(64).toString("hex");
+})();
+
 
 // 🔥 HELMET - Headers de sécurité complets
 app.use(helmet({
@@ -844,6 +865,7 @@ function validateCSRF(req, res, next) {
     '/login',
     '/inscription',
     '/verify-token',
+    '/api/verify-token',
 
     // ✅ nouveau flow
     '/api/start-paid-checkout',
@@ -1709,7 +1731,11 @@ function handleUnauthorized(req, res) {
 
 
 function handleAuthenticationError(req, res, error) {
-  res.clearCookie("auth_token");
+  res.clearCookie("auth_token", {
+    path: "/",
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
+  });
 
   const accept = req.headers.accept || "";
   const wantsHtml = accept.includes("text/html");
@@ -2879,7 +2905,7 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
     log.error("❌ /api/subscribe/session:", e?.raw?.message || e);
     return res.status(500).json({
       error: "Erreur création session Stripe",
-      details: e?.raw?.message || e.message
+      details: safeDetails(e)
     });
   }
 });
@@ -3019,7 +3045,7 @@ app.post("/login", async (req, res) => {
 
 
 // 🧪 ROUTE DE TEST - À ajouter temporairement
-app.post("/test-supabase", async (req, res) => {
+app.post("/test-supabase", devOnly, async (req, res) => {
 
   const { email, password } = req.body;
 
@@ -3074,7 +3100,7 @@ app.post("/verify-token", async (req, res) => {
 
 
 // 🧪 TEST SERVICE ROLE
-app.get('/api/test-service-role', async (req, res) => {
+app.get("/api/test-service-role", devOnly, async (req, res) => {
   try {
     // Test 1: Lecture simple
     const { data: testData, error: testError } = await supabase
@@ -3105,11 +3131,13 @@ app.get('/api/test-service-role', async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 });
+
+
 // ---------------------------
 // ROUTES PROTÉGÉES AVEC ABONNEMENTS
 // ---------------------------
 
-app.get("/test-supabase", async (req, res) => {
+app.get("/test-supabase", devOnly, async (req, res) => {
   try {
     const { data, error } = await supabase.auth.getUser();
     res.json({
@@ -3877,7 +3905,9 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
     if (existingErr) {
       log.error("❌ pending_signups select error:", existingErr);
-      return res.status(500).json({ error: "Erreur lecture pending_signups", details: existingErr.message });
+      return res.status(500).json({
+        error: "Erreur lecture pending_signups", details: safeDetails(existingErr)
+      });
     }
 
     let pending_id;
@@ -3910,7 +3940,9 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
       if (updErr) {
         log.error("❌ pending_signups update error:", updErr);
-        return res.status(500).json({ error: "Erreur update pending_signup", details: updErr.message });
+        return res.status(500).json({
+          error: "Erreur update pending_signup", details: safeDetails(updErr)
+        });
       }
 
     } else {
@@ -3940,7 +3972,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
       if (pendingErr || !pending) {
         log.error("❌ pending_signups insert error:", pendingErr);
-        return res.status(500).json({ error: "Impossible de créer pending_signup", details: pendingErr?.message });
+        return res.status(500).json({ error: "Impossible de créer pending_signup", details: safeDetails(pendingErr) });
       }
 
       pending_id = pending.id;
@@ -4057,7 +4089,9 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
     if (sessUpdErr) {
       log.error("❌ pending_signups update stripe_session_id error:", sessUpdErr);
-      return res.status(500).json({ error: "Erreur update stripe_session_id", details: sessUpdErr.message });
+      return res.status(500).json({
+        error: "Erreur update stripe_session_id", details: safeDetails(sessUpdErr)
+      });
     }
 
     return res.json({
@@ -4300,7 +4334,7 @@ app.post("/api/finalize-pending", async (req, res) => {
         return res.status(409).json({
           error: "Subscription not ready yet",
           code: "PAYMENT_PENDING",
-          details: { hasStripeCustomer, hasStripeSub },
+          details: IS_PROD ? undefined : { hasStripeCustomer, hasStripeSub },
         });
       }
     }
@@ -4555,7 +4589,9 @@ app.post("/api/start-trial-invite", async (req, res) => {
 
     if (existingErr) {
       log.error("❌ pending_signups select error:", existingErr);
-      return res.status(500).json({ error: "Erreur lecture pending_signups", details: existingErr.message });
+      return res.status(500).json({
+        error: "Erreur lecture pending_signups", details: safeDetails(existingErr)
+      });
     }
 
     if (existingPending) {
@@ -4579,7 +4615,9 @@ app.post("/api/start-trial-invite", async (req, res) => {
 
       if (updErr) {
         log.error("❌ pending_signups update error:", updErr);
-        return res.status(500).json({ error: "Erreur update pending_signup trial", details: updErr.message });
+        return res.status(500).json({
+          error: "Erreur update pending_signup trial", details: safeDetails(updErr)
+        });
       }
 
     } else {
@@ -4606,7 +4644,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
         log.error("❌ pending_signups insert error:", pendingErr);
         return res.status(500).json({
           error: "Impossible de créer pending_signup trial",
-          details: pendingErr?.message
+          details: safeDetails(pendingErr)
         });
       }
 

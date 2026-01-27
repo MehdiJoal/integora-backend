@@ -47,6 +47,16 @@ const log = {
   debug: (...a) => { if (can("debug")) console.log(...a); },
 };
 
+function safeError(e) {
+  return {
+    name: e?.name,
+    message: e?.message,
+    code: e?.code,
+    status: e?.status,
+  };
+}
+
+
 
 // Vérification CRITIQUE - doit être fait immédiatement
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
@@ -260,7 +270,7 @@ app.get('/api/health/supabase', async (req, res) => {
 
 
     if (error) {
-      log.error("❌ authEmailExists listUsers error:", error);
+      log.error("❌ authEmailExists listUsers error:", safeError(error));
       // SAFE MODE : si on ne peut pas vérifier, on bloque
       return true;
     }
@@ -272,7 +282,7 @@ app.get('/api/health/supabase', async (req, res) => {
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    log.error('🔴 Health check Supabase KO:', error);
+    log.error('🔴 Health check Supabase KO:', safeError(error));
 
     if (IS_PROD) {
       return res.status(500).json({ ok: false, error: "SUPABASE_UNAVAILABLE" });
@@ -715,11 +725,13 @@ function hasAnyAuthToken(req) {
   // Mets ici les noms de cookies que TON backend utilise réellement :
   // (tu peux en laisser plusieurs, ça ne casse rien)
   return (
+    cookie.includes("auth_token=") ||
     cookie.includes("token=") ||
     cookie.includes("access_token=") ||
     cookie.includes("sb-access-token=") ||
     cookie.includes("sb:token=")
   );
+
 }
 
 
@@ -921,7 +933,7 @@ function ensureCsrfToken(req, res, next) {
 
     return next();
   } catch (e) {
-    log.error("❌ ensureCsrfToken error:", e);
+    log.error("❌ ensureCsrfToken error:", safeError(e));
     return next();
   }
 }
@@ -1210,7 +1222,7 @@ app.get("/:page", async (req, res) => {
 
 
   } catch (error) {
-    log.error("💥 Erreur route universelle:", error);
+    log.error("💥 Erreur route universelle:", safeError(error));
     return res.status(500).sendFile(path.join(__dirname, "../frontend/500.html"));
   }
 });
@@ -1850,7 +1862,7 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
           user_id: userId
         });
       }
-      log.error('❌ [SERVER] Erreur Supabase:', error);
+      log.error('❌ [SERVER] Erreur Supabase:', safeError(error));
       return res.status(500).json({ error: 'Erreur base de données' });
     }
 
@@ -1888,7 +1900,7 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    log.error('❌ [SERVER] Erreur récupération abonnement:', error);
+    log.error('❌ [SERVER] Erreur récupération abonnement:', safeError(error));
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -1943,7 +1955,7 @@ app.get("/api/payment-method/status", authenticateToken, async (req, res) => {
       subscriptionDefaultPm,
     });
   } catch (e) {
-    log.error("❌ /api/payment-method/status:", e);
+    log.error("❌ /api/payment-method/status:", safeError(e));
     return res.status(500).json({ error: "Erreur status paiement" });
   }
 });
@@ -2026,7 +2038,7 @@ app.post("/api/request-account-deletion", authenticateToken, async (req, res) =>
       message: "Email de confirmation envoyé",
     });
   } catch (error) {
-    log.error("❌ [SERVER] Erreur demande suppression:", error);
+    log.error("❌ [SERVER] Erreur demande suppression:", safeError(error));
 
     // ✅ PROD : pas de détails techniques, pas de lien
     if (IS_PROD) {
@@ -2128,7 +2140,7 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
       });
 
     if (archiveError) {
-      log.error('❌ [SERVER] Erreur archivage:', archiveError);
+      log.error('❌ [SERVER] Erreur archivage:', safeError(archiveError));
     }
 
     // 🔥 3. SUPPRIMER L'ABONNEMENT STRIPE
@@ -2161,7 +2173,7 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
     const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(userId);
 
     if (deleteError) {
-      log.error('❌ [SERVER] Erreur suppression user auth:', deleteError);
+      log.error('❌ [SERVER] Erreur suppression user auth:', safeError(deleteError));
       return res.status(500).json({ error: 'Erreur suppression compte' });
     }
 
@@ -2174,7 +2186,7 @@ app.post('/api/confirm-account-deletion', async (req, res) => {
     });
 
   } catch (error) {
-    log.error('❌ [SERVER] Erreur confirmation suppression:', error);
+    log.error('❌ [SERVER] Erreur confirmation suppression:', safeError(error));
 
     if (error.name === 'TokenExpiredError') {
       return res.status(400).json({ error: 'Lien expiré, veuillez refaire une demande' });
@@ -2389,7 +2401,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
       if (e?.code === "BILLING_INCOMPLETE") {
         return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
       }
-      log.error("❌ sync billing (change-plan) error:", e);
+      log.error("❌ sync billing (change-plan) error:", safeError(e));
       return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
     }
 
@@ -2540,7 +2552,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       .limit(1);
 
     if (prepayErr) {
-      log.error("❌ prepay-next-year pending check error:", prepayErr);
+      log.error("❌ prepay-next-year pending check error:", safeError(prepayErr));
       return res.status(500).json({ error: "Erreur vérification prépaiement" });
     }
 
@@ -2576,7 +2588,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       if (e?.code === "BILLING_INCOMPLETE") {
         return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
       }
-      log.error("❌ sync billing (prepay) error:", e);
+      log.error("❌ sync billing (prepay) error:", safeError(e));
       return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
     }
 
@@ -2627,7 +2639,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
       .maybeSingle();
 
     if (pendingErr) {
-      log.error("prepay_next_year: lookup pending error", pendingErr);
+      log.error("prepay_next_year: lookup pending error", safeError(pendingErr));
       return res.status(500).json({ error: "pending_lookup_failed" });
     }
 
@@ -2709,7 +2721,7 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
 
 
   } catch (err) {
-    log.error("❌ prepay-next-year error:", err);
+    log.error("❌ prepay-next-year error:", safeError(err));
     return res.status(500).json({ error: "Erreur création session Stripe" });
   }
 });
@@ -2766,7 +2778,7 @@ app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res)
     });
 
   } catch (err) {
-    log.error("❌ toggle-renewal error:", err);
+    log.error("❌ toggle-renewal error:", safeError(err));
     res.status(500).json({ error: "Erreur renouvellement" });
   }
 });
@@ -2841,7 +2853,7 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
           code: "BILLING_INCOMPLETE",
         });
       }
-      log.error("❌ sync billing (subscribe/session) error:", e);
+      log.error("❌ sync billing (subscribe/session) error:", safeError(e));
       return res.status(500).json({ ok: false, error: "Erreur sync facturation (Stripe)" });
     }
 
@@ -2902,7 +2914,7 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
     return res.json({ url: session.url });
 
   } catch (e) {
-    log.error("❌ /api/subscribe/session:", e?.raw?.message || e);
+    log.error("❌ /api/subscribe/session:", e?.raw?.message || safeError(e));
     return res.status(500).json({
       error: "Erreur création session Stripe",
       details: safeDetails(e)
@@ -3035,7 +3047,7 @@ app.post("/login", async (req, res) => {
       },
     });
   } catch (error) {
-    log.error("💥 Erreur login:", error);
+    log.error("💥 Erreur login:", safeError(error));
     return res.status(500).json({
       success: false,
       error: "Erreur serveur lors de la connexion.",
@@ -3078,7 +3090,7 @@ app.post("/test-supabase", devOnly, async (req, res) => {
     });
 
   } catch (error) {
-    log.error("❌ Erreur serveur:", error);
+    log.error("❌ Erreur serveur:", safeError(error));
     if (IS_PROD) return res.status(500).json({ error: "SERVER_ERROR" });
     return res.status(500).json({ error: error.message });
   }
@@ -3126,7 +3138,7 @@ app.get("/api/test-service-role", devOnly, async (req, res) => {
     });
 
   } catch (error) {
-    log.error("❌ Erreur serveur:", error);
+    log.error("❌ Erreur serveur:", safeError(error));
     if (IS_PROD) return res.status(500).json({ error: "SERVER_ERROR" });
     return res.status(500).json({ error: error.message });
   }
@@ -3146,7 +3158,7 @@ app.get("/test-supabase", devOnly, async (req, res) => {
       error: error?.message
     });
   } catch (error) {
-    log.error("❌ Erreur serveur:", error);
+    log.error("❌ Erreur serveur:", safeError(error));
     if (IS_PROD) return res.status(500).json({ error: "SERVER_ERROR" });
     return res.status(500).json({ error: error.message });
   }
@@ -3195,7 +3207,7 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
     res.json(responseData);
 
   } catch (error) {
-    log.error('💥 [API My-Profile] Exception:', error);
+    log.error('💥 [API My-Profile] Exception:', safeError(error));
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -3214,14 +3226,14 @@ app.get("/api/my-company", authenticateToken, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      log.error("❌ [API My-Company] Supabase error:", error);
+      log.error("❌ [API My-Company] Supabase error:", safeError(error));
       return res.status(400).json({ ok: false, error: error.message });
     }
 
     // Si pas encore de company : on renvoie un objet vide (pas une 404)
     return res.json(company || {});
   } catch (e) {
-    log.error("💥 [API My-Company] Exception:", e);
+    log.error("💥 [API My-Company] Exception:", safeError(e));
     return res.status(500).json({ ok: false, error: "Erreur serveur my-company" });
   }
 });
@@ -3253,7 +3265,7 @@ app.post('/api/update-profile', authenticateToken, async (req, res) => {
       .single();
 
     if (error) {
-      log.error('❌ [API Update-Profile] Erreur Supabase:', error);
+      log.error('❌ [API Update-Profile] Erreur Supabase:', safeError(error));
       return res.status(400).json({
         ok: false,
         error: 'Échec de la mise à jour: ' + error.message
@@ -3272,7 +3284,7 @@ app.post('/api/update-profile', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    log.error('💥 [API Update-Profile] Exception:', error);
+    log.error('💥 [API Update-Profile] Exception:', safeError(error));
     res.status(500).json({
       ok: false,
       error: 'Erreur serveur lors de la mise à jour du profil'
@@ -3432,7 +3444,7 @@ app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
 
     return res.json({ ok: true, message: "Entreprise mise à jour", company });
   } catch (e) {
-    log.error("💥 [API update-billing] Exception:", e);
+    log.error("💥 [API update-billing] Exception:", safeError(e));
     return res.status(500).json({ ok: false, error: "Erreur serveur update-billing" });
   }
 });
@@ -3629,13 +3641,13 @@ app.get("/api/my-avatar-url", authenticateToken, async (req, res) => {
 
     if (signErr) {
       // 🔎 te donne un log explicite pour ne plus être dans le flou
-      log.error("❌ /api/my-avatar-url createSignedUrl error:", signErr, "path:", path);
+      log.error("❌ /api/my-avatar-url createSignedUrl error:", safeError(signErr), "path:", path);
       return res.status(500).json({ ok: false, error: signErr.message, path });
     }
 
     return res.json({ ok: true, url: signed.signedUrl, path });
   } catch (e) {
-    log.error("💥 /api/my-avatar-url exception:", e);
+    log.error("💥 /api/my-avatar-url exception:", safeError(e));
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -3748,7 +3760,7 @@ app.get('/api/assets/:id', authenticateToken, async (req, res) => {
     return res.send(buf);
 
   } catch (error) {
-    log.error('💥 [Protected Asset] Erreur finale:', error);
+    log.error('💥 [Protected Asset] Erreur finale:', safeError(error));
     return serveFallbackImage(res);
   }
 });
@@ -4101,7 +4113,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     });
 
   } catch (e) {
-    log.error("❌ [START-PAID] error:", e);
+    log.error("❌ [START-PAID] error:", safeError(e));
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
@@ -4238,7 +4250,7 @@ app.post("/api/complete-signup", async (req, res) => {
     });
 
   } catch (e) {
-    log.error("❌ [COMPLETE] error:", e);
+    log.error("❌ [COMPLETE] error:", safeError(e));
     return res.status(500).send(`Erreur complete-signup: ${e.message}`);
   }
 });
@@ -4513,7 +4525,7 @@ app.post("/api/finalize-pending", async (req, res) => {
     }
     return res.json({ ok: true, set_password_link: setPasswordLink });
   } catch (e) {
-    log.error("❌ /api/finalize-pending:", e);
+    log.error("❌ /api/finalize-pending:", safeError(e));
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
@@ -4671,7 +4683,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
 
     if (inviteErr) {
       const msg = String(inviteErr.message || "");
-      log.error("❌ inviteUserByEmail error:", inviteErr);
+      log.error("❌ inviteUserByEmail error:", safeError(inviteErr));
 
       if (msg.toLowerCase().includes("already been registered")) {
         const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
@@ -4728,7 +4740,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
     });
 
   } catch (e) {
-    log.error("❌ [TRIAL] error:", e);
+    log.error("❌ [TRIAL] error:", safeError(e));
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
@@ -5125,7 +5137,7 @@ app.post(
       return res.json({ ok: true, ticket_id: ticket.id });
 
     } catch (e) {
-      log.error("❌ /api/support/ticket:", e);
+      log.error("❌ /api/support/ticket:", safeError(e));
       return res.status(500).json({ error: "Erreur serveur" });
     }
 
@@ -5387,7 +5399,7 @@ app.post("/api/contact/ticket", contactPublicLimiter, async (req, res) => {
     return res.json({ ok: true, ticket_id: ticket.id });
 
   } catch (e) {
-    log.error("❌ /api/contact/ticket:", e);
+    log.error("❌ /api/contact/ticket:", safeError(e));
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });
@@ -5413,12 +5425,13 @@ app.post("/api/logout", async (req, res) => {
   }
 
   // ✅ SUPPRIMER LE COOKIE
-  res.clearCookie('auth_token', {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    path: '/'
+  const isProd = process.env.NODE_ENV === "production";
+  res.clearCookie("auth_token", {
+    path: "/",
+    secure: isProd,
+    sameSite: isProd ? "none" : "lax",
   });
+
 
   res.json({
     success: true,

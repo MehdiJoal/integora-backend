@@ -4565,10 +4565,8 @@ app.post("/api/finalize-pending", async (req, res) => {
     }
 
 
-    if (!devToolsAllowed(req)) {
-      return res.json({ ok: true });
-    }
     return res.json({ ok: true, set_password_link: setPasswordLink });
+
   } catch (e) {
     log.error("❌ /api/finalize-pending:", safeError(e));
     return res.status(500).json({ error: "Erreur serveur" });

@@ -377,7 +377,6 @@ app.use(helmet({
         // Resend
         "https://api.resend.com",
         "https://api.integora.fr",
-        "https://integora-backend.onrender.com"
 
       ],
       frameSrc: [

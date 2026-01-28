@@ -87,6 +87,9 @@ app.disable("x-powered-by");
 
 // ==================== CORS (TOUT EN HAUT) ====================
 const ALLOWED_ORIGINS = new Set([
+  "https://integora.fr",
+  "https://www.integora.fr",
+  // (optionnel) temps migration
   "https://integora-frontend.vercel.app",
   "http://localhost:3000",
   "http://localhost:5173",
@@ -987,7 +990,7 @@ app.use(validateCSRF);
 
 
 // Routes principales
-const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
 
 if (process.env.NODE_ENV === "production") {
   // En prod: backend => redirect vers le vrai front (Vercel)
@@ -4050,7 +4053,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     }
 
     // ✅ 3) Créer session Stripe (nouvelle session à chaque tentative)
-    const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+    const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
 
     // ✅ 3) Créer un Customer Stripe AVANT checkout (pour facture parfaite)
     const contactName =
@@ -4208,7 +4211,7 @@ app.post("/api/complete-signup", async (req, res) => {
     const stripe_subscription_id = session.subscription?.id || null;
 
     // 3) envoyer email d’invite (OVH via Supabase)
-    const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+    const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
     const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
 
     const { data: inviteData, error: inviteErr } =
@@ -4229,7 +4232,7 @@ app.post("/api/complete-signup", async (req, res) => {
 
       // ✅ Cas : user déjà créé -> on renvoie un lien de création de mot de passe
       if (msg.toLowerCase().includes("already been registered")) {
-        const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+        const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
         const redirectTo = `${FRONT}/create-password.html?pending_id=${pending_id}`;
 
         const { data: linkData, error: linkErr } =
@@ -4708,7 +4711,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
 
 
     // 2) invite email
-    const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+    const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
     const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
 
     const { data: inviteData, error: inviteErr } =
@@ -4729,7 +4732,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
       log.error("❌ inviteUserByEmail error:", safeError(inviteErr));
 
       if (msg.toLowerCase().includes("already been registered")) {
-        const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+        const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
         const redirectTo = `${FRONT}/create-password.html?pending_id=${pending_id}`;
 
         const { data: linkData, error: linkErr } =
@@ -4802,7 +4805,7 @@ app.post("/api/resend-activation", async (req, res) => {
 
     if (pendingErr || !pending) return res.status(404).json({ error: "pending introuvable" });
 
-    const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+    const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
     const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
 
     const { data: inviteData, error: inviteErr } =
@@ -4823,7 +4826,7 @@ app.post("/api/resend-activation", async (req, res) => {
 
       // ✅ Cas : user déjà créé -> on génère un lien "recovery" pour définir le mot de passe
       if (msg.toLowerCase().includes("already been registered")) {
-        const FRONT = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+        const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
         const redirectTo = `${FRONT}/create-password.html?pending_id=${pending_id}`;
 
         const { data: linkData, error: linkErr } =

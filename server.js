@@ -90,7 +90,6 @@ const ALLOWED_ORIGINS = new Set([
   "https://integora.fr",
   "https://www.integora.fr",
   // (optionnel) temps migration
-  "https://integora-frontend.vercel.app",
   "http://localhost:3000",
   "http://localhost:5173",
 ]);
@@ -99,7 +98,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin;
 
   const isVercelPreview =
-    origin && /^https:\/\/integora-frontend-.*\.vercel\.app$/.test(origin);
+    !IS_PROD && origin && /^https:\/\/integora-frontend-.*\.vercel\.app$/.test(origin);
 
   if (origin && (ALLOWED_ORIGINS.has(origin) || isVercelPreview)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -816,7 +815,9 @@ function enforceSameSiteForMutations(req, res, next) {
   const referer = req.headers.referer || "";
 
   const allowed = (o) =>
-    ALLOWED_ORIGINS.has(o) || /^https:\/\/integora-frontend-.*\.vercel\.app$/.test(o);
+    ALLOWED_ORIGINS.has(o) ||
+    (!IS_PROD && /^https:\/\/integora-frontend-.*\.vercel\.app$/.test(o));
+
 
   // si origin est présent => on le valide
   if (origin) {
@@ -1053,10 +1054,16 @@ app.get("/config.js", (req, res) => {
   const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
 
   // Autorise uniquement ton front + local
-  const allowedOrigins = new Set([
-    "https://integora-frontend.vercel.app",
-    "http://localhost:3000",
-  ]);
+  const allowedOrigins = [
+    "https://integora.fr",
+    "https://www.integora.fr",
+  ];
+
+  if (!IS_PROD) {
+    allowedOrigins.push("http://localhost:3000", "http://localhost:5173");
+  }
+
+
 
   const origin = req.headers.origin;
   if (origin && allowedOrigins.has(origin)) {
@@ -2403,7 +2410,7 @@ app.post("/api/change-plan", authenticateToken, async (req, res) => {
     }
 
 
-    const FRONTEND_URL = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+    const FRONTEND_URL = process.env.FRONTEND_URL || "https://integora.fr";
 
 
 
@@ -2870,7 +2877,7 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
     const priceId = PRICE_BY_PLAN[desiredPlan];
     if (!priceId) return res.status(500).json({ error: "PriceId Stripe manquant" });
 
-    const FRONTEND_URL = process.env.FRONTEND_URL || "https://integora-frontend.vercel.app";
+    const FRONT = process.env.FRONTEND_URL || "https://integora.fr";
 
     // 3) s'assurer d'avoir un customer Stripe
     let customerId = subRow?.stripe_customer_id || null;
@@ -4053,7 +4060,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
     }
 
     // ✅ 3) Créer session Stripe (nouvelle session à chaque tentative)
-    const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
+    const FRONT = process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
 
     // ✅ 3) Créer un Customer Stripe AVANT checkout (pour facture parfaite)
     const contactName =
@@ -4548,7 +4555,8 @@ app.post("/api/finalize-pending", async (req, res) => {
 
 
     // ✅ Générer un lien de création de mot de passe (flow recovery) SANS envoyer un 2e mail
-    const redirectTo = "https://integora-frontend.vercel.app/create-password.html";
+    const FRONT = process.env.FRONTEND_URL || "https://integora.fr";
+    const redirectTo = `${FRONT}/create-password.html`;
 
     const { data: linkData, error: linkErr } = await supabaseAdmin.auth.admin.generateLink({
       type: "recovery",

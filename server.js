@@ -994,7 +994,7 @@ app.use(validateCSRF);
 
 
 // Routes principales
-const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
+const FRONT = FRONTEND_URL;
 
 if (process.env.NODE_ENV === "production") {
   // En prod: backend => redirect vers le vrai front (Vercel)
@@ -2046,7 +2046,8 @@ app.post("/api/request-account-deletion", authenticateToken, async (req, res) =>
     );
 
     // 🔥 Construire le lien de confirmation
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    const frontendUrl =
+      process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
     const confirmationLink = `${frontendUrl}/confirm-deletion.html?token=${deletionToken}`;
 
     // 🔥 Appel Edge Function
@@ -2110,7 +2111,8 @@ app.post("/api/request-account-deletion", authenticateToken, async (req, res) =>
     }
 
     // DEV : fallback lien (optionnel)
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    const frontendUrl =
+      process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
     const confirmationLink = `${frontendUrl}/confirm-deletion.html?token=fallback_${Date.now()}`;
 
     return res.json({
@@ -2652,7 +2654,8 @@ app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) =>
     }
 
 
-    const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+    const FRONTEND_URL =
+      process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
 
     // ==========================================
     // Page profil paiement règle moins de 366 jours
@@ -4221,8 +4224,10 @@ app.post("/api/complete-signup", async (req, res) => {
     const stripe_subscription_id = session.subscription?.id || null;
 
     // 3) envoyer email d’invite (OVH via Supabase)
-    const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
+    const FRONT =
+      process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
     const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
+
 
     const { data: inviteData, error: inviteErr } =
       await supabaseAdmin.auth.admin.inviteUserByEmail(pending.email, {
@@ -4242,7 +4247,7 @@ app.post("/api/complete-signup", async (req, res) => {
 
       // ✅ Cas : user déjà créé -> on renvoie un lien de création de mot de passe
       if (msg.toLowerCase().includes("already been registered")) {
-        const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
+        const FRONT = FRONTEND_URL;
         const redirectTo = `${FRONT}/create-password.html?pending_id=${pending_id}`;
 
         const { data: linkData, error: linkErr } =
@@ -4722,7 +4727,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
 
 
     // 2) invite email
-    const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
+    const FRONT = FRONTEND_URL;
     const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
 
     const { data: inviteData, error: inviteErr } =
@@ -4743,7 +4748,7 @@ app.post("/api/start-trial-invite", async (req, res) => {
       log.error("❌ inviteUserByEmail error:", safeError(inviteErr));
 
       if (msg.toLowerCase().includes("already been registered")) {
-        const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
+        const FRONT = FRONTEND_URL;
         const redirectTo = `${FRONT}/create-password.html?pending_id=${pending_id}`;
 
         const { data: linkData, error: linkErr } =
@@ -4816,7 +4821,7 @@ app.post("/api/resend-activation", async (req, res) => {
 
     if (pendingErr || !pending) return res.status(404).json({ error: "pending introuvable" });
 
-    const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
+    const FRONT = FRONTEND_URL;
     const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
 
     const { data: inviteData, error: inviteErr } =
@@ -4837,7 +4842,7 @@ app.post("/api/resend-activation", async (req, res) => {
 
       // ✅ Cas : user déjà créé -> on génère un lien "recovery" pour définir le mot de passe
       if (msg.toLowerCase().includes("already been registered")) {
-        const FRONT = process.env.FRONTEND_URL || "http://localhost:3000";
+        const FRONT = FRONTEND_URL;
         const redirectTo = `${FRONT}/create-password.html?pending_id=${pending_id}`;
 
         const { data: linkData, error: linkErr } =

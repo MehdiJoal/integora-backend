@@ -7,6 +7,9 @@ require('dotenv').config();
 // ==========================
 const IS_PROD = process.env.NODE_ENV === "production";
 
+const FRONTEND_URL =
+  process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
+
 function setNoStore(res) {
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Pragma", "no-cache");

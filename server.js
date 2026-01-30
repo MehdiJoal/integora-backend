@@ -504,6 +504,24 @@ app.use('/api/resend-activation', authLimiter);
 
 
 
+// ======================================================
+// 🔒 PROD MODE : API ONLY (frontend servi par Vercel)
+// ======================================================
+if (IS_PROD) {
+  app.get("*", (req, res, next) => {
+    // ✅ Autoriser les routes API
+    if (req.path.startsWith("/api")) return next();
+
+    // ✅ Autoriser config.js si utilisé par le frontend
+    if (req.path === "/config.js") return next();
+
+    // ✅ Autoriser uploads / assets si besoin
+    if (req.path.startsWith("/uploads")) return next();
+
+    // ❌ Tout le reste = frontend → redirection vers Vercel
+    return res.redirect(302, `${FRONTEND_URL}${req.originalUrl}`);
+  });
+}
 
 
 // ==================== STATIC PUBLIC / STATIC APP (PROPRE) ====================

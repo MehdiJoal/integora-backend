@@ -413,7 +413,29 @@ const authLimiter = rateLimit({
     const email = (req.body?.email || "").toString().trim().toLowerCase();
     return `${ipKeyGenerator(req, res)}:${email}`;
   },
+
+  // ✅ AJOUT: réponse UX propre quand limite dépassée
+  handler: (req, res, next, options) => {
+    const accept = req.headers.accept || "";
+    const wantsHtml = accept.includes("text/html");
+
+    // (optionnel) aide navigateur + front à gérer le retry
+    res.setHeader("Retry-After", "120");
+
+    // Toujours 429
+    res.status(429);
+
+    // Si c'est une navigation web -> page HTML stylée
+    if (wantsHtml) {
+      return res.redirect(302, "/429.html");
+      // alternative: return res.sendFile(path.join(__dirname, "../frontend/429.html"));
+    }
+
+    // Sinon (fetch/ajax) -> JSON propre
+    return res.json(options.message || { error: "Trop de tentatives. Réessayez dans 2 minutes." });
+  },
 });
+
 
 // rate limite formulaire contact
 const supportLimiter = rateLimit({

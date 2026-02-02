@@ -5295,6 +5295,28 @@ function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
 }
 
+async function findRecentDuplicateContact({ email, subject, message, minutes = 10 }) {
+  try {
+    const since = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+
+    const { data, error } = await supabaseAdmin
+      .from("contact_tickets")
+      .select("id, created_at")
+      .eq("email", email)
+      .eq("subject", subject)
+      .eq("message", message)
+      .gte("created_at", since)
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    if (error) return null;
+    return data?.[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+
 app.post("/api/contact/ticket", contactPublicLimiter, async (req, res) => {
   try {
     // Si tu n'as pas déjà app.use(express.json()) plus haut, garde bodyParser

@@ -713,14 +713,14 @@ const PAGE_MIN_PLAN = {
 
 
   //creativite_irl
-  "conference_absurde": "standard",
+  "conference_absurde": "trial",
   "histoire_impossible": "standard",
   "a_vous_de_continuer": "standard",
   "7_secondes_chrono": "standard",
 
 
   //manager autrement
-  "un_mot_pour_avancer": "standard",
+  "un_mot_pour_avancer": "trial",
   "la_boussole_en_main": "standard",
   "ce_qu_on_ne_dit_pas_assez": "standard",
 
@@ -731,20 +731,20 @@ const PAGE_MIN_PLAN = {
 
   //collaboration_irl
   "le_relai_des_mimes": "standard",
-  "switch": "standard",
+  "switch": "trial",
 
 
   // RECRUTEMENT 
   "fiche_de_poste": "standard",
-  "rediger_offre_recrutement": "standard",
-  "guide_recrutement": "standard",
+  "rediger_offre_recrutement": "trial",
+  "guide_recrutement": "trial",
   "recrutement_collectif": "standard",
   "communication_candidat": "standard",
 
 
   // INTEGRAION 
   "livret_accueil": "standard",
-  "processus_integration": "standard",
+  "processus_integration": "trial",
   "parrain_marraine": "standard",
   "tableau_pilotage_des_formations": "standard",
   "intineraire_de_professionnalisation": "standard",

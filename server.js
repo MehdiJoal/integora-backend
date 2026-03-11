@@ -547,6 +547,7 @@ if (IS_PROD) {
 
 
 // ==================== STATIC PUBLIC / STATIC APP (PROPRE) ====================
+const APP_VERSION = "1.0.0"; // ← incrémenter à chaque déploiement
 const FRONTEND_DIR = path.join(__dirname, "../frontend");
 const APP_DIR = path.join(FRONTEND_DIR, "app");
 
@@ -582,9 +583,37 @@ app.use((req, res, next) => {
 // ✅ Assets /app/* (css/js/images/fonts/videos) — CACHE LONG uniquement pour le LOGO
 const ONE_YEAR_MS = 1000 * 60 * 60 * 24 * 365;
 
-// CSS/JS : cache modéré (tu peux les modifier)
-app.use("/app/css", express.static(path.join(APP_DIR, "css"), { maxAge: "7d", etag: true }));
-app.use("/app/js", express.static(path.join(APP_DIR, "js"), { maxAge: "7d", etag: true }));
+// CSS/JS : cache modéré (pas oublier modifier "const APP_VERSION" après un deploiement pour vider cache prod)
+app.use("/app/css", express.static(path.join(APP_DIR, "css"), { maxAge: IS_PROD ? "7d" : "0", etag: true }));
+app.use("/app/js", express.static(path.join(APP_DIR, "js"), {
+  maxAge: IS_PROD ? "7d" : "0",
+  etag: true,
+  setHeaders(res) {
+    res.setHeader("X-App-Version", APP_VERSION);
+  }
+}));
+
+// ✅ Injecte ?v= sur JS/CSS dans tous les HTML /app/*
+app.use("/app", (req, res, next) => {
+  if (!req.path.endsWith(".html")) return next();
+
+  const filePath = path.join(APP_DIR, req.path);
+  if (!fs.existsSync(filePath)) return next();
+
+  let html = fs.readFileSync(filePath, "utf8");
+
+  html = html.replace(
+    /(src|href)="(\/app\/(js|css)\/[^"]+\.(js|css))(\?[^"]*)?">/g,
+    (match, attr, url) => {
+      const cleanUrl = url.split("?")[0];
+      return `${attr}="${cleanUrl}?v=${APP_VERSION}">`;
+    }
+  );
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.send(html);
+});
 
 // Images "générales" (hors assets) : cache moyen
 app.use(
@@ -961,7 +990,8 @@ function validateCSRF(req, res, next) {
     '/api/create-paid-checkout',
 
     // ✅ PUBLIC CONTACT 
-    '/api/contact/ticket'
+    '/api/contact/ticket',
+
   ]);
 
   // ✅ Important : exempt doit être testé sur p (déjà nettoyé)
@@ -1182,6 +1212,7 @@ const ROUTES_PROPRES = {
   "creativite": { fichier: "creativite_irl/creativite_irl", public: false },
   "integration": { fichier: "integration/page_integration", public: false },
   "recrutement": { fichier: "recrutement/page_recrutement", public: false },
+  "outils-manager": { fichier: "appui_managerial/page_appui_managerial", public: false },
   "manager": { fichier: "manager_autrement/manager_autrement", public: false },
 
   // --- Bien-être IRL (pages)
@@ -1235,6 +1266,18 @@ const ROUTES_PROPRES = {
   "recrutement-collectif": { fichier: "recrutement/recrutement_collectif", public: false },
   "communication-candidat": { fichier: "recrutement/communication_candidat", public: false },
   "grille-entretien": { fichier: "recrutement/grille_entretien", public: false },
+
+  // --- Outils manager
+  "thermometre-tensions-outil": {
+    fichier: "appui_managerial/outils/thermometre_des_situations",
+    public: false
+  },
+  "thermometre-tensions-fiche": {
+    fichier: "appui_managerial/fiches/thermometre_des_situations_guide",
+    public: false
+  },
+
+
 
   // ==================== ALIAS "compat" (optionnel) ====================
   // Tu peux les garder le temps de mettre à jour tes liens
@@ -1900,6 +1943,20 @@ function requireSubscription(allowedPlans) {
     next();
   };
 }
+
+
+// ==================== OUTILS MANAGER : THERMOMETRE (API) ====================
+const thermometreRoutes = require("./routes/thermometre.routes");
+
+// ✅ ROUTE PROD-LIKE (AUTH + ABONNEMENT + CSRF)
+app.use(
+  "/api/outils/thermometre",
+  authenticateToken,                          // ✅ c'est TON middleware auth côté backend
+  requireSubscription(["trial", "standard", "premium"]), // ou ["standard","premium"]
+  thermometreRoutes
+);
+
+
 
 
 // ✅ ENDPOINT PAIEMENT STRIPE POUR STANDARD/PREMIUM

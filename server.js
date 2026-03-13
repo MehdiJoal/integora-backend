@@ -523,6 +523,7 @@ app.use('/api/verify-token', authLimiter);
 app.use('/api/start-trial-invite', authLimiter);
 app.use('/api/start-paid-checkout', authLimiter);
 app.use('/api/resend-activation', authLimiter);
+app.use('/api/direct-activate', authLimiter);
 
 
 
@@ -765,6 +766,7 @@ const PAGE_MIN_PLAN = {
 
   // RECRUTEMENT 
   "fiche_de_poste": "standard",
+  "fiche_de_poste_outil": "standard",
   "rediger_offre_recrutement": "trial",
   "guide_recrutement": "trial",
   "recrutement_collectif": "standard",
@@ -985,6 +987,7 @@ function validateCSRF(req, res, next) {
     '/api/start-trial-invite',
     '/api/resend-activation',
     '/api/finalize-pending',
+    '/api/direct-activate',
 
     // (optionnel) si tu gardes encore l’ancienne route quelque part
     '/api/create-paid-checkout',
@@ -1139,7 +1142,7 @@ app.get("/config.js", (req, res) => {
 
 
   const origin = req.headers.origin;
-  if (origin && allowedOrigins.has(origin)) {
+  if (origin && allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   } else {
@@ -1261,6 +1264,7 @@ const ROUTES_PROPRES = {
 
   // --- Recrutement
   "fiche-de-poste": { fichier: "recrutement/fiche_de_poste", public: false },
+  "fiche-de-poste-outil": { fichier: "recrutement/fiche_de_poste_outil", public: false },
   "rediger-offre-recrutement": { fichier: "recrutement/rediger_offre_recrutement", public: false },
   "guide-recrutement": { fichier: "recrutement/guide_recrutement", public: false },
   "recrutement-collectif": { fichier: "recrutement/recrutement_collectif", public: false },
@@ -4937,38 +4941,39 @@ app.post("/api/resend-activation", async (req, res) => {
     if (inviteErr) {
       const msg = String(inviteErr.message || "");
 
-      // ✅ Cas : user déjà créé -> on génère un lien "recovery" pour définir le mot de passe
+      // ✅ Cas : user déjà créé
       if (msg.toLowerCase().includes("already been registered")) {
         const FRONT = FRONTEND_URL;
-        const redirectTo = `${FRONT}/create-password.html?pending_id=${pending_id}`;
 
-        const { data: linkData, error: linkErr } =
-          await supabaseAdmin.auth.admin.generateLink({
-            type: "recovery",
-            email: pending.email,
-            options: { redirectTo },
-          });
+        // Si le compte n'est PAS encore finalisé → renvoyer vers welcome.html (comme direct-activate)
+        if (pending.status !== "activated") {
+          // Confirmer l'email du user
+          if (pending.user_id) {
+            await supabaseAdmin.auth.admin.updateUserById(pending.user_id, { email_confirm: true });
+          }
 
-        if (linkErr) return res.status(500).json({ error: linkErr.message });
+          const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
+          const { data: linkData, error: linkErr } =
+            await supabaseAdmin.auth.admin.generateLink({
+              type: "magiclink",
+              email: pending.email,
+              options: { redirectTo },
+            });
 
-        const setPasswordLink =
-          linkData?.properties?.action_link ||
-          linkData?.properties?.actionLink ||
-          null;
+          if (linkErr) return res.status(500).json({ error: linkErr.message });
 
-        if (!setPasswordLink) {
-          return res.status(500).json({ error: "Missing set_password_link" });
+          const actionLink =
+            linkData?.properties?.action_link ||
+            linkData?.properties?.actionLink ||
+            null;
+
+          if (!actionLink) return res.status(500).json({ error: "Lien d'activation manquant." });
+
+          return res.json({ ok: true, action_link: actionLink });
         }
 
-        if (!devToolsAllowed(req)) {
-          return res.json({ ok: true, account_exists: true });
-        }
-
-        return res.json({
-          ok: true,
-          account_exists: true,
-          set_password_link: setPasswordLink,
-        });
+        // Si le compte EST déjà activé → juste informer l'utilisateur
+        return res.json({ ok: true, already_activated: true });
 
       }
 
@@ -4989,6 +4994,78 @@ app.post("/api/resend-activation", async (req, res) => {
 
   } catch (e) {
     return res.status(500).json({ error: e.message });
+  }
+});
+
+
+// ---------------------------
+// Activation directe (anti-spam bypass)
+// ---------------------------
+app.post("/api/direct-activate", async (req, res) => {
+  try {
+    const { pending_id } = req.body;
+    if (!pending_id) return res.status(400).json({ error: "pending_id requis" });
+
+    // 1) Charger le pending_signup
+    const { data: pending, error: pendingErr } = await supabaseAdmin
+      .from("pending_signups")
+      .select("*")
+      .eq("id", pending_id)
+      .single();
+
+    if (pendingErr || !pending) {
+      return res.status(404).json({ error: "pending introuvable" });
+    }
+
+    // 2) Vérifier que le user existe dans Supabase (status "invited")
+    if (!pending.user_id) {
+      return res.status(400).json({ error: "Compte pas encore prêt. Réessayez dans quelques instants." });
+    }
+
+    if (pending.status === "activated") {
+      return res.status(400).json({ error: "Compte déjà activé. Connectez-vous." });
+    }
+
+    // 3) Confirmer l'email du user (bypasse la vérification email)
+    const { error: updateErr } = await supabaseAdmin.auth.admin.updateUserById(
+      pending.user_id,
+      { email_confirm: true }
+    );
+
+    if (updateErr) {
+      log.error("❌ direct-activate updateUserById:", safeError(updateErr));
+      return res.status(500).json({ error: "Impossible de confirmer le compte." });
+    }
+
+    // 4) Générer un magic link pointant vers welcome.html
+    const FRONT = FRONTEND_URL;
+    const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
+
+    const { data: linkData, error: linkErr } = await supabaseAdmin.auth.admin.generateLink({
+      type: "magiclink",
+      email: pending.email,
+      options: { redirectTo },
+    });
+
+    if (linkErr) {
+      log.error("❌ direct-activate generateLink:", safeError(linkErr));
+      return res.status(500).json({ error: "Impossible de générer le lien d'activation." });
+    }
+
+    const actionLink =
+      linkData?.properties?.action_link ||
+      linkData?.properties?.actionLink ||
+      null;
+
+    if (!actionLink) {
+      return res.status(500).json({ error: "Lien d'activation manquant." });
+    }
+
+    return res.json({ ok: true, action_link: actionLink });
+
+  } catch (e) {
+    log.error("❌ /api/direct-activate:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 

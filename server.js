@@ -682,8 +682,8 @@ app.use("/app/videos", express.static(path.join(APP_DIR, "videos"), { maxAge: "3
 
 
 // ==================== CGUV (PDF) ====================
-const CURRENT_TERMS_VERSION = "2026-01-20"; // <-- mets TA date
-const CGUV_FILENAME = `cguv_integora_v${CURRENT_TERMS_VERSION}.pdf`;
+const CURRENT_TERMS_VERSION = "2026-03-20"; // <-- mets TA date
+const CGUV_FILENAME = `CGUV_INTEGORA_v1.0_${CURRENT_TERMS_VERSION}.pdf`;
 
 app.get("/legal/cguv", (req, res) => {
   // PDF stocké dans: frontend/app/assets/pages_publiques/
@@ -765,8 +765,8 @@ const PAGE_MIN_PLAN = {
 
 
   // RECRUTEMENT 
-  "fiche_de_poste": "standard",
-  "fiche_de_poste_outil": "standard",
+  "fiche_de_poste": "trial",
+  "fiche_de_poste_outil": "trial",
   "rediger_offre_recrutement": "trial",
   "guide_recrutement": "trial",
   "recrutement_collectif": "standard",

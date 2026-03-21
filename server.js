@@ -832,14 +832,16 @@ app.use("/app", (req, res, next) => {
   if (isAsset) return next(); // les assets passent
 
   return authenticateToken(req, res, () => {
-    // 1) Abonnement actif requis pour tout /app (comme avant)
-    if (!req.user?.has_active_subscription) {
+    // ✅ Profil accessible même avec abonnement expiré (pour renouveler)
+    const pageName = getPageNameFromAppPath(req.path);
+    const exemptPages = ["profile"];
+
+    // 1) Abonnement actif requis pour tout /app (sauf pages exemptées)
+    if (!req.user?.has_active_subscription && !exemptPages.includes(pageName)) {
       return res.status(403).sendFile(path.join(FRONTEND_DIR, "subscription-expired.html"));
     }
 
     // 2) Contrôle plan par page
-    const pageName = getPageNameFromAppPath(req.path);
-
     if (!canAccessPageServer(req.user, pageName)) {
       // ✅ Objectif: ne JAMAIS afficher la page premium, même si l'URL est tapée
       // On redirige vers 403.html (ton fichier est dans /frontend/403.html)
@@ -1834,6 +1836,11 @@ async function resolveUserFromCookie(req) {
     throw new Error("PROFILE_NOT_FOUND");
   }
 
+  // ✅ Date d'expiration unifiée (trial_end pour trial, current_period_end ou dérivée pour payant)
+  const subscriptionEndDate = subscriptionResult.plan === 'trial'
+    ? (subscriptionResult.trial_end || null)
+    : (subscriptionResult.current_period_end || subscriptionResult.derived_paid_end || null);
+
   const user = {
     id: decoded.id,
     email: decoded.email,
@@ -1843,6 +1850,7 @@ async function resolveUserFromCookie(req) {
     avatar_url: profileResult.data.avatar_url,
     subscription_type: subscriptionResult.plan,
     has_active_subscription: subscriptionResult.hasActiveSubscription,
+    subscription_end_date: subscriptionEndDate,
   };
 
   cacheSet(cacheKey, user, 15000);

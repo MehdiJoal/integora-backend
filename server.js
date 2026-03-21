@@ -994,8 +994,11 @@ function validateCSRF(req, res, next) {
     // (optionnel) si tu gardes encore l’ancienne route quelque part
     '/api/create-paid-checkout',
 
-    // ✅ PUBLIC CONTACT 
+    // ✅ PUBLIC CONTACT
     '/api/contact/ticket',
+
+    // ✅ CRON (appelé par Supabase pg_cron, pas de cookies/CSRF)
+    '/api/cron/expiration-reminders',
 
   ]);
 

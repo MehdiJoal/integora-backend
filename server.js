@@ -5760,7 +5760,7 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
     const { data: subs, error: subsErr } = await supabaseAdmin
       .from("subscriptions")
       .select("user_id, plan, status, current_period_end, trial_end")
-      .in("status", ["active", "past_due", "trialing"]);
+      .in("status", ["active", "trialing"]);
 
     if (subsErr) throw subsErr;
     if (!subs?.length) return res.json({ ok: true, sent: 0, detail: "Aucun abonnement actif" });

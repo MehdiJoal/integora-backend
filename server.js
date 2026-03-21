@@ -1791,6 +1791,21 @@ async function resolveUserFromCookie(req) {
     .maybeSingle(); // ✅ pas de throw si 0 ligne
 
   if (sessionError || !session) {
+    // ✅ Vérifier si la session a été révoquée (connexion depuis un autre appareil)
+    const { data: revoked } = await supabaseAdmin
+      .from("token_sessions")
+      .select("revoked_at")
+      .eq("token_hash", tokenHash)
+      .eq("user_id", decoded.id)
+      .eq("is_active", false)
+      .not("revoked_at", "is", null)
+      .maybeSingle();
+
+    if (revoked) {
+      log.warn("🔒 SESSION_REVOKED (connexion concurrente)", { user_id: decoded.id });
+      throw new Error("SESSION_REVOKED");
+    }
+
     log.warn("❌ INVALID_SESSION", {
       sessionError: sessionError?.message,
       user_id: decoded.id,
@@ -1904,11 +1919,20 @@ function handleAuthenticationError(req, res, error) {
 
   });
 
+  const isRevoked = error?.message === "SESSION_REVOKED";
   const accept = req.headers.accept || "";
   const wantsHtml = accept.includes("text/html");
 
   if (wantsHtml) {
-    return res.redirect("/401.html?next=" + encodeURIComponent(req.originalUrl));
+    const reason = isRevoked ? "&reason=concurrent" : "";
+    return res.redirect("/401.html?next=" + encodeURIComponent(req.originalUrl) + reason);
+  }
+
+  if (isRevoked) {
+    return res.status(401).json({
+      error: "Une autre session est active sur ce compte.",
+      code: "SESSION_REVOKED",
+    });
   }
 
   return res.status(401).json({
@@ -3276,6 +3300,15 @@ app.post("/verify-token", async (req, res) => {
     const user = await resolveUserFromCookie(req);
     return res.json({ valid: true, user });
   } catch (error) {
+    // ✅ Connexion concurrente : on le signale au frontend
+    if (error.message === "SESSION_REVOKED") {
+      res.clearCookie("auth_token", {
+        path: "/",
+        secure: IS_PROD,
+        sameSite: IS_PROD ? "none" : "lax",
+      });
+      return res.json({ valid: false, code: "SESSION_REVOKED" });
+    }
     return res.json({ valid: false });
   }
 });

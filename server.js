@@ -5737,6 +5737,132 @@ app.post("/api/logout", async (req, res) => {
   });
 });
 
+// ==================== CRON : RAPPELS EXPIRATION ABONNEMENT ====================
+
+const CRON_SECRET = process.env.CRON_SECRET;
+const emailTemplates = require("./email-templates");
+
+app.post("/api/cron/expiration-reminders", async (req, res) => {
+  // ✅ Sécurité : secret partagé
+  const secret = req.headers["x-cron-secret"] || req.body?.secret;
+  if (!CRON_SECRET || secret !== CRON_SECRET) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  try {
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10); // YYYY-MM-DD
+
+    // ✅ Récupérer tous les abonnements avec date de fin
+    const { data: subs, error: subsErr } = await supabaseAdmin
+      .from("subscriptions")
+      .select("user_id, plan, status, current_period_end, trial_end")
+      .in("status", ["active", "past_due", "trialing"]);
+
+    if (subsErr) throw subsErr;
+    if (!subs?.length) return res.json({ ok: true, sent: 0, detail: "Aucun abonnement actif" });
+
+    // ✅ Définir les rappels à vérifier par plan
+    const paidReminders = [
+      { type: "j-30", days: 30 },
+      { type: "j-7", days: 7 },
+      { type: "j-3", days: 3 },
+      { type: "j-1", days: 1 },
+      { type: "expired", days: 0 },
+    ];
+    const trialReminders = [
+      { type: "j-3", days: 3 },
+      { type: "j-1", days: 1 },
+      { type: "expired", days: 0 },
+    ];
+
+    const templateMap = {
+      "j-30": emailTemplates.reminderJ30,
+      "j-7": emailTemplates.reminderJ7,
+      "j-3": emailTemplates.reminderJ3,
+      "j-1": emailTemplates.reminderJ1,
+      "expired": emailTemplates.reminderExpired,
+    };
+
+    let sent = 0;
+    const errors = [];
+
+    for (const sub of subs) {
+      const plan = (sub.plan || "trial").toLowerCase();
+      const isTrial = plan === "trial";
+      const endDateRaw = isTrial ? sub.trial_end : sub.current_period_end;
+      if (!endDateRaw) continue;
+
+      const endDate = new Date(endDateRaw);
+      if (isNaN(endDate.getTime())) continue;
+
+      // ✅ Calculer les jours restants (différence en jours calendaires)
+      const endDay = endDate.toISOString().slice(0, 10);
+      const diffMs = new Date(endDay) - new Date(today);
+      const daysLeft = Math.round(diffMs / (1000 * 60 * 60 * 24));
+
+      const reminders = isTrial ? trialReminders : paidReminders;
+
+      for (const reminder of reminders) {
+        if (daysLeft !== reminder.days) continue;
+
+        // ✅ Anti-doublon : vérifier si déjà envoyé
+        const { data: existing } = await supabaseAdmin
+          .from("subscription_reminders")
+          .select("id")
+          .eq("user_id", sub.user_id)
+          .eq("reminder_type", reminder.type)
+          .eq("expiration_date", endDay)
+          .maybeSingle();
+
+        if (existing) continue;
+
+        // ✅ Récupérer le profil (prénom + email)
+        const { data: profile } = await supabaseAdmin
+          .from("profiles")
+          .select("first_name")
+          .eq("user_id", sub.user_id)
+          .single();
+
+        // Récupérer l'email depuis auth
+        const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(sub.user_id);
+        const email = authUser?.user?.email;
+        if (!email) continue;
+
+        const firstName = profile?.first_name || "Utilisateur";
+        const templateFn = templateMap[reminder.type];
+        if (!templateFn) continue;
+
+        const { subject, html } = templateFn({ firstName, plan, endDate: endDateRaw });
+
+        try {
+          await sendResendEmail({ to: email, subject, html });
+
+          // ✅ Logger dans subscription_reminders (anti-doublon)
+          await supabaseAdmin.from("subscription_reminders").insert({
+            user_id: sub.user_id,
+            reminder_type: reminder.type,
+            expiration_date: endDay,
+            sent_at: new Date().toISOString(),
+          });
+
+          sent++;
+          log.info(`📧 Rappel ${reminder.type} envoyé à ${email} (plan: ${plan})`);
+        } catch (emailErr) {
+          errors.push({ user_id: sub.user_id, type: reminder.type, error: emailErr.message });
+          log.error(`❌ Erreur envoi rappel ${reminder.type}:`, safeError(emailErr));
+        }
+      }
+    }
+
+    return res.json({ ok: true, sent, errors: errors.length ? errors : undefined });
+  } catch (err) {
+    log.error("❌ Cron expiration-reminders:", safeError(err));
+    return res.status(500).json({ error: "Erreur interne cron" });
+  }
+});
+
+
 // Démarrage du serveur
 const FINAL_PORT = process.env.PORT || 3000;
 app.listen(FINAL_PORT, () => {

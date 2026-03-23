@@ -282,9 +282,8 @@ app.get('/api/health/supabase', async (req, res) => {
 
 
     if (error) {
-      log.error("❌ authEmailExists listUsers error:", safeError(error));
-      // SAFE MODE : si on ne peut pas vérifier, on bloque
-      return true;
+      log.error("❌ Health check Supabase error:", safeError(error));
+      return res.status(500).json({ ok: false, error: "SUPABASE_UNAVAILABLE" });
     }
 
 
@@ -3646,9 +3645,6 @@ app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
     }
 
     return res.json({ ok: true, message: "Entreprise mise à jour", company, stripe_synced });
-
-
-    return res.json({ ok: true, message: "Entreprise mise à jour", company });
   } catch (e) {
     log.error("💥 [API update-billing] Exception:", safeError(e));
     return res.status(500).json({ ok: false, error: "Erreur serveur update-billing" });

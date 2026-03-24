@@ -125,7 +125,7 @@ app.use((req, res, next) => {
 // ==========================================
 const path = require('path');
 const fs = require('fs');
-const bodyParser = require("body-parser");
+// FIX B16 — bodyParser supprimé (inutilisé, express.json() fait le travail)
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const cookieParser = require("cookie-parser");
@@ -905,10 +905,14 @@ function enforceSameSiteForMutations(req, res, next) {
     try {
       const refOrigin = new URL(referer).origin;
       if (!allowed(refOrigin)) return res.status(403).json({ error: "Referer interdit" });
+      return next();
     } catch {
       return res.status(403).json({ error: "Referer invalide" });
     }
   }
+
+  // ✅ FIX B7 — En prod, bloquer les mutations sans Origin ni Referer
+  if (IS_PROD) return res.status(403).json({ error: "Origin requis" });
 
   return next();
 }
@@ -1597,7 +1601,8 @@ function cleanPersonName(v, { max } = {}) {
 //Helper 3 — message (libre mais safe)
 function cleanMessage(v, { max } = {}) {
   if (typeof v !== "string") return "";
-  const s = v.trim();
+  // ✅ FIX B10 — Retirer les balises HTML (protection XSS stocké)
+  const s = v.trim().replace(/<[^>]*>/g, "");
   if (!s) return "";
   return s.length > max ? s.slice(0, max) : s;
 }
@@ -1759,6 +1764,16 @@ function cacheSet(key, value, ttlMs = 4000) {
   __authCache.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
 
+// ✅ FIX B9 — Ménage automatique des caches toutes les 5 min (évite fuite mémoire)
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of __authCache) {
+    if (v.expiresAt < now) __authCache.delete(k);
+  }
+  for (const [k, v] of __prepayCooldown) {
+    if (now - v > 120000) __prepayCooldown.delete(k);
+  }
+}, 300000);
 
 // Middleware d'authentification
 // server.js - NOUVELLE VERSION authenticateToken
@@ -3908,6 +3923,11 @@ app.get('/api/public/preview/*', async (req, res) => {
   try {
     const pathInBucket = req.params[0];
 
+    // ✅ FIX B19 — Bloquer les chemins qui essaient de remonter dans les dossiers
+    if (!pathInBucket || pathInBucket.includes('..')) {
+      return res.status(400).json({ error: "Chemin invalide" });
+    }
+
     const { data, error } = await supabase.storage.from('public').download(pathInBucket);
     if (error || !data) {
       return res.status(404).send('Not found');
@@ -5464,10 +5484,7 @@ const contactPublicLimiter = rateLimit({
 
 
 
-// helper email
-function isValidEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
-}
+// ✅ FIX B14 — isValidEmail doublon supprimé (déjà déclaré plus haut ligne ~2407)
 
 async function findRecentDuplicateContact({ email, subject, message, minutes = 10 }) {
   try {
@@ -5493,7 +5510,7 @@ async function findRecentDuplicateContact({ email, subject, message, minutes = 1
 
 app.post("/api/contact/ticket", contactPublicLimiter, async (req, res) => {
   try {
-    // Si tu n'as pas déjà app.use(express.json()) plus haut, garde bodyParser
+    // Parsing du body JSON via express.json()
     const subject = String(req.body?.subject || "").trim();
     const message = cleanMessage(req.body?.message, { max: 1200 });
     const pageUrl = String(req.body?.pageUrl || "").trim() || null;
@@ -5846,7 +5863,9 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
           });
 
           sent++;
-          log.info(`📧 Rappel ${reminder.type} envoyé à ${email} (plan: ${plan})`);
+          // ✅ FIX B17 — Email masqué dans les logs (RGPD)
+          const maskedEmail = email ? `${email.slice(0, 3)}***@${email.split('@')[1] || '?'}` : 'inconnu';
+          log.info(`📧 Rappel ${reminder.type} envoyé à ${maskedEmail} (plan: ${plan})`);
         } catch (emailErr) {
           errors.push({ user_id: sub.user_id, type: reminder.type, error: emailErr.message });
           log.error(`❌ Erreur envoi rappel ${reminder.type}:`, safeError(emailErr));

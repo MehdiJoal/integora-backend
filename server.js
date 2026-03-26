@@ -3663,8 +3663,8 @@ app.get("/api/my-avatar-url", authenticateToken, async (req, res) => {
       return v;
     };
 
-    // ✅ IMPORTANT : ton fichier default est dans "default/default-avatar.png"
-    const DEFAULT_AVATAR_PATH = "default/default-avatar.png";
+    // ✅ IMPORTANT : ton fichier default est dans "default/default-avatar.webp"
+    const DEFAULT_AVATAR_PATH = "default/default-avatar.webp";
 
     const path = normalizeAvatarPath(prof?.avatar_url) || DEFAULT_AVATAR_PATH;
 

@@ -3639,10 +3639,12 @@ app.get("/api/my-avatar-url", authenticateToken, async (req, res) => {
       return v;
     };
 
-    // ✅ IMPORTANT : ton fichier default est dans "default/default-avatar.webp"
-    const DEFAULT_AVATAR_PATH = "default/default-avatar.webp";
+    // ✅ IMPORTANT : ton fichier default est dans "avatars/default/default-avatar.webp"
+    const DEFAULT_AVATAR_PATH = "avatars/default/default-avatar.webp";
 
-    const path = normalizeAvatarPath(prof?.avatar_url) || DEFAULT_AVATAR_PATH;
+    let path = normalizeAvatarPath(prof?.avatar_url) || DEFAULT_AVATAR_PATH;
+    // ✅ Migration PNG → WebP pour l'avatar par défaut
+    if (path === "default/default-avatar.png" || path === "avatars/default/default-avatar.png") path = DEFAULT_AVATAR_PATH;
 
     const { data: signed, error: signErr } = await supabase.storage
       .from("Avatars")

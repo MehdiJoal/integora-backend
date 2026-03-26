@@ -619,54 +619,30 @@ app.use("/app", (req, res, next) => {
   res.send(html);
 });
 
-// Images "générales" (hors assets) : cache moyen
+// Images "générales" (hors assets) : cache 1 mois
 app.use(
   "/app/images",
   express.static(path.join(APP_DIR, "images"), {
-    etag: false,
-    lastModified: false,
-    maxAge: 0,
-    setHeaders(res) {
-      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-      res.setHeader("Pragma", "no-cache");
-      res.setHeader("Expires", "0");
-      res.setHeader("Surrogate-Control", "no-store");
-    },
+    etag: true,
+    maxAge: IS_PROD ? "30d" : "0",
   })
 );
 
-// ✅ IMPORTANT : cache LONG uniquement pour le dossier logo
-// => /app/assets/logo/logo.webp sera "figé" et instant en navigation
+// ✅ Logo : cache 1 mois
 app.use(
   "/app/assets/logo",
   express.static(path.join(APP_DIR, "assets", "logo"), {
-    etag: false,
-    lastModified: false,
-    maxAge: 0,
-    setHeaders(res) {
-      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-      res.setHeader("Pragma", "no-cache");
-      res.setHeader("Expires", "0");
-      res.setHeader("Surrogate-Control", "no-store");
-    },
+    etag: true,
+    maxAge: IS_PROD ? "30d" : "0",
   })
 );
 
-
-// ✅ Le reste de /app/assets (jeux, illustrations, etc.) : cache NORMAL
-// => si tu remplaces une image sans changer son nom, elle se mettra à jour bien plus vite
+// ✅ Le reste de /app/assets (jeux, illustrations, etc.) : cache 1 mois
 app.use(
   "/app/assets",
   express.static(path.join(APP_DIR, "assets"), {
-    etag: false,
-    lastModified: false,
-    maxAge: 0,
-    setHeaders(res) {
-      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-      res.setHeader("Pragma", "no-cache");
-      res.setHeader("Expires", "0");
-      res.setHeader("Surrogate-Control", "no-store");
-    },
+    etag: true,
+    maxAge: IS_PROD ? "30d" : "0",
   })
 );
 

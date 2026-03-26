@@ -877,8 +877,8 @@ app.get("/app/*", (req, res) => {
     if (fs.existsSync(p)) return res.sendFile(p);
   }
 
-  // fallback app
-  return res.sendFile(path.join(APP_DIR, "choix_irl_digital.html"));
+  // ✅ FIX B22 — Vraie 404 au lieu de servir silencieusement la page d'accueil
+  return res.status(404).sendFile(path.join(APP_DIR, "..", "404.html"));
 });
 
 //middleware empechant POST PUT, ect site externe
@@ -1018,12 +1018,23 @@ function validateCSRF(req, res, next) {
     log.warn("🚨 CSRF Token invalide", {
       method: req.method,
       path: req.path,
-      url: req.url,
-      originalUrl: req.originalUrl,
       headerToken: headerToken ? "present" : "missing",
       cookieToken: cookieToken ? "present" : "missing",
     });
     return res.status(403).json({ error: "Token CSRF invalide" });
+  }
+
+  // ✅ SÉCURITÉ : vérifier que le HMAC correspond à la session actuelle
+  const sessionToken = req.cookies?.auth_token || "";
+  const parts = headerToken.split(".");
+  if (parts.length === 2) {
+    const expectedHmac = crypto.createHmac("sha256", process.env.JWT_SECRET)
+      .update(parts[0] + sessionToken)
+      .digest("hex");
+    if (expectedHmac !== parts[1]) {
+      log.warn("🚨 CSRF HMAC invalide (session mismatch)");
+      return res.status(403).json({ error: "Token CSRF invalide" });
+    }
   }
 
 
@@ -1033,14 +1044,30 @@ function validateCSRF(req, res, next) {
 
 function ensureCsrfToken(req, res, next) {
   try {
-    // Si déjà présent, on ne régénère pas
-    if (req.cookies && req.cookies["XSRF-TOKEN"]) return next();
+    const sessionToken = req.cookies?.auth_token || "";
 
-    const token = crypto.randomBytes(32).toString("hex");
+    // Régénérer si absent OU si la session a changé (le HMAC ne matchera plus)
+    const existingCsrf = req.cookies?.["XSRF-TOKEN"];
+    if (existingCsrf && sessionToken) {
+      // Vérifie que le token existant est encore valide pour cette session
+      const parts = existingCsrf.split(".");
+      if (parts.length === 2) {
+        const expectedHmac = crypto.createHmac("sha256", process.env.JWT_SECRET)
+          .update(parts[0] + sessionToken)
+          .digest("hex");
+        if (expectedHmac === parts[1]) return next(); // token encore valide
+      }
+    }
 
-    // Render + Vercel = https => secure + SameSite=None
+    // Générer un nouveau token CSRF lié à la session
+    const randomPart = crypto.randomBytes(32).toString("hex");
+    const hmac = crypto.createHmac("sha256", process.env.JWT_SECRET)
+      .update(randomPart + sessionToken)
+      .digest("hex");
+    const token = randomPart + "." + hmac;
+
     res.cookie("XSRF-TOKEN", token, {
-      httpOnly: false,                 // doit être lisible par le frontend si besoin
+      httpOnly: false,
       secure: IS_PROD,
       sameSite: IS_PROD ? "none" : "lax",
       path: "/"
@@ -1060,6 +1087,19 @@ function requireCsrf(req, res, next) {
   if (!headerToken || !cookieToken || headerToken !== cookieToken) {
     return res.status(403).json({ error: "Token CSRF invalide", code: "CSRF_INVALID" });
   }
+
+  // ✅ SÉCURITÉ : vérifier le HMAC lié à la session
+  const sessionToken = req.cookies?.auth_token || "";
+  const parts = headerToken.split(".");
+  if (parts.length === 2) {
+    const expectedHmac = crypto.createHmac("sha256", process.env.JWT_SECRET)
+      .update(parts[0] + sessionToken)
+      .digest("hex");
+    if (expectedHmac !== parts[1]) {
+      return res.status(403).json({ error: "Token CSRF invalide", code: "CSRF_INVALID" });
+    }
+  }
+
   return next();
 }
 
@@ -2173,239 +2213,9 @@ app.get("/api/payment-method/status", authenticateToken, async (req, res) => {
 
 
 
-app.post("/api/request-account-deletion", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { email } = req.body;
-
-    // Vérifier l'email
-    if (email !== req.user.email) {
-      return res.status(400).json({ error: "Email incorrect" });
-    }
-
-    // 🔥 Générer un token de suppression
-    const deletionToken = jwt.sign(
-      {
-        user_id: userId,
-        email,
-        action: "delete_account",
-        timestamp: Date.now(),
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: "1h" }
-    );
-
-    // 🔥 Construire le lien de confirmation
-    const frontendUrl =
-      process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
-    const confirmationLink = `${frontendUrl}/confirm-deletion.html?token=${deletionToken}`;
-
-    // 🔥 Appel Edge Function
-    const edgeResponse = await fetch(
-      `${process.env.SUPABASE_URL}/functions/v1/send-deletion-email`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          user_id: userId,
-          email,
-          confirmation_link: confirmationLink,
-        }),
-      }
-    );
-
-    const edgeResult = await edgeResponse.json();
-
-    // ❌ Edge a échoué
-    if (!edgeResponse.ok) {
-      log.error("❌ [SERVER] Erreur Edge Function:", edgeResult);
-
-      // ✅ PROD : ne jamais renvoyer le lien
-      if (IS_PROD) {
-        return res.status(502).json({
-          success: false,
-          error: "EMAIL_SEND_FAILED",
-          message:
-            "Impossible d’envoyer l’email de confirmation. Réessayez dans quelques minutes.",
-        });
-      }
-
-      // ✅ DEV uniquement : on peut renvoyer le lien pour débug
-      return res.json({
-        success: true,
-        message: "Lien de suppression généré (dev uniquement)",
-        link: confirmationLink,
-        test_mode: true,
-      });
-    }
-
-    // ✅ OK : email envoyé
-    return res.json({
-      success: true,
-      message: "Email de confirmation envoyé",
-    });
-  } catch (error) {
-    log.error("❌ [SERVER] Erreur demande suppression:", safeError(error));
-
-    // ✅ PROD : pas de détails techniques, pas de lien
-    if (IS_PROD) {
-      return res.status(500).json({
-        success: false,
-        error: "SERVER_ERROR",
-        message:
-          "Une erreur est survenue. Réessayez dans quelques minutes.",
-      });
-    }
-
-    // DEV : fallback lien (optionnel)
-    const frontendUrl =
-      process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
-    const confirmationLink = `${frontendUrl}/confirm-deletion.html?token=fallback_${Date.now()}`;
-
-    return res.json({
-      success: true,
-      message: "Lien de suppression généré (dev uniquement)",
-      link: confirmationLink,
-      test_mode: true,
-      error: error.message,
-    });
-  }
-});
-
-
-
-
-
-// ✅ ROUTE POUR CONFIRMER LA SUPPRESSION (AVEC ARCHIVAGE)
-app.post('/api/confirm-account-deletion', async (req, res) => {
-  try {
-    const { token } = req.body;
-
-    if (!token) {
-      return res.status(400).json({ error: 'Token manquant' });
-    }
-
-    // 🔥 VÉRIFIER LE TOKEN
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    if (decoded.action !== 'delete_account') {
-      return res.status(400).json({ error: 'Token invalide' });
-    }
-
-    const userId = decoded.user_id;
-    const userEmail = decoded.email;
-
-
-    // 🔥 1. RÉCUPÉRER TOUTES LES DONNÉES POUR ARCHIVAGE
-    const { data: profileData } = await supabaseAdmin
-      .from('profiles')
-      .select(`
-                *,
-                companies (*)
-            `)
-      .eq('user_id', userId)
-      .single();
-
-    const { data: subscriptionData } = await supabaseAdmin
-      .from('subscriptions')
-      .select('*')
-      .eq('user_id', userId)
-      .single();
-
-    const { data: companyData } = await supabaseAdmin
-      .from('companies')
-      .select('*')
-      .eq('owner_id', userId)
-      .single();
-
-    // 🔥 2. ARCHIVAGE COMPLET
-    const { error: archiveError } = await supabaseAdmin
-      .from('deleted_users_archive')
-      .insert({
-        user_id: userId,
-        email: userEmail,
-
-        // Données profil
-        profile_data: profileData,
-        first_name: profileData?.first_name,
-        last_name: profileData?.last_name,
-        phone: profileData?.phone,
-        avatar_url: profileData?.avatar_url,
-        company_id: profileData?.company_id,
-
-        // Données entreprise
-        company_data: companyData,
-        company_legal_name: companyData?.legal_name,
-        company_display_name: companyData?.display_name,
-
-        // Données abonnement
-        subscription_data: subscriptionData,
-        plan_type: subscriptionData?.plan,
-        subscription_status: subscriptionData?.status,
-        current_period_end: subscriptionData?.current_period_end,
-        stripe_customer_id: subscriptionData?.stripe_customer_id,
-        stripe_subscription_id: subscriptionData?.stripe_subscription_id
-      });
-
-    if (archiveError) {
-      log.error('❌ [SERVER] Erreur archivage:', safeError(archiveError));
-    }
-
-    // 🔥 3. SUPPRIMER L'ABONNEMENT STRIPE
-    try {
-      if (subscriptionData && subscriptionData.stripe_subscription_id) {
-        await stripe.subscriptions.cancel(subscriptionData.stripe_subscription_id);
-
-        if (subscriptionData.stripe_customer_id) {
-          await stripe.customers.del(subscriptionData.stripe_customer_id);
-        }
-      }
-    } catch (stripeError) {
-      log.warn('⚠️ [SERVER] Erreur nettoyage Stripe:', stripeError);
-    }
-
-    // 🔥 4. SUPPRESSION DES DONNÉES (dans l'ordre logique)
-
-    // D'abord supprimer l'entreprise si elle existe
-    if (companyData) {
-      await supabaseAdmin.from('companies').delete().eq('owner_id', userId);
-    }
-
-    // Puis les abonnements
-    await supabaseAdmin.from('subscriptions').delete().eq('user_id', userId);
-
-    // Puis le profil
-    await supabaseAdmin.from('profiles').delete().eq('user_id', userId);
-
-    // 🔥 5. SUPPRIMER LE COMPTE AUTH
-    const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(userId);
-
-    if (deleteError) {
-      log.error('❌ [SERVER] Erreur suppression user auth:', safeError(deleteError));
-      return res.status(500).json({ error: 'Erreur suppression compte' });
-    }
-
-
-    res.json({
-      success: true,
-      message: 'Compte supprimé définitivement',
-      user_id: userId,
-      archived: true
-    });
-
-  } catch (error) {
-    log.error('❌ [SERVER] Erreur confirmation suppression:', safeError(error));
-
-    if (error.name === 'TokenExpiredError') {
-      return res.status(400).json({ error: 'Lien expiré, veuillez refaire une demande' });
-    }
-
-    res.status(500).json({ error: 'Erreur lors de la suppression' });
-  }
-});
+// ✅ SUPPRESSION DE COMPTE — désactivé le 26 mars 2026
+// La suppression se fait désormais via le support (conformité RGPD + traçabilité)
+// Les anciennes routes /api/request-account-deletion et /api/confirm-account-deletion ont été retirées
 
 
 // ==========================================
@@ -2428,21 +2238,23 @@ async function authEmailExists(emailNorm) {
   const target = String(emailNorm || "").toLowerCase().trim();
   if (!target) return false;
 
-  const perPage = 1000;
-  let page = 1;
+  // 1 seul appel HTTP à l'API GoTrue au lieu de scanner 20 000 users
+  const url = `${process.env.SUPABASE_URL}/auth/v1/admin/users?page=1&per_page=1&filter=${encodeURIComponent(target)}`;
+  const resp = await fetch(url, {
+    headers: {
+      "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "apikey": process.env.SUPABASE_SERVICE_ROLE_KEY,
+    },
+  });
 
-  for (let i = 0; i < 20; i++) { // garde-fou (20k users max scannés)
-    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage });
-    if (error) throw error;
-
-    const users = data?.users || [];
-    if (users.some(u => String(u?.email || "").toLowerCase().trim() === target)) return true;
-
-    if (users.length < perPage) break;
-    page += 1;
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => "");
+    throw new Error(`authEmailExists HTTP ${resp.status}: ${errBody}`);
   }
 
-  return false;
+  const body = await resp.json();
+  const users = body?.users || [];
+  return users.some(u => String(u?.email || "").toLowerCase().trim() === target);
 }
 
 
@@ -5005,31 +4817,11 @@ app.post("/api/resend-activation", async (req, res) => {
       if (msg.toLowerCase().includes("already been registered")) {
         const FRONT = FRONTEND_URL;
 
-        // Si le compte n'est PAS encore finalisé → renvoyer vers welcome.html (comme direct-activate)
+        // Si le compte n'est PAS encore finalisé → indiquer d'utiliser le bouton d'activation directe
         if (pending.status !== "activated") {
-          // Confirmer l'email du user
-          if (pending.user_id) {
-            await supabaseAdmin.auth.admin.updateUserById(pending.user_id, { email_confirm: true });
-          }
-
-          const redirectTo = `${FRONT}/welcome.html?pending_id=${pending_id}`;
-          const { data: linkData, error: linkErr } =
-            await supabaseAdmin.auth.admin.generateLink({
-              type: "magiclink",
-              email: pending.email,
-              options: { redirectTo },
-            });
-
-          if (linkErr) return res.status(500).json({ error: linkErr.message });
-
-          const actionLink =
-            linkData?.properties?.action_link ||
-            linkData?.properties?.actionLink ||
-            null;
-
-          if (!actionLink) return res.status(500).json({ error: "Lien d'activation manquant." });
-
-          return res.json({ ok: true, action_link: actionLink });
+          // ✅ SÉCURITÉ : ne plus renvoyer le magic link en JSON
+          // L'utilisateur peut utiliser le bouton "Activer sans email" (GET /api/direct-activate)
+          return res.json({ ok: true, use_direct_activate: true });
         }
 
         // Si le compte EST déjà activé → juste informer l'utilisateur
@@ -5061,10 +4853,10 @@ app.post("/api/resend-activation", async (req, res) => {
 // ---------------------------
 // Activation directe (anti-spam bypass)
 // ---------------------------
-app.post("/api/direct-activate", async (req, res) => {
+app.get("/api/direct-activate", async (req, res) => {
   try {
-    const { pending_id } = req.body;
-    if (!pending_id) return res.status(400).json({ error: "pending_id requis" });
+    const pending_id = req.query.pending_id;
+    if (!pending_id) return res.status(400).send("pending_id requis");
 
     // 1) Charger le pending_signup
     const { data: pending, error: pendingErr } = await supabaseAdmin
@@ -5074,16 +4866,16 @@ app.post("/api/direct-activate", async (req, res) => {
       .single();
 
     if (pendingErr || !pending) {
-      return res.status(404).json({ error: "pending introuvable" });
+      return res.status(404).send("Lien invalide ou expiré.");
     }
 
     // 2) Vérifier que le user existe dans Supabase (status "invited")
     if (!pending.user_id) {
-      return res.status(400).json({ error: "Compte pas encore prêt. Réessayez dans quelques instants." });
+      return res.status(400).send("Compte pas encore prêt. Réessayez dans quelques instants.");
     }
 
     if (pending.status === "activated") {
-      return res.status(400).json({ error: "Compte déjà activé. Connectez-vous." });
+      return res.redirect(`${FRONTEND_URL}/login.html`);
     }
 
     // 3) Confirmer l'email du user (bypasse la vérification email)
@@ -5094,7 +4886,7 @@ app.post("/api/direct-activate", async (req, res) => {
 
     if (updateErr) {
       log.error("❌ direct-activate updateUserById:", safeError(updateErr));
-      return res.status(500).json({ error: "Impossible de confirmer le compte." });
+      return res.status(500).send("Impossible de confirmer le compte.");
     }
 
     // 4) Générer un magic link pointant vers welcome.html
@@ -5109,7 +4901,7 @@ app.post("/api/direct-activate", async (req, res) => {
 
     if (linkErr) {
       log.error("❌ direct-activate generateLink:", safeError(linkErr));
-      return res.status(500).json({ error: "Impossible de générer le lien d'activation." });
+      return res.status(500).send("Impossible de générer le lien d'activation.");
     }
 
     const actionLink =
@@ -5118,14 +4910,15 @@ app.post("/api/direct-activate", async (req, res) => {
       null;
 
     if (!actionLink) {
-      return res.status(500).json({ error: "Lien d'activation manquant." });
+      return res.status(500).send("Lien d'activation manquant.");
     }
 
-    return res.json({ ok: true, action_link: actionLink });
+    // ✅ SÉCURITÉ : redirection serveur — le magic link ne transite jamais en JSON
+    return res.redirect(actionLink);
 
   } catch (e) {
     log.error("❌ /api/direct-activate:", safeError(e));
-    return res.status(500).json({ error: "Erreur serveur" });
+    return res.status(500).send("Erreur serveur");
   }
 });
 
@@ -5769,7 +5562,7 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
     const now = new Date();
     const today = now.toISOString().slice(0, 10); // YYYY-MM-DD
 
-    // ✅ Récupérer tous les abonnements avec date de fin
+    // ✅ 1. Récupérer tous les abonnements actifs (1 requête)
     const { data: subs, error: subsErr } = await supabaseAdmin
       .from("subscriptions")
       .select("user_id, plan, status, current_period_end, trial_end")
@@ -5800,9 +5593,8 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
       "expired": emailTemplates.reminderExpired,
     };
 
-    let sent = 0;
-    const errors = [];
-
+    // ✅ 2. Pré-filtrer : ne garder que les abonnements qui matchent un rappel
+    const candidates = [];
     for (const sub of subs) {
       const plan = (sub.plan || "trial").toLowerCase();
       const isTrial = plan === "trial";
@@ -5812,64 +5604,74 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
       const endDate = new Date(endDateRaw);
       if (isNaN(endDate.getTime())) continue;
 
-      // ✅ Calculer les jours restants (différence en jours calendaires)
       const endDay = endDate.toISOString().slice(0, 10);
       const diffMs = new Date(endDay) - new Date(today);
       const daysLeft = Math.round(diffMs / (1000 * 60 * 60 * 24));
 
       const reminders = isTrial ? trialReminders : paidReminders;
-
       for (const reminder of reminders) {
-        if (daysLeft !== reminder.days) continue;
-
-        // ✅ Anti-doublon : vérifier si déjà envoyé
-        const { data: existing } = await supabaseAdmin
-          .from("subscription_reminders")
-          .select("id")
-          .eq("user_id", sub.user_id)
-          .eq("reminder_type", reminder.type)
-          .eq("expiration_date", endDay)
-          .maybeSingle();
-
-        if (existing) continue;
-
-        // ✅ Récupérer le profil (prénom + email)
-        const { data: profile } = await supabaseAdmin
-          .from("profiles")
-          .select("first_name")
-          .eq("user_id", sub.user_id)
-          .single();
-
-        // Récupérer l'email depuis auth
-        const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(sub.user_id);
-        const email = authUser?.user?.email;
-        if (!email) continue;
-
-        const firstName = profile?.first_name || "Utilisateur";
-        const templateFn = templateMap[reminder.type];
-        if (!templateFn) continue;
-
-        const { subject, html } = templateFn({ firstName, plan, endDate: endDateRaw });
-
-        try {
-          await sendResendEmail({ to: email, subject, html });
-
-          // ✅ Logger dans subscription_reminders (anti-doublon)
-          await supabaseAdmin.from("subscription_reminders").insert({
-            user_id: sub.user_id,
-            reminder_type: reminder.type,
-            expiration_date: endDay,
-            sent_at: new Date().toISOString(),
-          });
-
-          sent++;
-          // ✅ FIX B17 — Email masqué dans les logs (RGPD)
-          const maskedEmail = email ? `${email.slice(0, 3)}***@${email.split('@')[1] || '?'}` : 'inconnu';
-          log.info(`📧 Rappel ${reminder.type} envoyé à ${maskedEmail} (plan: ${plan})`);
-        } catch (emailErr) {
-          errors.push({ user_id: sub.user_id, type: reminder.type, error: emailErr.message });
-          log.error(`❌ Erreur envoi rappel ${reminder.type}:`, safeError(emailErr));
+        if (daysLeft === reminder.days) {
+          candidates.push({ sub, plan, endDateRaw, endDay, reminder });
         }
+      }
+    }
+
+    if (!candidates.length) return res.json({ ok: true, sent: 0, detail: "Aucun rappel à envoyer" });
+
+    // ✅ 3. Charger en bulk les rappels déjà envoyés (1 requête au lieu de N)
+    const userIds = [...new Set(candidates.map(c => c.sub.user_id))];
+    const { data: existingReminders } = await supabaseAdmin
+      .from("subscription_reminders")
+      .select("user_id, reminder_type, expiration_date")
+      .in("user_id", userIds);
+
+    const alreadySent = new Set(
+      (existingReminders || []).map(r => `${r.user_id}|${r.reminder_type}|${r.expiration_date}`)
+    );
+
+    // ✅ 4. Charger en bulk les profils (1 requête au lieu de N)
+    const { data: profiles } = await supabaseAdmin
+      .from("profiles")
+      .select("user_id, first_name")
+      .in("user_id", userIds);
+
+    const profileMap = new Map((profiles || []).map(p => [p.user_id, p.first_name]));
+
+    // ✅ 5. Envoyer les rappels (seulement getUserById pour les candidats non-doublons)
+    let sent = 0;
+    const errors = [];
+
+    for (const { sub, plan, endDateRaw, endDay, reminder } of candidates) {
+      const key = `${sub.user_id}|${reminder.type}|${endDay}`;
+      if (alreadySent.has(key)) continue;
+
+      // Email : getUserById uniquement pour les vrais envois
+      const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(sub.user_id);
+      const email = authUser?.user?.email;
+      if (!email) continue;
+
+      const firstName = profileMap.get(sub.user_id) || "Utilisateur";
+      const templateFn = templateMap[reminder.type];
+      if (!templateFn) continue;
+
+      const { subject, html } = templateFn({ firstName, plan, endDate: endDateRaw });
+
+      try {
+        await sendResendEmail({ to: email, subject, html });
+
+        await supabaseAdmin.from("subscription_reminders").insert({
+          user_id: sub.user_id,
+          reminder_type: reminder.type,
+          expiration_date: endDay,
+          sent_at: new Date().toISOString(),
+        });
+
+        sent++;
+        const maskedEmail = `${email.slice(0, 3)}***@${email.split('@')[1] || '?'}`;
+        log.info(`📧 Rappel ${reminder.type} envoyé à ${maskedEmail} (plan: ${plan})`);
+      } catch (emailErr) {
+        errors.push({ user_id: sub.user_id, type: reminder.type, error: emailErr.message });
+        log.error(`❌ Erreur envoi rappel ${reminder.type}:`, safeError(emailErr));
       }
     }
 

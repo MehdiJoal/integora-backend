@@ -133,6 +133,7 @@ const crypto = require("crypto");
 const { createClient } = require('@supabase/supabase-js');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
+const compression = require("compression");
 
 
 // ==========================================
@@ -332,6 +333,9 @@ const SECRET_KEY = (() => {
   return fromEnv || crypto.randomBytes(64).toString("hex");
 })();
 
+
+// 🔥 GZIP - Compression des réponses (60-70% de bande passante en moins)
+app.use(compression());
 
 // 🔥 HELMET - Headers de sécurité complets
 app.use(helmet({

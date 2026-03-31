@@ -866,6 +866,9 @@ app.get("/app/*", (req, res) => {
 function enforceSameSiteForMutations(req, res, next) {
   if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) return next();
 
+  // ✅ Exempter les endpoints cron (appels serveur-à-serveur depuis Supabase pg_net, pas d'Origin)
+  if (req.path.startsWith("/api/cron/")) return next();
+
   const origin = req.headers.origin || "";
   const referer = req.headers.referer || "";
 

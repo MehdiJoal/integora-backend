@@ -144,8 +144,7 @@ const RESEND_FROM = process.env.RESEND_FROM || "INTEGORA <noreply@integora.fr>";
 
 async function sendResendEmail({ to, subject, html }) {
   if (!RESEND_API_KEY) {
-    log.warn("⚠️ RESEND_API_KEY manquante : email non envoyé.");
-    return { skipped: true, reason: "missing_resend_api_key" };
+    throw new Error("RESEND_API_KEY manquante : email non envoyé.");
   }
 
   const resp = await fetch("https://api.resend.com/emails", {

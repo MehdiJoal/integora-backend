@@ -31,7 +31,7 @@ function simpleLayout(body) {
 <html lang="fr">
 <head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;font-family:Arial,sans-serif;font-size:15px;color:#1a1a1a;line-height:1.6;">
-  <div style="max-width:560px;margin:0 auto;padding:32px 16px;">
+  <div style="max-width:560px;padding:32px 16px;">
     ${body}
     <hr style="border:none;border-top:1px solid #e2e8f0;margin:32px 0 16px;" />
     <p style="font-size:13px;color:#64748b;line-height:1.6;margin:0;">

@@ -19,6 +19,11 @@ function planLabel(plan) {
   return labels[plan] || plan;
 }
 
+// ✅ Bouton sobre — style lien discret (pas marketing, pas de lien brut)
+function soberLink(text) {
+  return `<p style="margin:20px 0;"><a href="${PROFILE_URL}" style="color:#1a1a1a;font-weight:600;text-decoration:underline;">${text}</a></p>`;
+}
+
 // ✅ Layout simple — style email personnel (évite l'onglet Promotions Gmail)
 function simpleLayout(body) {
   return `
@@ -28,10 +33,12 @@ function simpleLayout(body) {
 <body style="margin:0;padding:0;font-family:Arial,sans-serif;font-size:15px;color:#1a1a1a;line-height:1.6;">
   <div style="max-width:560px;margin:0 auto;padding:32px 16px;">
     ${body}
-    <p style="margin-top:32px;font-size:13px;color:#888;">
-      — L'équipe Integora<br/>
-      <a href="https://integora.fr" style="color:#888;">integora.fr</a> · <a href="mailto:contact@integora.fr" style="color:#888;">contact@integora.fr</a>
+    <hr style="border:none;border-top:1px solid #e2e8f0;margin:32px 0 16px;" />
+    <p style="font-size:13px;color:#64748b;line-height:1.6;margin:0;">
+      L'équipe <strong>Integora</strong><br/>
+      <a href="https://integora.fr" style="color:#64748b;text-decoration:none;">integora.fr</a> · <a href="mailto:contact@integora.fr" style="color:#64748b;text-decoration:none;">contact@integora.fr</a>
     </p>
+    <p style="font-size:11px;color:#94a3b8;margin-top:12px;">&copy; ${new Date().getFullYear()} Integora — Tous droits réservés.</p>
   </div>
 </body>
 </html>`;
@@ -47,7 +54,7 @@ function reminderJ30({ firstName, plan, endDate }) {
       <p>Bonjour ${firstName},</p>
       <p>Votre abonnement <strong>${planLabel(plan)}</strong> arrive à échéance le <strong>${formatDateFR(endDate)}</strong>.</p>
       <p>D'ici là, vous conservez un accès complet à la plateforme. Si vous souhaitez renouveler, vous pouvez le faire depuis votre profil :</p>
-      <p><a href="${PROFILE_URL}">${PROFILE_URL}</a></p>
+      ${soberLink("Accéder à mon compte")}
       <p>N'hésitez pas à nous écrire si vous avez la moindre question.</p>
     `),
   };
@@ -63,7 +70,7 @@ function reminderJ7({ firstName, plan, endDate }) {
       <p>Bonjour ${firstName},</p>
       <p>Votre abonnement <strong>${planLabel(plan)}</strong> expire dans <strong>7 jours</strong>, le <strong>${formatDateFR(endDate)}</strong>.</p>
       <p>Après cette date, votre accès à la plateforme sera suspendu. Vous pouvez renouveler dès maintenant depuis votre profil :</p>
-      <p><a href="${PROFILE_URL}">${PROFILE_URL}</a></p>
+      ${soberLink("Accéder à mon compte")}
       <p>Si vous avez des questions, répondez simplement à cet email.</p>
     `),
   };
@@ -88,7 +95,7 @@ function reminderJ3({ firstName, plan, endDate }) {
         ? "Après cette date, votre accès sera suspendu. Pour continuer à utiliser Integora, il suffit de choisir votre formule :"
         : "Après cette date, votre accès sera suspendu. Vous pouvez renouveler depuis votre profil :"
       }</p>
-      <p><a href="${PROFILE_URL}">${PROFILE_URL}</a></p>
+      ${soberLink("Accéder à mon compte")}
       <p>Une question ? Répondez directement à cet email.</p>
     `),
   };
@@ -113,7 +120,7 @@ function reminderJ1({ firstName, plan, endDate }) {
         ? "Si vous souhaitez continuer à utiliser Integora, choisissez votre formule avant demain :"
         : "Pour conserver votre accès, renouvelez avant demain :"
       }</p>
-      <p><a href="${PROFILE_URL}">${PROFILE_URL}</a></p>
+      ${soberLink("Accéder à mon compte")}
     `),
   };
 }
@@ -134,7 +141,7 @@ function reminderExpired({ firstName, plan, endDate }) {
         : `Votre abonnement <strong>${planLabel(plan)}</strong> a expiré le <strong>${formatDateFR(endDate)}</strong>. Votre accès est maintenant suspendu.`
       }</p>
       <p>Votre compte est conservé, rien n'est perdu. Vous pouvez réactiver votre accès à tout moment :</p>
-      <p><a href="${PROFILE_URL}">${PROFILE_URL}</a></p>
+      ${soberLink("Accéder à mon compte")}
       <p>Si vous avez besoin d'aide, répondez à cet email.</p>
     `),
   };

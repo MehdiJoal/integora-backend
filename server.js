@@ -586,6 +586,10 @@ app.use((req, res, next) => {
 // ✅ Assets /app/* (css/js/images/fonts/videos) — CACHE LONG uniquement pour le LOGO
 const ONE_YEAR_MS = 1000 * 60 * 60 * 24 * 365;
 
+// CSS/JS outils (entretiens RH, etc.) — sous-dossiers des pages outils
+app.use("/app/appui_managerial/outils/css", express.static(path.join(APP_DIR, "appui_managerial", "outils", "css"), { maxAge: IS_PROD ? "7d" : "0", etag: true }));
+app.use("/app/appui_managerial/outils/js", express.static(path.join(APP_DIR, "appui_managerial", "outils", "js"), { maxAge: IS_PROD ? "7d" : "0", etag: true }));
+
 // CSS/JS : cache modéré (pas oublier modifier "const APP_VERSION" après un deploiement pour vider cache prod)
 app.use("/app/css", express.static(path.join(APP_DIR, "css"), { maxAge: IS_PROD ? "7d" : "0", etag: true }));
 app.use("/app/js", express.static(path.join(APP_DIR, "js"), {

@@ -9,7 +9,7 @@ router.get("/health", (req, res) => {
     return res.json({
         ok: true,
         storeVersion: VERSION,
-        file: fullPath,
+        source: "thermometre_v1",
         schema_version: thermometreSituations?.schema_version || null,
         familiesCount:
             thermometreSituations?.recommendations_model?.family_playbooks?.families
@@ -38,7 +38,7 @@ router.post("/generate", (req, res) => {
         return res.status(500).json({
             ok: false,
             error: "THERMOMETRE_GENERATE_FAILED",
-            message: err?.message || String(err),
+            message: "Erreur serveur",
         });
     }
 });

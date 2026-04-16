@@ -604,10 +604,16 @@ app.use("/app/js", express.static(path.join(APP_DIR, "js"), {
 app.use("/app", (req, res, next) => {
   if (!req.path.endsWith(".html")) return next();
 
+  // 🛡️ Anti path traversal : s'assurer que le chemin résolu reste dans APP_DIR
   const filePath = path.join(APP_DIR, req.path);
-  if (!fs.existsSync(filePath)) return next();
+  const resolved = path.resolve(filePath);
+  const appDirResolved = path.resolve(APP_DIR);
+  if (resolved !== appDirResolved && !resolved.startsWith(appDirResolved + path.sep)) {
+    return res.status(403).send("Forbidden");
+  }
+  if (!fs.existsSync(resolved)) return next();
 
-  let html = fs.readFileSync(filePath, "utf8");
+  let html = fs.readFileSync(resolved, "utf8");
 
   html = html.replace(
     /(src|href)="(\/app\/(js|css)\/[^"]+\.(js|css))(\?[^"]*)?">/g,
@@ -939,6 +945,14 @@ app.use(requireJson);
 // 🔒 CSRF sécurisé (double-submit cookie)
 // -------------------------------------------------------
 
+// 🛡️ Comparaison en temps constant (protège des timing attacks)
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a ?? ""), "utf8");
+  const bb = Buffer.from(String(b ?? ""), "utf8");
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
 
 // → 1. S'assurer qu'un token existe en cookie lisible
 
@@ -1000,7 +1014,7 @@ function validateCSRF(req, res, next) {
   const headerToken = req.headers['x-csrf-token'];
   const cookieToken = req.cookies['XSRF-TOKEN'];
 
-  if (!headerToken || !cookieToken || headerToken !== cookieToken) {
+  if (!headerToken || !cookieToken || !safeEqual(headerToken, cookieToken)) {
     log.warn("🚨 CSRF Token invalide", {
       method: req.method,
       path: req.path,
@@ -1017,7 +1031,7 @@ function validateCSRF(req, res, next) {
     const expectedHmac = crypto.createHmac("sha256", process.env.JWT_SECRET)
       .update(parts[0] + sessionToken)
       .digest("hex");
-    if (expectedHmac !== parts[1]) {
+    if (!safeEqual(expectedHmac, parts[1])) {
       log.warn("🚨 CSRF HMAC invalide (session mismatch)");
       return res.status(403).json({ error: "Token CSRF invalide" });
     }
@@ -1041,7 +1055,7 @@ function ensureCsrfToken(req, res, next) {
         const expectedHmac = crypto.createHmac("sha256", process.env.JWT_SECRET)
           .update(parts[0] + sessionToken)
           .digest("hex");
-        if (expectedHmac === parts[1]) return next(); // token encore valide
+        if (safeEqual(expectedHmac, parts[1])) return next(); // token encore valide
       }
     }
 
@@ -1070,7 +1084,7 @@ function requireCsrf(req, res, next) {
   const headerToken = req.headers["x-csrf-token"];
   const cookieToken = req.cookies?.["XSRF-TOKEN"];
 
-  if (!headerToken || !cookieToken || headerToken !== cookieToken) {
+  if (!headerToken || !cookieToken || !safeEqual(headerToken, cookieToken)) {
     return res.status(403).json({ error: "Token CSRF invalide", code: "CSRF_INVALID" });
   }
 
@@ -1081,7 +1095,7 @@ function requireCsrf(req, res, next) {
     const expectedHmac = crypto.createHmac("sha256", process.env.JWT_SECRET)
       .update(parts[0] + sessionToken)
       .digest("hex");
-    if (expectedHmac !== parts[1]) {
+    if (!safeEqual(expectedHmac, parts[1])) {
       return res.status(403).json({ error: "Token CSRF invalide", code: "CSRF_INVALID" });
     }
   }
@@ -1807,8 +1821,8 @@ async function resolveUserFromCookie(req) {
   const token = req.cookies?.auth_token;
   if (!token) throw new Error("NO_TOKEN");
 
-  // 1) JWT
-  const decoded = jwt.verify(token, SECRET_KEY);
+  // 1) JWT — forcer HS256 uniquement (défense contre "alg:none" et confusion HS/RS)
+  const decoded = jwt.verify(token, SECRET_KEY, { algorithms: ['HS256'] });
 
   // ✅ RPC prépayment: non bloquant + throttle
   if (shouldRunPrepay(decoded.id, 60000)) {
@@ -3245,7 +3259,7 @@ app.get("/api/my-company", authenticateToken, async (req, res) => {
 
     if (error) {
       log.error("❌ [API My-Company] Supabase error:", safeError(error));
-      return res.status(400).json({ ok: false, error: error.message });
+      return res.status(400).json({ ok: false, error: "Erreur serveur" });
     }
 
     // Si pas encore de company : on renvoie un objet vide (pas une 404)
@@ -3450,7 +3464,10 @@ app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
         .maybeSingle();
 
       if (!subErr && subRow?.stripe_customer_id) {
-        await syncStripeCustomerBillingFromDb(subRow.stripe_customer_id, owner_id);
+        await syncStripeCustomerBillingFromDb({
+          userId: owner_id,
+          stripeCustomerId: subRow.stripe_customer_id,
+        });
         stripe_synced = true;
       }
     } catch (e) {
@@ -3611,7 +3628,7 @@ app.post(
       });
 
     } catch (error) {
-      return res.status(500).json({ ok: false, error: "Erreur serveur: " + error.message });
+      return res.status(500).json({ ok: false, error: "Erreur serveur" });
     }
   }
 );
@@ -3625,7 +3642,7 @@ app.get("/api/my-avatar-url", authenticateToken, async (req, res) => {
       .single();
 
     if (error) {
-      return res.status(500).json({ ok: false, error: error.message });
+      return res.status(500).json({ ok: false, error: "Erreur serveur" });
     }
 
     // ✅ Normalise avatar_url : on veut TOUJOURS un PATH "dans le bucket"
@@ -3665,7 +3682,7 @@ app.get("/api/my-avatar-url", authenticateToken, async (req, res) => {
     return res.json({ ok: true, url: signed.signedUrl, path });
   } catch (e) {
     log.error("💥 /api/my-avatar-url exception:", safeError(e));
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: "Erreur serveur" });
   }
 });
 
@@ -3758,6 +3775,16 @@ app.get('/api/assets/:id', authenticateToken, async (req, res) => {
 
     if (assetErr || !asset || !asset.is_active) {
       return serveFallbackImage(res);
+    }
+
+    // 🛡️ IDOR : vérifier que l'utilisateur a le niveau d'abonnement requis
+    if (asset.min_tier) {
+      const userTier = req.user.subscription_type || 'trial';
+      const userLvl = __planRank[userTier] ?? 0;
+      const reqLvl = __planRank[asset.min_tier] ?? 0;
+      if (userLvl < reqLvl) {
+        return res.status(403).json({ error: 'Accès refusé', code: 'TIER_REQUIRED' });
+      }
     }
 
     // 🔄 RÉESSAI SUR LE TÉLÉCHARGEMENT
@@ -4833,7 +4860,7 @@ app.post("/api/resend-activation", async (req, res) => {
     return res.json({ ok: true, resent: true });
 
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 

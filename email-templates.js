@@ -5,6 +5,16 @@
 const FRONT_URL = process.env.FRONTEND_URL || "https://integora.fr";
 const PROFILE_URL = `${FRONT_URL}/login.html?next=/app/profile.html`;
 
+// 🛡️ Échappement HTML pour les variables injectées dans les templates (anti-XSS)
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // ✅ Formatage date FR
 function formatDateFR(isoStr) {
   if (!isoStr) return "—";
@@ -13,10 +23,10 @@ function formatDateFR(isoStr) {
   return d.toLocaleDateString("fr-FR", { day: "numeric", month: "long", year: "numeric" });
 }
 
-// ✅ Label plan
+// ✅ Label plan — les valeurs whitelistées sont safe ; le fallback est échappé
 function planLabel(plan) {
   const labels = { trial: "essai gratuit", standard: "Standard", premium: "Premium" };
-  return labels[plan] || plan;
+  return labels[plan] || escapeHtml(plan);
 }
 
 // ✅ Bouton sobre — style lien discret (pas marketing, pas de lien brut)
@@ -51,7 +61,7 @@ function reminderJ30({ firstName, plan, endDate }) {
   return {
     subject: `${firstName}, votre abonnement Integora expire le ${formatDateFR(endDate)}`,
     html: simpleLayout(`
-      <p>Bonjour ${firstName},</p>
+      <p>Bonjour ${escapeHtml(firstName)},</p>
       <p>Votre abonnement <strong>${planLabel(plan)}</strong> arrive à échéance le <strong>${formatDateFR(endDate)}</strong>.</p>
       <p>D'ici là, vous conservez un accès complet à la plateforme. Si vous souhaitez renouveler, vous pouvez le faire depuis votre profil :</p>
       ${soberLink("Accéder à mon compte")}
@@ -67,7 +77,7 @@ function reminderJ7({ firstName, plan, endDate }) {
   return {
     subject: `${firstName}, plus que 7 jours sur votre abonnement Integora`,
     html: simpleLayout(`
-      <p>Bonjour ${firstName},</p>
+      <p>Bonjour ${escapeHtml(firstName)},</p>
       <p>Votre abonnement <strong>${planLabel(plan)}</strong> expire dans <strong>7 jours</strong>, le <strong>${formatDateFR(endDate)}</strong>.</p>
       <p>Après cette date, votre accès à la plateforme sera suspendu. Vous pouvez renouveler dès maintenant depuis votre profil :</p>
       ${soberLink("Accéder à mon compte")}
@@ -86,7 +96,7 @@ function reminderJ3({ firstName, plan, endDate }) {
       ? `${firstName}, votre essai gratuit Integora se termine dans 3 jours`
       : `${firstName}, votre abonnement Integora expire dans 3 jours`,
     html: simpleLayout(`
-      <p>Bonjour ${firstName},</p>
+      <p>Bonjour ${escapeHtml(firstName)},</p>
       <p>${isTrial
         ? `Votre <strong>essai gratuit</strong> se termine dans <strong>3 jours</strong>, le <strong>${formatDateFR(endDate)}</strong>.`
         : `Votre abonnement <strong>${planLabel(plan)}</strong> expire dans <strong>3 jours</strong>, le <strong>${formatDateFR(endDate)}</strong>.`
@@ -111,7 +121,7 @@ function reminderJ1({ firstName, plan, endDate }) {
       ? `${firstName}, votre essai Integora expire demain`
       : `${firstName}, votre abonnement Integora expire demain`,
     html: simpleLayout(`
-      <p>Bonjour ${firstName},</p>
+      <p>Bonjour ${escapeHtml(firstName)},</p>
       <p>${isTrial
         ? `Votre <strong>essai gratuit</strong> expire <strong>demain</strong>, le <strong>${formatDateFR(endDate)}</strong>.`
         : `Votre abonnement <strong>${planLabel(plan)}</strong> expire <strong>demain</strong>, le <strong>${formatDateFR(endDate)}</strong>.`
@@ -135,7 +145,7 @@ function reminderExpired({ firstName, plan, endDate }) {
       ? `${firstName}, votre essai Integora est terminé`
       : `${firstName}, votre abonnement Integora a expiré`,
     html: simpleLayout(`
-      <p>Bonjour ${firstName},</p>
+      <p>Bonjour ${escapeHtml(firstName)},</p>
       <p>${isTrial
         ? "Votre <strong>essai gratuit</strong> est arrivé à son terme. Votre accès à Integora est maintenant suspendu."
         : `Votre abonnement <strong>${planLabel(plan)}</strong> a expiré le <strong>${formatDateFR(endDate)}</strong>. Votre accès est maintenant suspendu.`

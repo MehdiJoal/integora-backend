@@ -187,7 +187,9 @@ async function sendAdminSignupNotification({
   desired_plan,
 }) {
   try {
-    const RECIPIENTS = ["contact@integora.fr", "mehdi.joalland@integora.fr"];
+    // [16 mai 2026] Destinataires internes : uniquement mehdi.joalland pour l'instant
+    // (compte solo). A elargir avec contact@integora.fr si une equipe rejoint plus tard.
+    const RECIPIENTS = ["mehdi.joalland@integora.fr"];
 
     const planLabel = desired_plan === "trial"
       ? "Essai gratuit 7 jours"
@@ -2898,7 +2900,8 @@ Merci de contacter ce client pour preparer un devis personnalise pour son nouvel
       return res.status(500).json({ error: "Erreur creation ticket" });
     }
 
-    const internalRecipients = ["contact@integora.fr", "mehdi.joalland@integora.fr"];
+    // [16 mai 2026] Destinataires internes : uniquement mehdi.joalland (compte solo).
+    const internalRecipients = ["mehdi.joalland@integora.fr"];
     const subjectMail = `Demande devis 50+ — ${companyName} (#${String(ticket.id).slice(0, 8)})`;
 
     // Generer le lien "Marquer comme traite" (token signe HMAC, expire 90 jours)
@@ -5422,7 +5425,8 @@ app.post("/api/start-trial-invite", async (req, res) => {
           </div>
         `;
         await sendResendEmail({
-          to: ["contact@integora.fr", "mehdi.joalland@integora.fr"],
+          // [16 mai 2026] Destinataires internes : uniquement mehdi.joalland (compte solo).
+          to: ["mehdi.joalland@integora.fr"],
           subject: subjectMail,
           html: htmlAlert,
         });

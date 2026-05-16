@@ -169,6 +169,82 @@ async function sendResendEmail({ to, subject, html }) {
   return data;
 }
 
+// [15 mai 2026] Notification interne (Mehdi + contact@) a chaque nouvelle inscription
+// soumise via le formulaire (trial OU paid). Non-bloquante : si l'envoi echoue,
+// on log et on continue le flow normal (l'inscription du user n'est pas affectee).
+//
+// Destinataires fixes :
+//   - contact@integora.fr (boite generique)
+//   - mehdi.joalland@integora.fr (perso)
+//
+// Format : email court avec resume des infos d'inscription.
+async function sendAdminSignupNotification({
+  first_name,
+  last_name,
+  email,
+  company_name,
+  company_size,
+  desired_plan,
+}) {
+  try {
+    const RECIPIENTS = ["contact@integora.fr", "mehdi.joalland@integora.fr"];
+
+    const planLabel = desired_plan === "trial"
+      ? "Essai gratuit 7 jours"
+      : desired_plan === "paid"
+        ? `Abonnement annuel${company_size ? ` - ${company_size} collaborateurs` : ""}`
+        : `Plan ${desired_plan || "inconnu"}`;
+
+    const fullName = `${first_name || ""} ${last_name || ""}`.trim() || "Anonyme";
+    const subject = `Nouvelle inscription INTEGORA - ${fullName}`;
+
+    const now = new Date().toLocaleString("fr-FR", {
+      day: "2-digit", month: "2-digit", year: "numeric",
+      hour: "2-digit", minute: "2-digit",
+    });
+
+    const html = `<!DOCTYPE html>
+<html lang="fr">
+<head><meta charset="UTF-8" /></head>
+<body style="margin:0; padding:0; background:#ffffff; color:#2d3748; font-family:Arial,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#ffffff; padding:24px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;">
+        <tr><td style="background:#ffffff; border:1px solid #e2e8f0; border-radius:16px; overflow:hidden;">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+            <tr><td align="center" style="padding:22px 20px 12px 20px;">
+              <div style="font-size:18px; font-weight:700; color:#0b132b;">Nouvelle inscription INTEGORA</div>
+              <div style="margin-top:6px; font-size:13px; color:#718096;">Notification interne</div>
+            </td></tr>
+            <tr><td style="padding:0 20px;"><div style="height:1px; background:#e2e8f0;"></div></td></tr>
+            <tr><td style="padding:16px 22px;">
+              <div style="font-size:14px; line-height:1.8; color:#2d3748;">
+                <div><strong>Nom :</strong> ${escapeHtml(fullName)}</div>
+                <div><strong>Email :</strong> ${escapeHtml(email || "—")}</div>
+                <div><strong>Entreprise :</strong> ${escapeHtml(company_name || "—")}</div>
+                <div><strong>Palier :</strong> ${escapeHtml(company_size || "—")}</div>
+                <div><strong>Formule :</strong> ${escapeHtml(planLabel)}</div>
+              </div>
+              <div style="margin-top:14px; font-size:12px; color:#718096;">
+                Soumis le ${escapeHtml(now)}
+              </div>
+            </td></tr>
+          </table>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+    await sendResendEmail({ to: RECIPIENTS, subject, html });
+    log.debug("📧 Admin signup notif sent", { email, plan: desired_plan });
+  } catch (e) {
+    // Non-bloquant : on n'echoue pas l'inscription du user si la notif admin foire
+    log.warn("⚠️ Admin signup notif failed (non-bloquant):", safeError(e));
+  }
+}
+
 function escapeHtml(s = "") {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -189,8 +265,7 @@ let supabase;
 
 const SUBSCRIPTION_TYPES = {
   TRIAL: 'trial',
-  STANDARD: 'standard',
-  PREMIUM: 'premium',
+  PAID: 'paid',
 };
 
 
@@ -524,6 +599,8 @@ app.use('/inscription', authLimiter);
 app.use('/api/verify-token', authLimiter);
 app.use('/api/start-trial-invite', authLimiter);
 app.use('/api/start-paid-checkout', authLimiter);
+// [15 mai 2026] Rate-limit du set initial password (anti-bruteforce)
+app.use('/api/auth/set-initial-password', authLimiter);
 app.use('/api/resend-activation', authLimiter);
 app.use('/api/direct-activate', authLimiter);
 
@@ -670,7 +747,7 @@ app.use("/app/videos", express.static(path.join(APP_DIR, "videos"), { maxAge: "3
 
 
 // ==================== CGUV (PDF) ====================
-const CURRENT_TERMS_VERSION = "2026-03-20"; // <-- mets TA date
+const CURRENT_TERMS_VERSION = "14_05_2026"; // <-- mets TA date
 const CGUV_FILENAME = `CGUV_INTEGORA_v1.0_${CURRENT_TERMS_VERSION}.pdf`;
 
 app.get("/legal/cguv", (req, res) => {
@@ -694,79 +771,75 @@ app.get("/legal/cguv", (req, res) => {
 // ==================== PAGE-LEVEL ACCESS (SERVER) ====================
 
 // Rank des plans (simple et robuste)
-const __planRank = { trial: 0, standard: 1, premium: 2 };
+const __planRank = { trial: 0, paid: 1 };
 
 // Pages qui demandent un plan minimal (clé = nom du fichier sans .html)
 const PAGE_MIN_PLAN = {
-  // PREMIUM
-
   //connaissance_des_collegues_irl
-  "le_pantheon_des_talents": "premium",
+  "le_pantheon_des_talents": "paid",
 
 
   //creativite_irl
-  "le_labo_bizarre": "premium",
+  "le_labo_bizarre": "paid",
 
   //manager autrement
-  "carte_rh_express": "premium",
-  "30_defis_pour_mieux_manager": "premium",
+  "carte_rh_express": "paid",
+  "30_defis_pour_mieux_manager": "paid",
 
   //bien_etre_irl
-  "instant_zen": "premium",
-  "quiz_bien_etre": "premium",
+  "instant_zen": "paid",
+  "quiz_bien_etre": "paid",
 
   //competition_amicale
-  "challenge_des_tribus": "premium",
+  "challenge_des_tribus": "paid",
 
 
 
 
-
-  // STANDARD 
 
   //connaissance_des_collegues_irl
-  "qui_est_qui": "standard",
-  "si_j_etais": "standard",
-  "c_est_moi_ou_pas": "standard",
+  "qui_est_qui": "paid",
+  "si_j_etais": "paid",
+  "c_est_moi_ou_pas": "paid",
 
 
   //creativite_irl
   "conference_absurde": "trial",
-  "histoire_impossible": "standard",
-  "a_vous_de_continuer": "standard",
-  "7_secondes_chrono": "standard",
+  "histoire_impossible": "paid",
+  "a_vous_de_continuer": "paid",
+  "7_secondes_chrono": "paid",
 
 
   //manager autrement
   "un_mot_pour_avancer": "trial",
-  "la_boussole_en_main": "standard",
-  "ce_qu_on_ne_dit_pas_assez": "standard",
+  "la_boussole_en_main": "paid",
+  "ce_qu_on_ne_dit_pas_assez": "paid",
 
 
   //bien_etre_irl
-  "chasse_au_bonheur": "standard",
+  "chasse_au_bonheur": "paid",
 
 
   //collaboration_irl
-  "le_relai_des_mimes": "standard",
+  "le_relai_des_mimes": "paid",
   "switch": "trial",
 
 
-  // RECRUTEMENT 
+  // RECRUTEMENT
   "fiche_de_poste": "trial",
   "fiche_de_poste_outil": "trial",
   "rediger_offre_recrutement": "trial",
   "guide_recrutement": "trial",
-  "recrutement_collectif": "standard",
-  "communication_candidat": "standard",
+  "recrutement_collectif": "paid",
+  "communication_candidat": "paid",
 
 
-  // INTEGRAION 
-  "livret_accueil": "standard",
+  // INTEGRAION
+  "livret_accueil": "paid",
   "processus_integration": "trial",
-  "parrain_marraine": "standard",
-  "tableau_pilotage_des_formations": "standard",
-  "intineraire_de_professionnalisation": "standard",
+  "parrain_marraine": "paid",
+  "tableau_pilotage_des_formations": "paid",
+  "intineraire_de_professionnalisation": "paid",
 
 
 
@@ -831,8 +904,7 @@ app.use("/app", (req, res, next) => {
 
     // 2) Contrôle plan par page
     if (!canAccessPageServer(req.user, pageName)) {
-      // ✅ Objectif: ne JAMAIS afficher la page premium, même si l'URL est tapée
-      // On redirige vers 403.html (ton fichier est dans /frontend/403.html)
+      // ✅ Si le user n'a pas le plan requis pour cette page, on redirige vers 403
       return res.redirect(302, "/403.html");
     }
 
@@ -994,8 +1066,9 @@ function validateCSRF(req, res, next) {
     '/api/finalize-pending',
     '/api/direct-activate',
 
-    // (optionnel) si tu gardes encore l’ancienne route quelque part
-    '/api/create-paid-checkout',
+    // ✅ [15 mai 2026] Set du mdp initial via API admin (evite l'email "Password changed"
+    //    de Supabase pour la creation initiale). Authentifie via access_token Supabase.
+    '/api/auth/set-initial-password',
 
     // ✅ PUBLIC CONTACT
     '/api/contact/ticket',
@@ -1533,7 +1606,33 @@ async function syncStripeCustomerBillingFromDb({ userId, stripeCustomerId, requi
     return { ok: false, reason: "db_read_error" };
   }
 
-  const company = prof?.companies || null;
+  let company = prof?.companies || null;
+
+  // [15 mai 2026] Fallback owner_id : pour les comptes legacy ou les cas
+  // ou profile.company_id n'a jamais ete lie a la company (alors qu'elle
+  // existe via companies.owner_id), on tente une 2eme requete avant de
+  // declarer les infos manquantes. Meme correctif que pour le devis 50+.
+  if (!company) {
+    const { data: companyByOwner, error: ownerErr } = await supabaseAdmin
+      .from("companies")
+      .select(`
+        legal_name,
+        display_name,
+        company_siret,
+        billing_street,
+        billing_postal_code,
+        billing_city,
+        billing_country
+      `)
+      .eq("owner_id", userId)
+      .maybeSingle();
+    if (ownerErr) {
+      log.warn("⚠️ syncStripeCustomerBillingFromDb: companies(owner_id) read error:", ownerErr);
+    } else if (companyByOwner) {
+      company = companyByOwner;
+      log.debug("ℹ️ syncStripeCustomerBillingFromDb: company resolved via owner_id fallback", { userId });
+    }
+  }
 
   const legalName = company?.legal_name || null;
   const displayName = company?.display_name || null;
@@ -1692,7 +1791,7 @@ async function getActiveSubscription(userId) {
 
 
 
-  const paidPlans = ['standard', 'premium'];
+  const paidPlans = ['paid'];
 
   // Calcul de la date de début (started_at prime sur created_at)
   const startedAt = sub.started_at ? new Date(sub.started_at) :
@@ -1763,19 +1862,9 @@ async function applyPendingPrepaymentIfNeeded(userId) {
   }
 }
 
-// recupérer contact depuis table profiles 
-async function getContactNameFromProfiles(userId) {
-  const { data, error } = await supabaseAdmin
-    .from("profiles")
-    .select("first_name, last_name")
-    .eq("user_id", userId)
-    .maybeSingle();
-
-  if (error || !data) return null;
-
-  const full = `${data.first_name ?? ""} ${data.last_name ?? ""}`.trim();
-  return full.length ? full : null;
-}
+// [SUPPRIME 15 mai 2026] getContactNameFromProfiles : helper orphelin
+// (etait utilise uniquement par les routes /api/change-plan et /api/prepay-next-year/session
+//  qui ont ete supprimees)
 
 
 // ✅ OPTIM PERF: throttle du RPC + cache court verify-token
@@ -2045,14 +2134,13 @@ const thermometreRoutes = require("./routes/thermometre.routes");
 app.use(
   "/api/outils/thermometre",
   authenticateToken,                          // ✅ c'est TON middleware auth côté backend
-  requireSubscription(["trial", "standard", "premium"]), // ou ["standard","premium"]
+  requireSubscription(["trial", "paid"]), // tous les plans autorises pour le thermometre
   thermometreRoutes
 );
 
 
 
 
-// ✅ ENDPOINT PAIEMENT STRIPE POUR STANDARD/PREMIUM
 // ==================== STRIPE CONFIG (TEST/LIVE) ====================
 const STRIPE_MODE = (process.env.STRIPE_MODE ?? (process.env.NODE_ENV === "production" ? "live" : "test")).toLowerCase();
 
@@ -2061,31 +2149,53 @@ const STRIPE_SECRET_KEY =
     ? (process.env.STRIPE_SECRET_KEY_LIVE || process.env.STRIPE_SECRET_KEY)
     : (process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY);
 
-const STRIPE_PRICE_STANDARD =
-  STRIPE_MODE === "live"
-    ? (process.env.STRIPE_PRICE_STANDARD_LIVE || process.env.STRIPE_PRICE_STANDARD)
-    : (process.env.STRIPE_PRICE_STANDARD_TEST || process.env.STRIPE_PRICE_STANDARD);
+// [SUPPRIME 15 mai 2026] Constantes legacy STRIPE_PRICE_STANDARD,
+// STRIPE_PRICE_PREMIUM, STANDARD_PREPAY_PRICE_ID, PREMIUM_PREPAY_PRICE_ID
+// retirees apres passage au modele plan unique "paid" + 9 paliers d'effectif.
 
-const STRIPE_PRICE_PREMIUM =
-  STRIPE_MODE === "live"
-    ? (process.env.STRIPE_PRICE_PREMIUM_LIVE || process.env.STRIPE_PRICE_PREMIUM)
-    : (process.env.STRIPE_PRICE_PREMIUM_TEST || process.env.STRIPE_PRICE_PREMIUM);
 
-const STANDARD_PREPAY_PRICE_ID =
-  STRIPE_MODE === "live"
-    ? (process.env.STANDARD_PREPAY_PRICE_ID_LIVE || "")
-    : (process.env.STANDARD_PREPAY_PRICE_ID_TEST || "");
+// ==================== NOUVEAUX TARIFS PAR PALIER (plan 'paid') ====================
+// Mapping palier d'effectif -> Stripe Price ID, selon le mode TEST/LIVE
+const STRIPE_PRICE_BY_TIER = STRIPE_MODE === "live"
+  ? {
+      "5-9":   process.env.STRIPE_PRICE_TIER_5_9_LIVE   || "",
+      "10-14": process.env.STRIPE_PRICE_TIER_10_14_LIVE || "",
+      "15-19": process.env.STRIPE_PRICE_TIER_15_19_LIVE || "",
+      "20-24": process.env.STRIPE_PRICE_TIER_20_24_LIVE || "",
+      "25-29": process.env.STRIPE_PRICE_TIER_25_29_LIVE || "",
+      "30-34": process.env.STRIPE_PRICE_TIER_30_34_LIVE || "",
+      "35-39": process.env.STRIPE_PRICE_TIER_35_39_LIVE || "",
+      "40-44": process.env.STRIPE_PRICE_TIER_40_44_LIVE || "",
+      "45-49": process.env.STRIPE_PRICE_TIER_45_49_LIVE || "",
+    }
+  : {
+      "5-9":   process.env.STRIPE_PRICE_TIER_5_9_TEST   || "",
+      "10-14": process.env.STRIPE_PRICE_TIER_10_14_TEST || "",
+      "15-19": process.env.STRIPE_PRICE_TIER_15_19_TEST || "",
+      "20-24": process.env.STRIPE_PRICE_TIER_20_24_TEST || "",
+      "25-29": process.env.STRIPE_PRICE_TIER_25_29_TEST || "",
+      "30-34": process.env.STRIPE_PRICE_TIER_30_34_TEST || "",
+      "35-39": process.env.STRIPE_PRICE_TIER_35_39_TEST || "",
+      "40-44": process.env.STRIPE_PRICE_TIER_40_44_TEST || "",
+      "45-49": process.env.STRIPE_PRICE_TIER_45_49_TEST || "",
+    };
 
-const PREMIUM_PREPAY_PRICE_ID =
-  STRIPE_MODE === "live"
-    ? (process.env.PREMIUM_PREPAY_PRICE_ID_LIVE || "")
-    : (process.env.PREMIUM_PREPAY_PRICE_ID_TEST || "");
+// Verification au demarrage : alerter si un tier n'a pas de prix configure
+for (const [tier, priceId] of Object.entries(STRIPE_PRICE_BY_TIER)) {
+  if (!priceId) log.error(`❌ Missing STRIPE price for tier ${tier} (mode ${STRIPE_MODE})`);
+}
+
+// Helper: reverse lookup price_id -> tier (utile pour les webhooks et le frontend)
+function tierFromPriceId(priceId) {
+  if (!priceId) return null;
+  for (const [tier, id] of Object.entries(STRIPE_PRICE_BY_TIER)) {
+    if (id === priceId) return tier;
+  }
+  return null;
+}
+
 
 if (!STRIPE_SECRET_KEY) log.error("❌ Missing STRIPE secret key (resolved)");
-if (!STRIPE_PRICE_STANDARD) log.error("❌ Missing STRIPE standard price (resolved)");
-if (!STRIPE_PRICE_PREMIUM) log.error("❌ Missing STRIPE premium price (resolved)");
-if (!STANDARD_PREPAY_PRICE_ID) log.error("❌ Missing STANDARD_PREPAY price id (resolved)");
-if (!PREMIUM_PREPAY_PRICE_ID) log.error("❌ Missing PREMIUM_PREPAY price id (resolved)");
 
 const stripe = require("stripe")(STRIPE_SECRET_KEY);
 
@@ -2131,10 +2241,33 @@ app.get('/api/my-subscription', authenticateToken, async (req, res) => {
 
     const period_end = subscription.current_period_end || subscription.trial_end || null;
 
+    // ============================================================
+    // [14 mai 2026] Distinction tier actuel (facture en cours) vs
+    // tier programme (prochain renouvellement).
+    //
+    //   subscriptions.current_paid_tier = ce que l'utilisateur paie en cours
+    //                                     (mis a jour UNIQUEMENT au renouvellement via webhook invoice.paid)
+    //   subscriptions.tier              = ce qui sera facture au prochain renouvellement
+    //                                     (mis a jour immediatement par /api/subscription/change-tier)
+    //
+    // Si current_paid_tier est NULL (compte legacy avant migration), on
+    // tombe en fallback sur subscription.tier (= aucun changement detecte).
+    // ============================================================
+    const current_tier = subscription.current_paid_tier ?? subscription.tier ?? null;
+    const scheduled_tier = subscription.tier ?? null;
+    const tier_change_pending =
+      !!current_tier &&
+      !!scheduled_tier &&
+      current_tier !== scheduled_tier;
+
 
     return res.json({
       ...subscription,
       period_end,
+      // NOUVEAU : tier actuellement facture (current) vs tier prevu au prochain renouvellement (scheduled)
+      current_tier,
+      scheduled_tier,
+      tier_change_pending,
       hasPrepaidNextPeriod: !!prepaid,
       prepaid: prepaid ? {
         amount: prepaid.amount,
@@ -2222,8 +2355,11 @@ app.get("/api/payment-method/status", authenticateToken, async (req, res) => {
 // ✅ Validation serveur stricte
 // ==========================================
 // ✅ Whitelist stricte (doit matcher inscription.html)
-const ALLOWED_COMPANY_SIZES = new Set(["1-10", "11-50", "51-200", "201-500", "501+"]);
-const ALLOWED_PLANS = new Set(["trial", "standard", "premium"]);
+const ALLOWED_COMPANY_SIZES = new Set([
+  "5-9", "10-14", "15-19", "20-24", "25-29",
+  "30-34", "35-39", "40-44", "45-49", "50+"
+]);
+const ALLOWED_PLANS = new Set(["trial", "paid"]);
 
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
@@ -2233,7 +2369,7 @@ function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
 }
 
-//verifier si compte payant existe mode standard & premium pour l'inscription
+// Verifier si un compte (auth.users) existe deja pour cet email - utilise a l'inscription
 async function authEmailExists(emailNorm) {
   const target = String(emailNorm || "").toLowerCase().trim();
   if (!target) return false;
@@ -2263,37 +2399,9 @@ async function authEmailExists(emailNorm) {
 
 
 
-async function retrieveProrationPreview(stripe, {
-  userId,
-  customerId,
-  subscriptionId,
-  subscriptionItemId,
-  newPriceId,
-  currentPriceId,
-}) {
-  const now = Math.floor(Date.now() / 1000);
-
-
-
-  const preview = await stripe.invoices.createPreview({
-    customer: customerId,
-    subscription: subscriptionId,
-    subscription_details: {
-      proration_behavior: "create_prorations",
-      proration_date: now,
-      items: [
-        {
-          id: subscriptionItemId,
-          price: newPriceId,
-          quantity: 1,
-        },
-      ],
-    },
-  });
-
-  return preview;
-}
-
+// [SUPPRIME 15 mai 2026] retrieveProrationPreview : helper orphelin
+// (etait utilise uniquement par /api/change-plan pour calculer le prorata
+//  d'un upgrade Standard -> Premium, route supprimee).
 
 
 async function ensureStripeCustomer({ userId, email, existingCustomerId }) {
@@ -2333,422 +2441,20 @@ async function ensureStripeCustomer({ userId, email, existingCustomerId }) {
 
 
 // ==========================================
-// 🔁 UPGRADE STANDARD → PREMIUM (Checkout prorata)
-// ✅ Stripe calcule le prorata (retrieveUpcoming)
-// ✅ l’utilisateur paye via Stripe Checkout (payment)
-// ✅ après paiement, le webhook applique l’upgrade (sans prorata)
-// ==========================================
-app.post("/api/change-plan", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { newPlan } = req.body;
-
-    if (newPlan !== "premium") {
-      return res.status(400).json({ error: "Upgrade autorisé uniquement vers Premium" });
-    }
-
-    const { data: sub, error } = await supabaseAdmin
-      .from("subscriptions")
-      .select("stripe_subscription_id, stripe_customer_id, plan")
-      .eq("user_id", userId)
-      .single();
-
-    if (error || !sub?.stripe_subscription_id || !sub?.stripe_customer_id) {
-      return res.status(400).json({ error: "Aucun abonnement Stripe actif" });
-    }
-
-    if (sub.plan !== "standard") {
-      return res.status(400).json({ error: "Upgrade possible uniquement depuis Standard" });
-    }
-
-    // ✅ garantir un customer valide dans le mode courant (test/live)
-    const ensured = await ensureStripeCustomer({
-      userId,
-      email: req.user?.email ?? null,
-      existingCustomerId: sub.stripe_customer_id,
-    });
-
-
-
-
-    const PREMIUM_PRICE_ID = STRIPE_PRICE_PREMIUM;
-    if (!PREMIUM_PRICE_ID) {
-      return res.status(500).json({ error: "STRIPE_PRICE_PREMIUM manquant (mode " + STRIPE_MODE + ")" });
-    }
-
-
-    const FRONTEND_URL = process.env.FRONTEND_URL || "https://integora.fr";
-
-
-
-
-    // 1) récupérer subscription + item courant
-    const subscriptionId = sub.stripe_subscription_id;
-    const customerId = sub.stripe_customer_id;
-
-    // 1) Récup subscription Stripe
-    const stripeSub = await stripe.subscriptions.retrieve(subscriptionId);
-
-    // 2) Customer réel de la subscription
-    const subCustomerId = typeof stripeSub.customer === "string" ? stripeSub.customer : null;
-    if (!subCustomerId) {
-      return res.status(400).json({ error: "Stripe subscription has no customer" });
-    }
-
-    // 3) Si DB customer != Stripe customer, on resync DB (optionnel mais top)
-    if (customerId !== subCustomerId) {
-
-
-      await supabaseAdmin
-        .from("subscriptions")
-        .update({ stripe_customer_id: subCustomerId })
-        .eq("user_id", userId);
-    }
-
-    const customerIdForUpgrade = subCustomerId;
-
-    const itemId = stripeSub?.items?.data?.[0]?.id;
-    if (!itemId) {
-      return res.status(400).json({ error: "Subscription Stripe invalide (item manquant)" });
-    }
-
-    // ✅ sync facturation avant de créer un checkout
-    try {
-      await syncStripeCustomerBillingFromDb({
-        userId,
-        stripeCustomerId: customerIdForUpgrade,
-        requireComplete: true,
-      });
-
-    } catch (e) {
-      if (e?.code === "BILLING_INCOMPLETE") {
-        return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
-      }
-      log.error("❌ sync billing (change-plan) error:", safeError(e));
-      return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
-    }
-
-    // 2) demander à Stripe le "prorata dû maintenant" (quote)
-    // IMPORTANT: on simule l’update (nouveau price) sans la faire encore
-    const now = Math.floor(Date.now() / 1000);
-
-    const preview = await retrieveProrationPreview(stripe, {
-      userId,
-      customerId: customerIdForUpgrade,
-      subscriptionId: sub.stripe_subscription_id,
-      subscriptionItemId: itemId,
-      newPriceId: PREMIUM_PRICE_ID,
-      currentPriceId: stripeSub?.items?.data?.[0]?.price?.id,
-    });
-
-
-    const amountDue = typeof preview?.amount_due === "number" ? preview.amount_due : 0;
-    const currency = (preview?.currency || "eur").toLowerCase();
-
-
-    // Si Stripe dit 0 (rare mais possible), pas besoin de paiement → on peut appliquer direct via webhook-like
-    // (je te conseille quand même de gérer ce cas)
-    if (amountDue <= 0) {
-      return res.json({
-        url: `${FRONTEND_URL}/app/profile.html?upgrade=free`,
-      });
-    }
-
-    let receiptEmail = null;
-    try {
-      const customer = await stripe.customers.retrieve(ensured.customerId);
-      if (customer && !customer.deleted) {
-        receiptEmail = customer.email || null;
-      }
-    } catch (e) {
-      log.warn("⚠️ Unable to retrieve customer email for Stripe receipt:", e);
-    }
-
-    const contactName = await getContactNameFromProfiles(userId);
-    // 3) Checkout Session (payment) = l’utilisateur paye UNIQUEMENT le prorata
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      customer: customerIdForUpgrade,
-      locale: "fr",
-      // ✅ TVA auto (Stripe Tax)
-      automatic_tax: { enabled: true },
-      billing_address_collection: "required",
-      customer_update: { name: "auto", address: "auto" },
-
-
-      payment_intent_data: receiptEmail
-        ? { receipt_email: receiptEmail }
-        : undefined,
-
-      invoice_creation: {
-        enabled: true,
-        invoice_data: {
-          description: "INTEGORA — Upgrade Standard → Premium (prorata)",
-          metadata: {
-            action: "upgrade_proration",
-            user_id: userId,
-            plan: "premium",
-            subscription_id: sub.stripe_subscription_id,
-          },
-        },
-      },
-
-
-      line_items: [
-        {
-          price_data: {
-            currency,
-            unit_amount: amountDue,
-            tax_behavior: "exclusive",
-            product_data: {
-              name: "INTEGORA — Prorata upgrade Standard → Premium",
-              tax_code: "txcd_10103000",
-            },
-          },
-          quantity: 1,
-        },
-      ],
-
-
-      success_url: `${FRONTEND_URL}/app/profile.html?upgrade=success`,
-      cancel_url: `${FRONTEND_URL}/app/profile.html?upgrade=cancel`,
-
-      metadata: {
-        action: "upgrade_proration",
-        user_id: userId,
-        subscription_id: sub.stripe_subscription_id,
-        new_price_id: PREMIUM_PRICE_ID,
-        subscription_item_id: itemId,
-      },
-    });
-
-
-
-    return res.json({ url: session.url });
-  } catch (e) {
-    log.error("❌ change-plan checkout error", {
-      message: e?.message,
-      type: e?.type,
-      code: e?.code,
-      rawType: e?.rawType,
-      param: e?.param,
-      requestId: e?.requestId,
-    });
-    return res.status(500).json({ error: "stripe_error" });
-  }
-
-
-});
-
-
-
-
-
-
-// ==========================================
-// payer l’année suivante
+// [SUPPRIME 15 mai 2026] Routes legacy retirees :
+//   - /api/change-plan : upgrade Standard -> Premium avec prorata
+//   - /api/prepay-next-year/session : pre-paiement annee suivante
+//
+// Raison : passage au modele 1 plan unique "paid" + 9 paliers d'effectif.
+// Les changements de palier se font via /api/subscription/change-tier
+// (sans prorata, applique au prochain renouvellement).
+//
+// Si du code legacy quelque part appelle encore /api/change-plan ou
+// /api/prepay-next-year/session, l'appel renverra 404 (route inexistante).
 // ==========================================
 
-// 💰 Montants en centimes par plan
 
 
-app.post("/api/prepay-next-year/session", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-
-    const { data: sub, error } = await supabaseAdmin
-      .from("subscriptions")
-      .select("plan, stripe_customer_id, current_period_end, trial_end")
-      .eq("user_id", userId)
-      .single();
-
-    if (error || !sub?.stripe_customer_id) {
-      return res.status(400).json({ error: "Aucun customer Stripe" });
-    }
-
-    // ✅ empêcher un 2e prépaiement en attente
-    const { data: pendingPrepay, error: prepayErr } = await supabaseAdmin
-      .from("subscription_prepayments")
-      .select("id")
-      .eq("user_id", userId)
-      .is("consumed_at", null)
-      .limit(1);
-
-    if (prepayErr) {
-      log.error("❌ prepay-next-year pending check error:", safeError(prepayErr));
-      return res.status(500).json({ error: "Erreur vérification prépaiement" });
-    }
-
-    if (pendingPrepay?.length) {
-      return res.status(409).json({
-        error: "prepay_already_exists",
-        message: "Vous avez déjà un prépaiement en attente. Il sera appliqué automatiquement au prochain renouvellement.",
-      });
-    }
-
-    // ✅ 1) plan demandé
-    const requestedPlan = String(req.body?.plan ?? "").trim().toLowerCase();
-    if (requestedPlan !== "standard" && requestedPlan !== "premium") {
-      return res.status(400).json({ error: "Plan invalide" });
-    }
-    const plan = requestedPlan;
-
-    // ✅ 2) garantir un customer valide (test/live)
-    const ensured = await ensureStripeCustomer({
-      userId,
-      email: req.user?.email ?? null,
-      existingCustomerId: sub.stripe_customer_id,
-    });
-
-    // ✅ 3) sync facturation AVANT checkout (adresse + SIRET + raison sociale)
-    try {
-      await syncStripeCustomerBillingFromDb({
-        userId,
-        stripeCustomerId: ensured.customerId,
-        requireComplete: true,
-      });
-    } catch (e) {
-      if (e?.code === "BILLING_INCOMPLETE") {
-        return res.status(400).json({ error: e.message, code: "BILLING_INCOMPLETE" });
-      }
-      log.error("❌ sync billing (prepay) error:", safeError(e));
-      return res.status(500).json({ error: "Erreur sync facturation (Stripe)" });
-    }
-
-
-    const FRONTEND_URL =
-      process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
-
-    // ==========================================
-    // Page profil paiement règle moins de 366 jours
-    // ==========================================
-    const endStr = sub.current_period_end || sub.trial_end;
-    if (endStr) {
-      const end = new Date(endStr);
-      const now = new Date();
-      const ms = end.getTime() - now.getTime();
-      const daysRemaining = Math.ceil(ms / (1000 * 60 * 60 * 24));
-
-      if (daysRemaining > 366) {
-        return res.status(400).json({
-          error: "Le prépaiement est disponible uniquement à moins d’un an de l’échéance.",
-          daysRemaining
-        });
-      }
-    }
-
-    // Email reçu Stripe (optionnel)
-
-
-    let receiptEmail = null;
-    try {
-      const customer = await stripe.customers.retrieve(ensured.customerId);
-      if (customer && !customer.deleted) {
-        receiptEmail = customer.email || null;
-      }
-    } catch (e) {
-      log.warn("⚠️ Unable to retrieve customer email for Stripe receipt:", e);
-    }
-
-
-
-
-    // 0) Bloquer si un prépaiement non consommé existe déjà
-    const { data: pending, error: pendingErr } = await supabase
-      .from("subscription_prepayments")
-      .select("id, checkout_session_id, applied_invoice_id, created_at")
-      .eq("user_id", userId)
-      .is("consumed_at", null)
-      .limit(1)
-      .maybeSingle();
-
-    if (pendingErr) {
-      log.error("prepay_next_year: lookup pending error", safeError(pendingErr));
-      return res.status(500).json({ error: "pending_lookup_failed" });
-    }
-
-    if (pending?.id) {
-      return res.status(409).json({
-        error: "prepay_already_exists",
-        message: "Vous avez déjà un prépaiement en attente. Il sera appliqué automatiquement au prochain renouvellement.",
-      });
-    }
-
-    const priceId = plan === "premium" ? STRIPE_PRICE_PREMIUM : STRIPE_PRICE_STANDARD;
-    if (!priceId) return res.status(500).json({ error: "Missing Stripe price for plan" });
-
-
-
-    // ✅ 1) stripe_customer_id depuis la DB
-    const stripeCustomerId = sub?.stripe_customer_id || null;
-
-    // ✅ 2) email : utilise celui du user (ou receiptEmail si c'est ton email fiable)
-    const userEmail = receiptEmail ?? null; // ou req.user.email si tu l'as
-
-
-
-    // ✅ 3) sync billing AVANT checkout (facture complète : raison sociale, SIRET, adresse)
-    await syncStripeCustomerBillingFromDb({
-      userId,
-      stripeCustomerId: ensured.customerId,
-      requireComplete: true,
-    });
-
-    const prepayPriceId =
-      plan === "premium" ? PREMIUM_PREPAY_PRICE_ID : STANDARD_PREPAY_PRICE_ID;
-
-
-    if (!prepayPriceId) {
-      return res.status(500).json({
-        error: "Missing prepay price id",
-        plan,
-        STRIPE_MODE,
-      });
-    }
-
-    const contactName = await getContactNameFromProfiles(userId);
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      customer: ensured.customerId,
-      locale: "fr",
-      automatic_tax: { enabled: true },
-      billing_address_collection: "required",
-      customer_update: { name: "auto", address: "auto" },
-
-      invoice_creation: {
-        enabled: true,
-        invoice_data: {
-          description: `INTEGORA — Pré-paiement année suivante (${plan})`,
-          metadata: { action: "prepay_next_year", user_id: userId, plan },
-        },
-      },
-
-      line_items: [
-        {
-          price: prepayPriceId,   // ✅ on utilise un Price Stripe existant (one-off)
-          quantity: 1,
-        },
-      ],
-
-      success_url: `${FRONTEND_URL}/app/profile.html?prepay=success`,
-      cancel_url: `${FRONTEND_URL}/app/profile.html?prepay=cancel`,
-
-      metadata: {
-        action: "prepay_next_year",
-        user_id: userId,
-        plan,
-      },
-    });
-
-    return res.json({ url: session.url });
-
-
-  } catch (err) {
-    log.error("❌ prepay-next-year error:", safeError(err));
-    return res.status(500).json({ error: "Erreur création session Stripe" });
-  }
-});
 
 
 
@@ -2763,7 +2469,7 @@ app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res)
 
     const { data: sub, error } = await supabaseAdmin
       .from('subscriptions')
-      .select('stripe_subscription_id')
+      .select('stripe_subscription_id, status, plan')
       .eq('user_id', userId)
       .single();
 
@@ -2771,7 +2477,27 @@ app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res)
       return res.status(400).json({ error: "Aucun abonnement Stripe actif" });
     }
 
+    // [15 mai 2026] Protection defensive : refuser proprement si la sub
+    // est deja terminee. Stripe refuserait l'update avec une erreur 500
+    // peu claire. On renvoie un 400 avec un message clair a la place.
+    if (sub.status === "canceled") {
+      return res.status(400).json({
+        error: "Votre abonnement est terminé. Reprenez d'abord un abonnement pour modifier votre renouvellement."
+      });
+    }
+    if (sub.plan === "trial") {
+      return res.status(400).json({
+        error: "Le renouvellement automatique ne s'applique pas à un essai gratuit."
+      });
+    }
+
+    // On verifie aussi cote Stripe (defense in depth en cas de desync DB <-> Stripe)
     const current = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
+    if (current.status === "canceled" || current.status === "incomplete_expired") {
+      return res.status(400).json({
+        error: "Votre abonnement Stripe est déjà terminé. Reprenez d'abord un abonnement."
+      });
+    }
 
     const updated = await stripe.subscriptions.update(sub.stripe_subscription_id, {
       cancel_at_period_end: autoRenew ? false : true,
@@ -2808,6 +2534,730 @@ app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res)
 });
 
 
+// ==========================================
+// 💳 BILLING PORTAL — Gerer moyens de paiement, factures, infos facturation
+// Cree une session du Customer Portal Stripe (page hosted par Stripe).
+// Le client est redirige sur cette page pour mettre a jour sa CB, voir ses
+// factures, etc. PCI compliance assuree par Stripe.
+// IMPORTANT : configurer le portail dans Stripe Dashboard avant utilisation
+// (Settings > Billing > Customer portal). Desactiver "Cancel subscription"
+// pour conserver notre flow custom de resiliation.
+// ==========================================
+app.post("/api/billing-portal", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // 1) Recuperer le stripe_customer_id de l'utilisateur
+    const { data: sub, error: subErr } = await supabaseAdmin
+      .from("subscriptions")
+      .select("stripe_customer_id, plan")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (subErr) {
+      log.error("❌ billing-portal DB error:", safeError(subErr));
+      return res.status(500).json({ error: "Erreur base de donnees" });
+    }
+
+    if (!sub?.stripe_customer_id) {
+      return res.status(400).json({
+        error: "Aucun customer Stripe associe a votre compte.",
+        code: "NO_STRIPE_CUSTOMER",
+      });
+    }
+
+    // 2) Trial users : pas de portail (pas de paiement)
+    if (sub.plan === "trial") {
+      return res.status(400).json({
+        error: "Le portail de facturation est reserve aux abonnements payants.",
+        code: "TRIAL_NO_BILLING",
+      });
+    }
+
+    // 3) Creer la session du portail
+    const FRONTEND_URL = process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
+    const returnUrl = `${FRONTEND_URL}/app/profile.html?portal=returned`;
+
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: sub.stripe_customer_id,
+      return_url: returnUrl,
+      locale: "fr",
+    });
+
+    log.debug("✅ BILLING-PORTAL session created", {
+      userId,
+      stripeCustomerId: sub.stripe_customer_id,
+      sessionId: portalSession.id,
+    });
+
+    return res.json({ url: portalSession.url });
+
+  } catch (e) {
+    log.error("❌ /api/billing-portal:", safeError(e));
+    return res.status(500).json({
+      error: "Erreur creation session portail. Reessayez plus tard.",
+      details: safeDetails(e),
+    });
+  }
+});
+
+
+// ==========================================
+// 🔄 CHANGEMENT DE PALIER (sans prorata, applique au prochain renouvellement)
+// Decision Mehdi 12 mai 2026 : tout changement de palier s'applique
+// uniquement a la prochaine echeance. Pas de facturation intermediaire.
+// Stripe : proration_behavior = 'none'
+// ==========================================
+app.post("/api/subscription/change-tier", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const newTier = String(req.body?.tier ?? "").trim();
+
+    // 1) Validation du tier
+    if (newTier === "50+") {
+      return res.status(400).json({
+        error: "Le palier 50+ necessite un devis. Veuillez contacter le support."
+      });
+    }
+    if (!STRIPE_PRICE_BY_TIER[newTier]) {
+      return res.status(400).json({ error: "Palier invalide" });
+    }
+    const newPriceId = STRIPE_PRICE_BY_TIER[newTier];
+
+    // 2) Recuperer la subscription en DB
+    const { data: sub, error: subErr } = await supabaseAdmin
+      .from("subscriptions")
+      .select("stripe_subscription_id, plan, tier, cancel_at, status")
+      .eq("user_id", userId)
+      .single();
+
+    if (subErr || !sub?.stripe_subscription_id) {
+      return res.status(400).json({ error: "Aucun abonnement Stripe actif" });
+    }
+    if (sub.plan === "trial") {
+      return res.status(400).json({
+        error: "Vous devez d'abord souscrire un abonnement payant."
+      });
+    }
+
+    // [14 mai 2026] Defense in depth : refuser le change-tier si le
+    // renouvellement est annule (cancel_at rempli OU status canceled).
+    // Modifier le palier n'a aucun sens tant qu'il n'y aura pas de
+    // prochain renouvellement. Le frontend doit normalement bloquer
+    // l'UI, mais on protege aussi cote backend.
+    if (sub.status === "canceled") {
+      return res.status(400).json({
+        error: "Votre abonnement est terminé. Reprenez d'abord un abonnement pour modifier votre palier."
+      });
+    }
+    if (sub.cancel_at) {
+      return res.status(400).json({
+        error: "Le renouvellement de votre abonnement est arrêté. Réactivez-le d'abord avant de modifier votre palier."
+      });
+    }
+
+    // 3) Recuperer la subscription Stripe pour l'item_id
+    const stripeSub = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
+    const itemId = stripeSub?.items?.data?.[0]?.id;
+    if (!itemId) {
+      return res.status(500).json({ error: "Subscription Stripe invalide (item manquant)" });
+    }
+
+    // 4) Mettre a jour la subscription Stripe SANS prorata
+    //    Le nouveau prix sera applique au prochain renouvellement, sans facture intermediaire.
+    await stripe.subscriptions.update(sub.stripe_subscription_id, {
+      items: [{ id: itemId, price: newPriceId }],
+      proration_behavior: "none",
+      metadata: {
+        ...(stripeSub.metadata || {}),
+        plan: "paid",
+        tier: newTier,
+        last_tier_change_at: new Date().toISOString(),
+      },
+    });
+
+    // 5) Mettre a jour la DB
+    // [14 mai 2026] IMPORTANT : on ne touche QUE 'tier' et 'stripe_price_id'
+    // (= ce qui sera facture au prochain renouvellement).
+    // 'current_paid_tier' reste inchangee : elle represente le palier
+    // actuellement facture, et ne sera mise a jour qu'au prochain renouvellement
+    // par le webhook invoice.paid (subscription_cycle).
+    const { error: updateErr } = await supabaseAdmin
+      .from("subscriptions")
+      .update({
+        plan: "paid",
+        tier: newTier,
+        stripe_price_id: newPriceId,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId);
+
+    if (updateErr) {
+      log.error("❌ change-tier DB update error:", safeError(updateErr));
+      return res.status(500).json({ error: "Erreur mise a jour de la base de donnees" });
+    }
+
+    log.debug("✅ TIER CHANGED", {
+      userId,
+      oldTier: sub.tier,
+      newTier,
+      stripeSubId: sub.stripe_subscription_id,
+    });
+
+    return res.json({
+      success: true,
+      tier: newTier,
+      stripe_price_id: newPriceId,
+      message: "Palier mis a jour. Le nouveau tarif sera applique au prochain renouvellement.",
+    });
+
+  } catch (e) {
+    log.error("❌ /api/subscription/change-tier:", safeError(e));
+    return res.status(500).json({ error: "Erreur changement de palier" });
+  }
+});
+
+
+// ==========================================
+// 🔐 HELPERS TOKEN SIGNE pour actions admin one-click via email
+// ==========================================
+// Permet de generer/verifier un token URL-safe qui prouve qu'un lien
+// (genre "Marquer comme traite" dans un email) est legitime.
+// Signe avec CRON_SECRET (HMAC-SHA256). Expire apres ttlSeconds.
+function _b64urlEncode(buf) {
+  return Buffer.from(buf).toString("base64")
+    .replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+function _b64urlDecode(str) {
+  let s = String(str).replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return Buffer.from(s, "base64").toString("utf8");
+}
+// Whitelist des tables autorisees pour le mark-closed via lien email signe
+const TICKET_CLOSE_ALLOWED_TABLES = new Set(["contact_tickets", "support_tickets"]);
+
+function generateCloseTicketToken(ticketId, tableName, ttlSeconds = 90 * 24 * 3600) {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) throw new Error("CRON_SECRET non defini pour signer le token");
+  if (!TICKET_CLOSE_ALLOWED_TABLES.has(tableName)) {
+    throw new Error(`Table non autorisee pour token close: ${tableName}`);
+  }
+  const payload = {
+    tid: String(ticketId),
+    table: tableName,
+    exp: Math.floor(Date.now() / 1000) + ttlSeconds,
+  };
+  const payloadB64 = _b64urlEncode(JSON.stringify(payload));
+  const sig = require("crypto")
+    .createHmac("sha256", secret).update(payloadB64).digest("base64")
+    .replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return `${payloadB64}.${sig}`;
+}
+function verifyCloseTicketToken(token) {
+  try {
+    const secret = process.env.CRON_SECRET;
+    if (!secret) return { valid: false, error: "secret_missing" };
+    if (!token || typeof token !== "string") return { valid: false, error: "no_token" };
+    const parts = token.split(".");
+    if (parts.length !== 2) return { valid: false, error: "bad_format" };
+    const [payloadB64, sig] = parts;
+    const expectedSig = require("crypto")
+      .createHmac("sha256", secret).update(payloadB64).digest("base64")
+      .replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+    if (sig.length !== expectedSig.length) return { valid: false, error: "bad_signature" };
+    if (!require("crypto").timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) {
+      return { valid: false, error: "bad_signature" };
+    }
+    const payload = JSON.parse(_b64urlDecode(payloadB64));
+    if (!payload.tid) return { valid: false, error: "missing_tid" };
+    if (!payload.table || !TICKET_CLOSE_ALLOWED_TABLES.has(payload.table)) {
+      return { valid: false, error: "bad_table" };
+    }
+    if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+      return { valid: false, error: "expired" };
+    }
+    return { valid: true, ticketId: payload.tid, tableName: payload.table };
+  } catch (e) {
+    return { valid: false, error: "decode_failed" };
+  }
+}
+
+
+// ==========================================
+// 📞 DEMANDE DE DEVIS 50+ COLLABORATEURS
+// ==========================================
+// Permet a un client connecte (sur profile.html) de declarer que son
+// effectif a depasse 50 collaborateurs et qu'il souhaite un devis
+// personnalise. Cree un ticket dans contact_tickets + envoie un email
+// interne a contact@integora.fr + mehdi.joalland@integora.fr +
+// un accuse de reception au client.
+// L'abonnement actuel continue normalement (pas de blocage).
+app.post("/api/subscription/request-quote-50plus", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userEmail = req.user.email;
+
+    if (!userEmail) {
+      return res.status(400).json({ error: "Email utilisateur introuvable" });
+    }
+
+    const { data: profile, error: profErr } = await supabaseAdmin
+      .from("profiles")
+      .select(`
+        user_id, first_name, last_name,
+        companies:company_id (
+          id, legal_name, display_name, company_siret
+        )
+      `)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (profErr) {
+      log.error("❌ quote-50plus profil read error:", safeError(profErr));
+      return res.status(500).json({ error: "Erreur lecture profil" });
+    }
+
+    const { data: sub } = await supabaseAdmin
+      .from("subscriptions")
+      .select("plan, tier, current_period_end")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    // Fallback : si profile.companies est vide (lien profile.company_id null),
+    // chercher la company directement via owner_id. Couvre les comptes legacy.
+    let company = profile?.companies || null;
+    if (!company) {
+      const { data: ownedCompany } = await supabaseAdmin
+        .from("companies")
+        .select("id, legal_name, display_name, company_siret")
+        .eq("owner_id", userId)
+        .maybeSingle();
+      company = ownedCompany || {};
+    }
+
+    // Tronquage defensif aligne sur les contraintes SQL de contact_tickets
+    // (au cas ou un compte legacy aurait des valeurs depassant les limites en DB)
+    const firstName = String(profile?.first_name || "").slice(0, 30);
+    const lastName = String(profile?.last_name || "").slice(0, 40);
+    const companyNameRaw = company.legal_name || company.display_name || "—";
+    const companyName = String(companyNameRaw).slice(0, 60);
+    const companySiret = company.company_siret || null;
+    const currentTier = sub?.tier || "—";
+    const currentPlan = sub?.plan || "—";
+    const endIso = sub?.current_period_end || null;
+    const endDateFR = endIso ? new Date(endIso).toLocaleDateString("fr-FR") : "—";
+
+    const { data: existing } = await supabaseAdmin
+      .from("contact_tickets")
+      .select("id, created_at")
+      .eq("email", userEmail)
+      .eq("subject", "quote_50_plus")
+      .eq("status", "open")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (existing?.id) {
+      return res.json({
+        ok: true,
+        already_pending: true,
+        requested_at: existing.created_at,
+        ticket_id: existing.id,
+        message: "Une demande de devis est deja en cours pour ce compte.",
+      });
+    }
+
+    const messageText = `Demande de devis pour palier 50+ collaborateurs.
+
+Client connecte depuis profile.html.
+Palier actuel souscrit : ${currentTier}
+Plan actuel : ${currentPlan}
+Renouvellement actuel prevu le : ${endDateFR}
+${companySiret ? `SIRET : ${companySiret}\n` : ""}
+Merci de contacter ce client pour preparer un devis personnalise pour son nouvel effectif.`;
+
+    const { data: ticket, error: ticketErr } = await supabaseAdmin
+      .from("contact_tickets")
+      .insert({
+        subject: "quote_50_plus",
+        message: messageText,
+        page_url: "/app/profile.html",
+        first_name: firstName,
+        last_name: lastName,
+        email: userEmail,
+        company_name: companyName,
+        position: null,
+        phone: null,
+        status: "open",
+      })
+      .select("*")
+      .single();
+
+    if (ticketErr) {
+      log.error("❌ quote_50_plus ticket insert error:", safeError(ticketErr));
+      return res.status(500).json({ error: "Erreur creation ticket" });
+    }
+
+    const internalRecipients = ["contact@integora.fr", "mehdi.joalland@integora.fr"];
+    const subjectMail = `Demande devis 50+ — ${companyName} (#${String(ticket.id).slice(0, 8)})`;
+
+    // Generer le lien "Marquer comme traite" (token signe HMAC, expire 90 jours)
+    const FRONT_URL = process.env.FRONTEND_URL || "https://integora.fr";
+    let markClosedUrl = null;
+    try {
+      const closeToken = generateCloseTicketToken(ticket.id, "contact_tickets");
+      markClosedUrl = `${FRONT_URL}/api/admin/ticket-mark-closed?token=${closeToken}`;
+    } catch (e) {
+      log.warn("⚠️ quote_50_plus: impossible de generer le token close:", safeError(e));
+    }
+
+    const htmlInternal = `
+      <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#1a1a1a;font-size:15px;line-height:1.6;">
+        <h2 style="margin:0 0 16px 0;font-size:18px;font-weight:700;">Nouvelle demande de devis 50+ collaborateurs</h2>
+        <p>Un client a declare avoir depasse le palier 50 collaborateurs et demande un devis personnalise.</p>
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin:16px 0;">
+          <p style="margin:0 0 6px 0;"><strong>Client :</strong> ${escapeHtml(firstName)} ${escapeHtml(lastName)}</p>
+          <p style="margin:0 0 6px 0;"><strong>Email :</strong> ${escapeHtml(userEmail)}</p>
+          <p style="margin:0 0 6px 0;"><strong>Entreprise :</strong> ${escapeHtml(companyName)}</p>
+          ${companySiret ? `<p style="margin:0 0 6px 0;"><strong>SIRET :</strong> ${escapeHtml(companySiret)}</p>` : ""}
+          <p style="margin:0 0 6px 0;"><strong>Palier actuel souscrit :</strong> ${escapeHtml(currentTier)}</p>
+          <p style="margin:0 0 6px 0;"><strong>Plan :</strong> ${escapeHtml(currentPlan)}</p>
+          <p style="margin:0;"><strong>Renouvellement prevu le :</strong> ${endDateFR}</p>
+        </div>
+        <p>Action : contacter ce client pour preparer un devis personnalise.</p>
+        ${markClosedUrl ? `
+        <div style="text-align:center;margin:28px 0 20px 0;">
+          <a href="${markClosedUrl}"
+             style="display:inline-block;background:#16a34a;color:#ffffff;text-decoration:none;padding:13px 28px;border-radius:8px;font-weight:700;font-size:14px;">
+            ✓ Marquer ce ticket comme traite
+          </a>
+          <div style="font-size:12px;color:#64748b;margin-top:8px;">
+            Une fois le client contacte, cliquez ici pour cloturer la demande.
+          </div>
+        </div>
+        ` : ""}
+        <p style="font-size:13px;color:#64748b;margin-top:24px;">
+          Ticket ID : <code>${ticket.id}</code><br/>
+          Recu le ${new Date(ticket.created_at).toLocaleString("fr-FR")}
+        </p>
+      </div>
+    `;
+
+    try {
+      await sendResendEmail({ to: internalRecipients, subject: subjectMail, html: htmlInternal });
+    } catch (emailErr) {
+      log.error("❌ quote_50_plus internal email failed:", safeError(emailErr));
+    }
+
+    const ackSubject = "Votre demande de devis INTEGORA est bien recue";
+    const ackHtml = `
+      <div style="font-family:Arial,sans-serif;max-width:560px;padding:32px 16px;color:#1a1a1a;font-size:15px;line-height:1.6;">
+        <p>Bonjour ${escapeHtml(firstName)},</p>
+        <p>Nous avons bien recu votre demande de devis pour un effectif de 50 collaborateurs ou plus.</p>
+        <p>Notre equipe va vous contacter rapidement pour preparer une proposition adaptee a votre nouvelle situation.</p>
+        <p>En attendant, votre abonnement actuel continue normalement et votre acces a INTEGORA n'est pas modifie.</p>
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:32px 0 16px;" />
+        <p style="font-size:13px;color:#64748b;line-height:1.6;margin:0;">
+          L'equipe <strong>Integora</strong><br/>
+          <a href="https://integora.fr" style="color:#64748b;text-decoration:none;">integora.fr</a>
+          ·
+          <a href="mailto:contact@integora.fr" style="color:#64748b;text-decoration:none;">contact@integora.fr</a>
+        </p>
+      </div>
+    `;
+
+    try {
+      await sendResendEmail({ to: userEmail, subject: ackSubject, html: ackHtml });
+    } catch (emailErr) {
+      log.error("❌ quote_50_plus ack email failed:", safeError(emailErr));
+    }
+
+    return res.json({
+      ok: true,
+      already_pending: false,
+      requested_at: ticket.created_at,
+      ticket_id: ticket.id,
+    });
+
+  } catch (err) {
+    log.error("❌ request-quote-50plus error:", safeError(err));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+
+// ==========================================
+// 📞 STATUT DE LA DEMANDE DE DEVIS 50+
+// ==========================================
+// Indique au frontend si une demande de devis 50+ est deja en cours
+// pour le user connecte. Permet d'afficher "Demande envoyee le X"
+// au lieu du bouton "Demander un devis".
+app.get("/api/subscription/quote-50plus-status", authenticateToken, async (req, res) => {
+  try {
+    const userEmail = req.user.email;
+    if (!userEmail) {
+      return res.json({ pending: false });
+    }
+
+    const { data: existing, error } = await supabaseAdmin
+      .from("contact_tickets")
+      .select("id, created_at")
+      .eq("email", userEmail)
+      .eq("subject", "quote_50_plus")
+      .eq("status", "open")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      log.error("❌ quote-50plus-status read error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture statut" });
+    }
+
+    if (existing?.id) {
+      return res.json({
+        pending: true,
+        requested_at: existing.created_at,
+        ticket_id: existing.id,
+      });
+    }
+
+    return res.json({ pending: false });
+
+  } catch (err) {
+    log.error("❌ quote-50plus-status error:", safeError(err));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+
+// ==========================================
+// ✅ MARQUER UN TICKET COMME TRAITE (action one-click via email)
+// ==========================================
+// Route GET non-authentifiee mais protegee par un TOKEN SIGNE (HMAC).
+// Cliquable depuis l'email envoye a contact@integora.fr / mehdi.joalland@integora.fr / support.
+// Generique : fonctionne pour contact_tickets ET support_tickets (whitelist).
+// Le token expire apres 90 jours. Renvoie une page HTML simple de confirmation.
+app.get("/api/admin/ticket-mark-closed", async (req, res) => {
+  const pageHtml = (title, color, heading, body) => {
+    // Detection du type d'etat pour adapter l'icone et le fond
+    const isSuccess = color === "#16a34a";
+    const isInfo = color === "#0891b2";
+    // Icone SVG selon l'etat (check / info / warning)
+    const iconSvg = isSuccess
+      ? `<svg xmlns="http://www.w3.org/2000/svg" width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`
+      : isInfo
+      ? `<svg xmlns="http://www.w3.org/2000/svg" width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>`
+      : `<svg xmlns="http://www.w3.org/2000/svg" width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`;
+    const bgGradient = isSuccess
+      ? "linear-gradient(135deg, #ecfdf5 0%, #f0fdf4 50%, #f7fee7 100%)"
+      : isInfo
+      ? "linear-gradient(135deg, #ecfeff 0%, #f0fdfa 50%, #eff6ff 100%)"
+      : "linear-gradient(135deg, #fef2f2 0%, #fff1f2 50%, #fef3f2 100%)";
+    // Heading propre sans emoji (l'icone SVG s'en charge)
+    const cleanHeading = String(heading).replace(/^[✅❌ℹ️\s]+/, "").trim();
+
+    return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${title} — INTEGORA</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      padding: 24px 16px;
+      background: ${bgGradient};
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      color: #0f172a;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      -webkit-font-smoothing: antialiased;
+    }
+    .card {
+      max-width: 480px;
+      width: 100%;
+      background: #ffffff;
+      border-radius: 20px;
+      padding: 48px 32px 32px;
+      box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08), 0 2px 6px rgba(15, 23, 42, 0.04);
+      text-align: center;
+      animation: fadeIn 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .icon-circle {
+      width: 84px;
+      height: 84px;
+      border-radius: 50%;
+      background: ${color};
+      margin: 0 auto 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 10px 28px ${color}40;
+    }
+    h1 {
+      color: ${color};
+      font-size: 24px;
+      font-weight: 700;
+      margin: 0 0 14px;
+      letter-spacing: -0.01em;
+      line-height: 1.25;
+    }
+    p {
+      color: #475569;
+      font-size: 15px;
+      line-height: 1.6;
+      margin: 0 0 12px;
+    }
+    p:last-of-type { margin-bottom: 0; }
+    code {
+      background: #f1f5f9;
+      color: #334155;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      letter-spacing: -0.01em;
+    }
+    .meta {
+      margin-top: 28px;
+      padding-top: 20px;
+      border-top: 1px solid #e2e8f0;
+      color: #94a3b8;
+      font-size: 12px;
+      letter-spacing: 0.01em;
+    }
+    .brand {
+      margin-top: 14px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+    }
+    .brand a {
+      color: #1e293b;
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+      transition: border-color .2s;
+    }
+    .brand a:hover { border-bottom-color: #1e293b; }
+    @media (max-width: 480px) {
+      .card { padding: 36px 22px 28px; border-radius: 16px; }
+      .icon-circle { width: 72px; height: 72px; }
+      h1 { font-size: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="card" role="status" aria-live="polite">
+    <div class="icon-circle" aria-hidden="true">${iconSvg}</div>
+    <h1>${escapeHtml(cleanHeading)}</h1>
+    ${body}
+    <div class="meta">Vous pouvez fermer cette page en toute sécurité.</div>
+    <div class="brand"><a href="https://integora.fr" target="_blank" rel="noopener">INTEGORA</a></div>
+  </main>
+</body>
+</html>`;
+  };
+
+  try {
+    const token = String(req.query.token || "");
+    const v = verifyCloseTicketToken(token);
+
+    if (!v.valid) {
+      return res.status(400).type("html").send(pageHtml(
+        "Lien invalide",
+        "#dc2626",
+        "❌ Lien invalide ou expire",
+        `<p>Ce lien ne peut plus etre utilise (${escapeHtml(v.error || "inconnu")}).</p>
+         <p style="color:#64748b;">Si besoin, fermez le ticket directement dans Supabase.</p>`
+      ));
+    }
+
+    const ticketId = v.ticketId;
+    const tableName = v.tableName;
+
+    // Choix de la colonne email selon la table (les schemas different)
+    const emailCol = tableName === "support_tickets" ? "user_email" : "email";
+
+    const { data: ticket, error: readErr } = await supabaseAdmin
+      .from(tableName)
+      .select(`id, status, subject, ${emailCol}, created_at`)
+      .eq("id", ticketId)
+      .maybeSingle();
+
+    if (readErr) {
+      log.error("❌ mark-closed read error:", safeError(readErr));
+      return res.status(500).type("html").send(pageHtml(
+        "Erreur",
+        "#dc2626",
+        "❌ Erreur serveur",
+        `<p>Impossible de lire le ticket. Reessayez plus tard.</p>`
+      ));
+    }
+
+    if (!ticket) {
+      return res.status(404).type("html").send(pageHtml(
+        "Ticket introuvable",
+        "#dc2626",
+        "❌ Ticket introuvable",
+        `<p>Ce ticket n'existe plus en base.</p>`
+      ));
+    }
+
+    if (ticket.status === "closed") {
+      return res.type("html").send(pageHtml(
+        "Deja traite",
+        "#0891b2",
+        "ℹ️ Ce ticket etait deja cloture",
+        `<p>Le ticket <code>#${escapeHtml(String(ticket.id).slice(0, 8))}</code> a deja ete marque comme traite.</p>
+         <p style="color:#64748b;">Aucune action supplementaire necessaire.</p>`
+      ));
+    }
+
+    const { error: updateErr } = await supabaseAdmin
+      .from(tableName)
+      .update({ status: "closed" })
+      .eq("id", ticketId);
+
+    if (updateErr) {
+      log.error("❌ mark-closed update error:", safeError(updateErr));
+      return res.status(500).type("html").send(pageHtml(
+        "Erreur",
+        "#dc2626",
+        "❌ Erreur lors de la cloture",
+        `<p>${escapeHtml(updateErr.message || "Erreur inconnue")}</p>`
+      ));
+    }
+
+    log.info(`✅ Ticket marque comme traite via email: ${tableName} ${ticketId}`);
+
+    const ticketEmail = ticket[emailCol] || "—";
+
+    return res.type("html").send(pageHtml(
+      "Ticket traite",
+      "#16a34a",
+      "✅ Ticket marque comme traite",
+      `<p>Le ticket <code>#${escapeHtml(String(ticket.id).slice(0, 8))}</code> (${escapeHtml(ticketEmail)}) est maintenant cloture.</p>
+       <p style="color:#64748b;">Table : <code>${escapeHtml(tableName)}</code></p>`
+    ));
+
+  } catch (err) {
+    log.error("❌ quote-50plus-mark-closed error:", safeError(err));
+    return res.status(500).type("html").send(pageHtml(
+      "Erreur",
+      "#dc2626",
+      "❌ Erreur serveur",
+      `<p>Une erreur inattendue s'est produite.</p>`
+    ));
+  }
+});
 
 
 // ==========================================
@@ -2816,34 +3266,50 @@ app.post('/api/subscription/toggle-renewal', authenticateToken, async (req, res)
 app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const desiredPlan = req.body?.plan;
+    const desiredTier = req.body?.tier;     // "5-9" | "10-14" | ... | "45-49"
 
-    if (!["standard", "premium"].includes(desiredPlan)) {
-      return res.status(400).json({ error: "Plan invalide" });
+    // ----- Resolution du price_id selon le palier d'effectif -----
+    let priceId = null;
+    let planForMetadata = null;  // sera lu par le webhook pour ecrire en DB
+    let tierForMetadata = null;
+
+    if (!desiredTier) {
+      return res.status(400).json({
+        error: "Body invalide. Envoyez { tier: '5-9' } (ou autre palier 5-9 a 45-49)."
+      });
+    }
+    if (desiredTier === "50+") {
+      return res.status(400).json({
+        error: "Le palier 50+ necessite un devis. Veuillez contacter le support."
+      });
+    }
+    if (!STRIPE_PRICE_BY_TIER[desiredTier]) {
+      return res.status(400).json({ error: "Palier invalide" });
+    }
+    priceId = STRIPE_PRICE_BY_TIER[desiredTier];
+    planForMetadata = "paid";
+    tierForMetadata = desiredTier;
+
+    if (!priceId) {
+      return res.status(500).json({ error: "PriceId Stripe manquant pour ce palier/plan" });
     }
 
     // 1) récupérer infos locales (customer existant ?)
     const { data: subRow } = await supabaseAdmin
       .from("subscriptions")
-      .select("stripe_customer_id, stripe_subscription_id, plan")
+      .select("stripe_customer_id, stripe_subscription_id, plan, status")
       .eq("user_id", userId)
       .maybeSingle();
 
-    // Si déjà une subscription Stripe -> on ne passe pas ici
-    if (subRow?.stripe_subscription_id) {
+    // ✅ Si déjà une subscription Stripe ACTIVE -> on ne passe pas ici
+    //    (mais on AUTORISE le cas status='canceled' = sub morte, le user
+    //    veut souscrire a nouveau, on creera une nouvelle subscription
+    //    qui remplacera l'ancienne dans subscriptions via le webhook)
+    if (subRow?.stripe_subscription_id && subRow?.status !== 'canceled') {
       return res.status(400).json({
         error: "Abonnement Stripe déjà actif, utilise change-plan."
       });
     }
-
-    // 2) price mapping
-    const PRICE_BY_PLAN = {
-      standard: STRIPE_PRICE_STANDARD,
-      premium: STRIPE_PRICE_PREMIUM,
-    };
-
-    const priceId = PRICE_BY_PLAN[desiredPlan];
-    if (!priceId) return res.status(500).json({ error: "PriceId Stripe manquant" });
 
     const FRONT = process.env.FRONTEND_URL || "https://integora.fr";
 
@@ -2884,7 +3350,9 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
 
     // 🧪 DEBUG
     log.debug("🧪 SUBSCRIBE DEBUG (/api/subscribe/session)", {
-      desiredPlan,
+      desiredTier,
+      planForMetadata,
+      tierForMetadata,
       priceId,
       customerId,
       userId,
@@ -2918,14 +3386,22 @@ app.post("/api/subscribe/session", authenticateToken, async (req, res) => {
       metadata: {
         action: "subscribe_paid",
         user_id: userId,
-        plan: desiredPlan
+        plan: planForMetadata,
+        ...(tierForMetadata ? { tier: tierForMetadata } : {}),
       },
 
       subscription_data: {
         metadata: {
           action: "subscribe_paid",
           user_id: userId,
-          plan: desiredPlan
+          plan: planForMetadata,
+          // [15 mai 2026] IMPORTANT : on declare explicitement renewal_mode = "auto"
+          // pour que le webhook (enforceRenewalModeOnStripeSubscription) ne force pas
+          // cancel_at_period_end = true par defaut sur cette nouvelle subscription.
+          // Sans ca, la sub se cree puis se met en "non reconductible" automatiquement
+          // car le code considere une absence de renewal_mode comme "manual".
+          renewal_mode: "auto",
+          ...(tierForMetadata ? { tier: tierForMetadata } : {}),
         },
 
       },
@@ -3334,9 +3810,10 @@ app.post("/api/company/update-billing", authenticateToken, async (req, res) => {
     const body = req.body || {};
 
     // 1) Nettoyage/validation (backend = source de vérité sécurité)
-    const legal_name = cleanTextStrict(body.legal_name, { max: 120, allowEmpty: false });
+    // Max 60 chars : aligné sur contact_tickets.company_name (contrainte SQL contact_company_len)
+    const legal_name = cleanTextStrict(body.legal_name, { max: 60, allowEmpty: false });
     if (!legal_name) {
-      return res.status(400).json({ ok: false, error: "Raison sociale invalide." });
+      return res.status(400).json({ ok: false, error: "Raison sociale invalide (max 60 caractères)." });
     }
 
     // optionnel
@@ -3863,7 +4340,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
 
     const desired_plan = String(req.body?.desired_plan || "").trim();
-    if (!["standard", "premium"].includes(desired_plan)) {
+    if (desired_plan !== "paid") {
       return res.status(400).json({ error: "desired_plan invalide" });
     }
 
@@ -3883,7 +4360,10 @@ app.post("/api/start-paid-checkout", async (req, res) => {
 
     // 3) Whitelist stricte : on accepte uniquement une date YYYY-MM-DD
     //    (dans ton cas: "2025-11-12")
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(termsVersionRaw)) {
+    // [15 mai 2026] Accepte le format DD_MM_YYYY (ex: "14_05_2026") qui est le
+    // format actuel de CURRENT_TERMS_VERSION. L'ancien format YYYY-MM-DD est
+    // aussi accepte pour retrocompat (au cas ou des comptes legacy l'utilisent).
+    if (!/^(\d{2}_\d{2}_\d{4}|\d{4}-\d{2}-\d{2})$/.test(termsVersionRaw)) {
       return res.status(400).json({ error: "terms_version invalide" });
     }
 
@@ -4039,19 +4519,32 @@ app.post("/api/start-paid-checkout", async (req, res) => {
       pending_id = pending.id;
     }
 
-    // ✅ 2) Price mapping (ENV)
-    const priceIds = {
-      standard: STRIPE_PRICE_STANDARD,
-      premium: STRIPE_PRICE_PREMIUM,
-    };
-    const priceId = priceIds[desired_plan];
+    // [15 mai 2026] Notification interne (contact@ + mehdi.joalland@)
+    // a chaque nouvelle inscription paid soumise. Non-bloquant.
+    sendAdminSignupNotification({
+      first_name,
+      last_name,
+      email: emailNorm,
+      company_name,
+      company_size,
+      desired_plan,
+    });
 
+    // ✅ 2) Price mapping selon le plan
+    let priceId = null;
+    let extraMetadata = {};
 
+    // Resolution du price_id selon le palier d'effectif (= company_size)
+    if (company_size === "50+") {
+      return res.status(400).json({ error: "Le palier 50+ necessite un devis" });
+    }
+    priceId = STRIPE_PRICE_BY_TIER[company_size];
     if (!priceId) {
       return res.status(500).json({
-        error: "PriceId Stripe manquant côté serveur (STRIPE_PRICE_STANDARD / STRIPE_PRICE_PREMIUM)"
+        error: `PriceId Stripe manquant pour le palier ${company_size}`
       });
     }
+    extraMetadata = { tier: company_size, plan: "paid" };
 
     // ✅ 3) Créer session Stripe (nouvelle session à chaque tentative)
     const FRONT = process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
@@ -4123,6 +4616,7 @@ app.post("/api/start-paid-checkout", async (req, res) => {
         desired_plan,
         user_email: emailNorm,
         stripe_customer_id: stripeCustomer.id, // ✅ utile pour debug
+        ...extraMetadata, // ✅ ajoute "tier" et "plan: paid" pour le new flow
       },
 
       subscription_data: {
@@ -4130,6 +4624,13 @@ app.post("/api/start-paid-checkout", async (req, res) => {
           pending_id,
           desired_plan,
           user_email: emailNorm,
+          // [15 mai 2026] FIX bug "Renouvellement annulé" a la 1ere connexion apres inscription :
+          // sans renewal_mode explicite, l'edge function (enforceRenewalModeOnStripeSubscription)
+          // considere la sub comme "manual" par defaut et force cancel_at_period_end=true.
+          // Du coup Stripe set cancel_at = current_period_end -> le frontend affiche "annule".
+          // Meme fix que /api/subscribe/session (utilise pour reactivation).
+          renewal_mode: "auto",
+          ...extraMetadata,
         },
       },
     });
@@ -4188,7 +4689,7 @@ app.post("/api/complete-signup", async (req, res) => {
       return res.status(404).send("pending introuvable");
     }
 
-    if (!["standard", "premium"].includes(pending.desired_plan)) {
+    if (pending.desired_plan !== "paid") {
       return res.status(400).send("pending n'est pas un plan payant");
     }
 
@@ -4476,6 +4977,15 @@ app.post("/api/finalize-pending", async (req, res) => {
         updated_at: now.toISOString(),
       };
 
+      // [15 mai 2026] On stocke aussi le tier (= palier choisi a l'inscription)
+      // pour les comptes trial. Cela facilite les requetes business (pas besoin
+      // de JOIN avec companies) et pre-renseigne le palier au moment de la
+      // conversion en paid. current_paid_tier reste NULL : un trial ne paie
+      // rien actuellement, il n'a donc pas de "palier facture en cours".
+      if (companySize) {
+        payload.tier = companySize;
+      }
+
 
       const { data: subSaved, error: upErr } = await supabaseAdmin
         .from("subscriptions")
@@ -4490,7 +5000,7 @@ app.post("/api/finalize-pending", async (req, res) => {
 
     } else {
 
-      // ✅ Payant (standard/premium) : la subscription doit déjà exister (créée par webhook Stripe)
+      // ✅ Payant : la subscription doit déjà exister (créée par webhook Stripe)
       const { data: subRow, error: subErr } = await supabaseAdmin
         .from("subscriptions")
         .select("user_id, plan, status")
@@ -4501,21 +5011,84 @@ app.post("/api/finalize-pending", async (req, res) => {
 
       if (!subRow) {
 
+        // Construire le payload pour un plan paid
+        const subscriptionPayload = {
+          user_id: user.id,
+          plan: plan,                  // "paid"
+          status: "active",            // ✅ dans ton enum sub_status
+          stripe_customer_id: pending.stripe_customer_id,
+          stripe_subscription_id: pending.stripe_subscription_id,
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+
+        // ✅ Pour le flow 'paid', stocker le tier (= company_size)
+        if (plan === "paid" && companySize) {
+          subscriptionPayload.tier = companySize;
+          // [14 mai 2026] A la creation, current_paid_tier = tier (= ce qui va etre facture immediatement)
+          // Par la suite, current_paid_tier ne sera mis a jour qu'au renouvellement annuel
+          // (webhook invoice.paid). Si le user change de tier entre-temps, seul 'tier' change.
+          subscriptionPayload.current_paid_tier = companySize;
+        }
+
+        // ✅ Enrichir avec les donnees Stripe (current_period_end, stripe_price_id, etc.)
+        //    Necessaire car le webhook n'a pas pu remplir ces champs : a ce moment-la,
+        //    l'utilisateur n'existait pas encore en Supabase Auth (timing issue).
+        if (pending.stripe_subscription_id) {
+          try {
+            const stripeSub = await stripe.subscriptions.retrieve(pending.stripe_subscription_id);
+            const firstItem = stripeSub.items?.data?.[0] ?? null;
+
+            // ✅ Defensif : essaie d'abord au niveau subscription, puis au niveau item
+            //    (depend de la version d'API Stripe)
+            const periodStartTs =
+              stripeSub.current_period_start ||
+              firstItem?.current_period_start ||
+              null;
+            const periodEndTs =
+              stripeSub.current_period_end ||
+              firstItem?.current_period_end ||
+              null;
+
+            log.debug("🔍 FINALIZE: Stripe subscription fetched", {
+              sub_id: stripeSub.id,
+              status: stripeSub.status,
+              top_level_period_start: stripeSub.current_period_start,
+              top_level_period_end: stripeSub.current_period_end,
+              item_period_start: firstItem?.current_period_start,
+              item_period_end: firstItem?.current_period_end,
+              cancel_at: stripeSub.cancel_at,
+              price_id: firstItem?.price?.id,
+              resolved_period_start: periodStartTs,
+              resolved_period_end: periodEndTs,
+            });
+
+            if (periodStartTs) {
+              subscriptionPayload.current_period_start = new Date(periodStartTs * 1000).toISOString();
+            }
+            if (periodEndTs) {
+              subscriptionPayload.current_period_end = new Date(periodEndTs * 1000).toISOString();
+            }
+            if (stripeSub.cancel_at) {
+              subscriptionPayload.cancel_at = new Date(stripeSub.cancel_at * 1000).toISOString();
+            }
+            if (firstItem?.price?.id) {
+              subscriptionPayload.stripe_price_id = firstItem.price.id;
+            }
+            // ✅ Patch user_id dans la metadata Stripe pour que les futurs events trouvent l'user
+            await stripe.subscriptions.update(pending.stripe_subscription_id, {
+              metadata: { ...(stripeSub.metadata ?? {}), user_id: user.id },
+            });
+          } catch (e) {
+            log.warn("⚠️ FINALIZE: failed to fetch Stripe sub for enrichment:", e?.message);
+            // On continue sans bloquer - le prochain webhook (renewal) repopulera
+          }
+        }
+
         const { data: createdSub, error: createErr } = await supabaseAdmin
           .from("subscriptions")
-          .upsert(
-            {
-              user_id: user.id,
-              plan: plan,                  // "standard" ou "premium"
-              status: "active",            // ✅ dans ton enum sub_status
-              stripe_customer_id: pending.stripe_customer_id,
-              stripe_subscription_id: pending.stripe_subscription_id,
-              started_at: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: "user_id" }
-          )
-          .select("id, user_id, plan, status, stripe_subscription_id")
+          .upsert(subscriptionPayload, { onConflict: "user_id" })
+          .select("id, user_id, plan, status, stripe_subscription_id, tier")
           .single();
 
         if (createErr) {
@@ -4582,6 +5155,113 @@ app.post("/api/finalize-pending", async (req, res) => {
 
 
 
+// ==========================================
+// [15 mai 2026] SET MDP INITIAL (apres clic sur lien d'invitation)
+//
+// Pourquoi cette route ?
+//   Quand le user clique sur le lien d'invitation et arrive sur
+//   create-password.html, on appelait avant sb.auth.updateUser({ password }).
+//   Or Supabase Auth declenche AUTOMATIQUEMENT l'email "Mot de passe modifie"
+//   sur toute action updateUser({ password }), meme pour une creation initiale.
+//   C'est trompeur pour le user.
+//
+// Solution :
+//   On passe par l'API admin Supabase (supabase.auth.admin.updateUserById)
+//   qui NE declenche PAS le template "Password changed". Pour proteger cet
+//   endpoint contre les abus, on verifie :
+//     1. L'access_token Supabase est valide (donc user authentifie)
+//     2. C'est bien une creation initiale (last_sign_in_at null OU pas
+//        encore de flag password_initialized dans user_metadata)
+//
+// Pour TOUT autre changement de mdp ulterieur (profile.html ou reset-password.html),
+// on continue a appeler sb.auth.updateUser({ password }) directement -> email envoye
+// pour la securite (notif au vrai proprietaire en cas de tentative de hack).
+// ==========================================
+app.post("/api/auth/set-initial-password", async (req, res) => {
+  try {
+    const password = String(req.body?.password || "");
+    // Le frontend peut envoyer le token soit dans le body, soit en header Authorization
+    const accessToken = String(
+      req.body?.accessToken ||
+        (req.headers.authorization || "").replace(/^Bearer\s+/i, "") ||
+        ""
+    );
+
+    // 1) Validation basique du mdp (la verif forte est faite par Supabase Auth derriere)
+    if (!password) {
+      return res.status(400).json({ error: "Mot de passe requis" });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ error: "Mot de passe trop court (8 caracteres minimum)" });
+    }
+    if (password.length > 72) {
+      return res.status(400).json({ error: "Mot de passe trop long (72 caracteres maximum)" });
+    }
+    if (!accessToken) {
+      return res.status(401).json({ error: "Session manquante" });
+    }
+
+    // 2) Verifier le token via Supabase admin -> recupere le user
+    const { data: userData, error: getUserErr } = await supabaseAdmin.auth.getUser(accessToken);
+    if (getUserErr || !userData?.user) {
+      return res.status(401).json({ error: "Session invalide ou expiree" });
+    }
+    const user = userData.user;
+
+    // 3) Verifier que c'est bien une CREATION INITIALE.
+    //    On se base UNIQUEMENT sur le flag user_metadata.password_initialized
+    //    qu'on controle nous-meme (set a true des le premier passage via ce endpoint).
+    //
+    //    On ne se base PAS sur last_sign_in_at car Supabase Auth peut le remplir
+    //    automatiquement au moment ou le user clique sur le lien d'invitation
+    //    (verification du token = "sign in" du point de vue Supabase), ce qui
+    //    rendrait le check trop strict.
+    //
+    //    Risque residuel : un user legacy (sans le flag) pourrait theoriquement
+    //    utiliser cette route une fois. Mais il faut deja un access_token valide
+    //    (= acces deja confirme), donc pas d'elevation de privilege reelle.
+    const alreadyInitialized = !!user.user_metadata?.password_initialized;
+
+    if (alreadyInitialized) {
+      return res.status(403).json({
+        error: "Cet endpoint est reserve a la creation initiale du mot de passe. " +
+               "Pour modifier votre mot de passe, utilisez votre espace profil ou la procedure d'oubli.",
+      });
+    }
+
+    // 4) Set du password via l'API admin -> ne declenche PAS le template Supabase "Password changed"
+    //    On marque aussi user_metadata.password_initialized = true pour bloquer toute
+    //    reutilisation de ce endpoint pour ce user.
+    const { error: updErr } = await supabaseAdmin.auth.admin.updateUserById(user.id, {
+      password,
+      user_metadata: {
+        ...(user.user_metadata || {}),
+        password_initialized: true,
+        password_initialized_at: new Date().toISOString(),
+      },
+    });
+
+    if (updErr) {
+      log.warn("⚠️ /api/auth/set-initial-password update error:", safeError(updErr));
+      // On renvoie le message brut Supabase pour que le frontend gere
+      // les cas "mdp trop faible / leaked / etc." comme avant.
+      return res.status(updErr.status || 400).json({
+        error: updErr.message || "Erreur lors de la creation du mot de passe",
+      });
+    }
+
+    log.debug("✅ Initial password set via admin API (no security email sent)", {
+      user_id: user.id,
+    });
+
+    return res.json({ success: true });
+  } catch (e) {
+    log.error("❌ /api/auth/set-initial-password:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+
 app.post("/api/start-trial-invite", async (req, res) => {
 
 
@@ -4610,7 +5290,10 @@ app.post("/api/start-trial-invite", async (req, res) => {
       return res.status(400).json({ error: "terms_version manquante" });
     }
 
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(termsVersionRaw)) {
+    // [15 mai 2026] Accepte le format DD_MM_YYYY (ex: "14_05_2026") qui est le
+    // format actuel de CURRENT_TERMS_VERSION. L'ancien format YYYY-MM-DD est
+    // aussi accepte pour retrocompat (au cas ou des comptes legacy l'utilisent).
+    if (!/^(\d{2}_\d{2}_\d{4}|\d{4}-\d{2}-\d{2})$/.test(termsVersionRaw)) {
       return res.status(400).json({ error: "terms_version invalide" });
     }
 
@@ -4713,6 +5396,53 @@ app.post("/api/start-trial-invite", async (req, res) => {
       pending_id = pending.id;
     }
 
+
+    // ✅ Alerte commerciale : trial 50+ collaborateurs
+    //    Notre equipe doit contacter ce prospect pendant les 7 jours d'essai
+    //    pour preparer un devis personnalise (Option C : pas de checkout
+    //    self-service pour 50+, mais essai gratuit accessible).
+    if (company_size === "50+") {
+      try {
+        const subjectMail = `🚨 Nouveau trial 50+ — ${company_name}`;
+        const htmlAlert = `
+          <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#1a1a1a;font-size:15px;line-height:1.6;">
+            <h2 style="margin:0 0 16px 0;font-size:18px;font-weight:700;">Nouveau trial pour effectif 50+ collaborateurs</h2>
+            <p>Un prospect avec un effectif <strong>50 collaborateurs ou plus</strong> vient de demarrer un essai gratuit.</p>
+            <p>Action recommandee : <strong>contacter ce prospect rapidement</strong> pendant les 7 jours d'essai pour preparer un devis personnalise.</p>
+            <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin:16px 0;">
+              <p style="margin:0 0 6px 0;"><strong>Client :</strong> ${escapeHtml(first_name)} ${escapeHtml(last_name)}</p>
+              <p style="margin:0 0 6px 0;"><strong>Email :</strong> ${escapeHtml(emailNorm)}</p>
+              <p style="margin:0 0 6px 0;"><strong>Entreprise :</strong> ${escapeHtml(company_name)}</p>
+              <p style="margin:0;"><strong>Effectif declare :</strong> 50 collaborateurs ou plus</p>
+            </div>
+            <p style="font-size:13px;color:#64748b;margin-top:24px;">
+              Pending ID : <code>${pending_id}</code><br/>
+              Recu le ${new Date().toLocaleString("fr-FR")}
+            </p>
+          </div>
+        `;
+        await sendResendEmail({
+          to: ["contact@integora.fr", "mehdi.joalland@integora.fr"],
+          subject: subjectMail,
+          html: htmlAlert,
+        });
+        log.info(`📧 Alerte trial 50+ envoyee pour ${company_name}`);
+      } catch (alertErr) {
+        log.warn("⚠️ Trial 50+ alert email failed:", safeError(alertErr));
+      }
+    }
+
+
+    // [15 mai 2026] Notification interne (contact@ + mehdi.joalland@)
+    // a chaque nouvelle inscription trial. Non-bloquant.
+    sendAdminSignupNotification({
+      first_name,
+      last_name,
+      email: emailNorm,
+      company_name,
+      company_size,
+      desired_plan: "trial",
+    });
 
     // 2) invite email
     const FRONT = FRONTEND_URL;
@@ -5115,11 +5845,21 @@ app.post(
         other: { label: "Autre", bg: "#EEF2F7", bd: "#AAB4C3", tx: "#223048" },
       };
       const badge = subjectBadges[ticket.subject] || { label: prettySubject, bg: "#EEF2F7", bd: "#AAB4C3", tx: "#223048" };
-      const planBadge = (ticket.user_plan || "").toLowerCase() === "premium"
-        ? { label: "Plan premium", bg: "#FFF4E5", bd: "#FFB84D", tx: "#7A4A0B" }
-        : (ticket.user_plan || "").toLowerCase() === "standard"
-          ? { label: "Plan standard", bg: "#EAF7EE", bd: "#7FE0A0", tx: "#0B5A2A" }
+      const planBadge = (ticket.user_plan || "").toLowerCase() === "paid"
+        ? { label: "Abonnement annuel", bg: "#EAF7EE", bd: "#7FE0A0", tx: "#0B5A2A" }
+        : (ticket.user_plan || "").toLowerCase() === "trial"
+          ? { label: "Essai gratuit", bg: "#F1ECFF", bd: "#B49BFF", tx: "#3A1A7A" }
           : { label: `Plan ${prettyPlan}`, bg: "#EEF2F7", bd: "#AAB4C3", tx: "#223048" };
+
+      // Generer le lien "Marquer comme traite" (token signe HMAC, expire 90 jours)
+      const FRONT_URL = process.env.FRONTEND_URL || "https://integora.fr";
+      let markClosedUrl = null;
+      try {
+        const closeToken = generateCloseTicketToken(ticket.id, "support_tickets");
+        markClosedUrl = `${FRONT_URL}/api/admin/ticket-mark-closed?token=${closeToken}`;
+      } catch (e) {
+        log.warn("⚠️ support ticket: impossible de generer le token close:", safeError(e));
+      }
 
       const html = `
   <div style="margin:0;padding:0;background:#f4f6fb;">
@@ -5214,6 +5954,19 @@ app.post(
           : `<div style="color:#64748b;">Aucune pièce jointe.</div>`
         }
         </div>
+
+        ${markClosedUrl ? `
+        <!-- BOUTON MARQUER COMME TRAITE -->
+        <div style="text-align:center;margin:24px 0 16px 0;">
+          <a href="${markClosedUrl}"
+             style="display:inline-block;background:#16a34a;color:#ffffff;text-decoration:none;padding:13px 28px;border-radius:8px;font-weight:700;font-size:14px;">
+            ✓ Marquer ce ticket comme traite
+          </a>
+          <div style="font-size:12px;color:#64748b;margin-top:8px;">
+            Une fois le ticket support traite, cliquez ici pour le cloturer.
+          </div>
+        </div>
+        ` : ""}
 
         <div style="text-align:center;margin-top:14px;color:#94a3b8;font-size:12px;">
           INTEGORA • Ticket ${escapeHtml(prettyIdShort)}
@@ -5419,10 +6172,20 @@ app.post("/api/contact/ticket", contactPublicLimiter, async (req, res) => {
     // Badge "CONTACT" (remplace le badge Plan du support)
     const contactBadge = { label: "Contact public", bg: "#ecfeff", bd: "#67e8f9", tx: "#155e75" };
 
+    // Generer le lien "Marquer comme traite" (token signe HMAC, expire 90 jours)
+    const FRONT_URL = process.env.FRONTEND_URL || "https://integora.fr";
+    let markClosedUrl = null;
+    try {
+      const closeToken = generateCloseTicketToken(ticket.id, "contact_tickets");
+      markClosedUrl = `${FRONT_URL}/api/admin/ticket-mark-closed?token=${closeToken}`;
+    } catch (e) {
+      log.warn("⚠️ contact ticket: impossible de generer le token close:", safeError(e));
+    }
+
     const html = `
   <div style="margin:0;padding:0;background:#f4f6fb;">
     <div style="max-width:760px;margin:0 auto;padding:28px 14px;font-family:Arial,sans-serif;color:#0f172a;">
-      
+
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
         <span style="display:inline-block;width:10px;height:10px;border-radius:999px;background:#22c55e;"></span>
         <div style="font-weight:800;font-size:16px;">INTEGORA — Nouveau message Contact</div>
@@ -5495,6 +6258,19 @@ app.post("/api/contact/ticket", contactPublicLimiter, async (req, res) => {
           <div style="font-weight:900;font-size:16px;margin-bottom:8px;">Pièces jointes</div>
           <div style="color:#64748b;">Aucune (formulaire Contact public).</div>
         </div>
+
+        ${markClosedUrl ? `
+        <!-- BOUTON MARQUER COMME TRAITE -->
+        <div style="text-align:center;margin:24px 0 16px 0;">
+          <a href="${markClosedUrl}"
+             style="display:inline-block;background:#16a34a;color:#ffffff;text-decoration:none;padding:13px 28px;border-radius:8px;font-weight:700;font-size:14px;">
+            ✓ Marquer ce ticket comme traite
+          </a>
+          <div style="font-size:12px;color:#64748b;margin-top:8px;">
+            Une fois le contact traite, cliquez ici pour cloturer la demande.
+          </div>
+        </div>
+        ` : ""}
 
         <div style="text-align:center;margin-top:14px;color:#94a3b8;font-size:12px;">
           INTEGORA • Ticket ${escapeHtml(prettyIdShort)}
@@ -5580,7 +6356,7 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
     // ✅ 1. Récupérer tous les abonnements actifs (1 requête)
     const { data: subs, error: subsErr } = await supabaseAdmin
       .from("subscriptions")
-      .select("user_id, plan, status, current_period_end, trial_end")
+      .select("user_id, plan, tier, status, current_period_end, trial_end")
       .in("status", ["active", "trialing"]);
 
     if (subsErr) throw subsErr;
@@ -5669,7 +6445,7 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
       const templateFn = templateMap[reminder.type];
       if (!templateFn) continue;
 
-      const { subject, html } = templateFn({ firstName, plan, endDate: endDateRaw });
+      const { subject, html } = templateFn({ firstName, plan, endDate: endDateRaw, tier: sub.tier });
 
       try {
         await sendResendEmail({ to: email, subject, html });
@@ -5690,7 +6466,34 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
       }
     }
 
-    return res.json({ ok: true, sent, errors: errors.length ? errors : undefined });
+    // ✅ AUTO-CLOSE des tickets contact_tickets ouverts depuis > 30 jours
+    //    Mehdi n'a pas a aller dans Supabase fermer les vieux tickets.
+    //    Si une demande contact (general/demo/commercial/quote_50_plus/etc.) n'a
+    //    pas ete traitee en 30j, le systeme la cloture automatiquement.
+    //    support_tickets reste manuel (peut prendre + de temps a resoudre).
+    let autoClosed = 0;
+    try {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - 30);
+      const { data: closedRows, error: autoCloseErr } = await supabaseAdmin
+        .from("contact_tickets")
+        .update({ status: "closed" })
+        .eq("status", "open")
+        .lt("created_at", cutoff.toISOString())
+        .select("id");
+      if (autoCloseErr) {
+        log.warn("⚠️ Auto-close contact_tickets failed:", safeError(autoCloseErr));
+      } else {
+        autoClosed = (closedRows || []).length;
+        if (autoClosed > 0) {
+          log.info(`🧹 Auto-close: ${autoClosed} contact_ticket(s) > 30j cloture(s)`);
+        }
+      }
+    } catch (e) {
+      log.warn("⚠️ Auto-close contact_tickets exception:", safeError(e));
+    }
+
+    return res.json({ ok: true, sent, autoClosed, errors: errors.length ? errors : undefined });
   } catch (err) {
     log.error("❌ Cron expiration-reminders:", safeError(err));
     return res.status(500).json({ error: "Erreur interne cron" });

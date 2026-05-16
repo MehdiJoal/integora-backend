@@ -25,7 +25,10 @@ function formatDateFR(isoStr) {
 
 // ✅ Label plan — les valeurs whitelistées sont safe ; le fallback est échappé
 function planLabel(plan) {
-  const labels = { trial: "essai gratuit", standard: "Standard", premium: "Premium" };
+  const labels = {
+    trial: "essai gratuit",
+    paid: "annuel",
+  };
   return labels[plan] || escapeHtml(plan);
 }
 
@@ -57,13 +60,21 @@ function simpleLayout(body) {
 // ──────────────────────────────────────────
 // TEMPLATE J-30 (payant uniquement)
 // ──────────────────────────────────────────
-function reminderJ30({ firstName, plan, endDate }) {
+function reminderJ30({ firstName, plan, endDate, tier }) {
+  const tierLine = tier
+    ? `<p>Vous êtes actuellement sur le palier <strong>${escapeHtml(tier)} collaborateurs</strong>.</p>`
+    : "";
   return {
     subject: `${firstName}, votre abonnement Integora expire le ${formatDateFR(endDate)}`,
     html: simpleLayout(`
       <p>Bonjour ${escapeHtml(firstName)},</p>
       <p>Votre abonnement <strong>${planLabel(plan)}</strong> arrive à échéance le <strong>${formatDateFR(endDate)}</strong>.</p>
-      <p>D'ici là, vous conservez un accès complet à la plateforme. Si vous souhaitez renouveler, vous pouvez le faire depuis votre profil :</p>
+      ${tierLine}
+      <p>D'ici là, vous conservez un accès complet à la plateforme. Avant le renouvellement automatique, vérifiez que votre effectif est toujours dans cette tranche :</p>
+      <ul style="margin:0 0 16px 0; padding-left:20px;">
+        <li style="margin-bottom:8px;">Si votre effectif a évolué, vous pouvez ajuster votre palier depuis votre profil. Le nouveau tarif s'appliquera au prochain renouvellement.</li>
+        <li>Si vous avez dépassé 50 collaborateurs, contactez-nous pour un devis personnalisé.</li>
+      </ul>
       ${soberLink("Accéder à mon compte")}
       <p>N'hésitez pas à nous écrire si vous avez la moindre question.</p>
     `),

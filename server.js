@@ -633,6 +633,32 @@ const APP_VERSION = "1.0.0"; // ← incrémenter à chaque déploiement
 const FRONTEND_DIR = path.join(__dirname, "../frontend");
 const APP_DIR = path.join(FRONTEND_DIR, "app");
 
+// ✅ [ADMIN] Liste auto de toutes les pages réelles de l'app (scan 1x, mis en cache).
+// page = nom du fichier sans .html (= exactement ce que le mouchard enregistre).
+// On garde le dossier (univers) pour regrouper joliment à l'écran. Pages admin exclues (c'est toi).
+let _appPagesCache = null;
+function getAppPages() {
+  if (_appPagesCache) return _appPagesCache;
+  const pages = [];
+  const walk = (dir, folder) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        // on ignore les dossiers techniques (pas des pages)
+        if (["css", "js", "images", "assets", "fonts", "videos"].includes(entry.name)) continue;
+        walk(full, folder ? `${folder}/${entry.name}` : entry.name);
+      } else if (entry.isFile() && entry.name.endsWith(".html")) {
+        const name = entry.name.replace(".html", "");
+        if (name.startsWith("admin")) continue; // pages admin exclues
+        pages.push({ page: name, folder: folder || null });
+      }
+    }
+  };
+  walk(APP_DIR, "");
+  _appPagesCache = pages;
+  return pages;
+}
+
 
 // ==================== STATIC VITE "public/" (LOCAL) ====================
 const PUBLIC_DIR = path.join(FRONTEND_DIR, "public");
@@ -680,7 +706,7 @@ app.use("/app/js", express.static(path.join(APP_DIR, "js"), {
 }));
 
 // ✅ Injecte ?v= sur JS/CSS dans tous les HTML /app/*
-app.use("/app", (req, res, next) => {
+app.use("/app", async (req, res, next) => {
   if (!req.path.endsWith(".html")) return next();
 
   // 🛡️ Anti path traversal : s'assurer que le chemin résolu reste dans APP_DIR
@@ -690,6 +716,21 @@ app.use("/app", (req, res, next) => {
   if (resolved !== appDirResolved && !resolved.startsWith(appDirResolved + path.sep)) {
     return res.status(403).send("Forbidden");
   }
+
+  // 🔒 [INVISIBILITÉ ADMIN] /app/admin*.html n'existe (404) QUE pour les non-admins.
+  //    Seuls les emails de ADMIN_EMAILS (vérifiés via le cookie) peuvent charger ces pages.
+  //    Pour un curieux : page "introuvable" → il ne peut même pas savoir que l'espace admin existe.
+  if (/^\/admin[\w-]*\.html$/.test(req.path)) {
+    let email = "";
+    try {
+      const u = await resolveUserFromCookie(req);
+      email = String(u?.email || "").trim().toLowerCase();
+    } catch (_) { /* pas de session → traité comme non-admin */ }
+    if (!email || !ADMIN_EMAILS.has(email)) {
+      return res.status(404).sendFile(path.join(FRONTEND_DIR, "404.html"));
+    }
+  }
+
   if (!fs.existsSync(resolved)) return next();
 
   let html = fs.readFileSync(resolved, "utf8");
@@ -898,6 +939,11 @@ app.use("/app", (req, res, next) => {
     // ✅ Profil accessible même avec abonnement expiré (pour renouveler)
     const pageName = getPageNameFromAppPath(req.path);
     const exemptPages = ["profile"];
+
+    // 0) Compte suspendu par un admin -> bloqué partout (avant tout le reste, même profile)
+    if (req.user?.suspended) {
+      return res.status(403).sendFile(path.join(FRONTEND_DIR, "account-suspended.html"));
+    }
 
     // 1) Abonnement actif requis pour tout /app (sauf pages exemptées)
     if (!req.user?.has_active_subscription && !exemptPages.includes(pageName)) {
@@ -1773,7 +1819,7 @@ async function getActiveSubscription(userId) {
 
   const { data: sub, error } = await supabase
     .from('subscriptions')
-    .select('plan, status, started_at, created_at, current_period_end, trial_end')
+    .select('plan, status, started_at, created_at, current_period_end, trial_end, access_locked, access_locked_reason')
     .eq('user_id', userId)
     .order('created_at', { ascending: false })
     .limit(1)
@@ -1829,10 +1875,15 @@ async function getActiveSubscription(userId) {
     trialEnd && trialEnd >= now; // ❌ trial_end NULL = trial inactif
 
 
+  // ✅ Suspension ADMIN uniquement (on ne bloque PAS les impayés "past_due" qui gardent leur grâce)
+  const suspended = sub.access_locked === true
+    && String(sub.access_locked_reason || '').toLowerCase() === 'admin_suspended';
+
   const result = {
     plan,
     status,
     hasActiveSubscription: isPaidActive || isTrialActive,
+    suspended,
     started_at: sub.started_at,
     current_period_end: sub.current_period_end,
     trial_end: sub.trial_end,
@@ -2013,6 +2064,7 @@ async function resolveUserFromCookie(req) {
     avatar_url: profileResult.data.avatar_url,
     subscription_type: subscriptionResult.plan,
     has_active_subscription: subscriptionResult.hasActiveSubscription,
+    suspended: subscriptionResult.suspended === true,
     subscription_end_date: subscriptionEndDate,
   };
 
@@ -2038,6 +2090,37 @@ async function authenticateToken(req, res, next) {
   } catch (error) {
     handleAuthenticationError(req, res, error);
   }
+}
+
+
+// ✅ Liste blanche des emails admin (variable d'env ADMIN_EMAILS, séparés par des virgules)
+const ADMIN_EMAILS = new Set(
+  String(process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+// ✅ Middleware : réserve une route aux admins. À placer APRÈS authenticateToken.
+function requireAdmin(req, res, next) {
+  const email = String(req.user?.email || "").trim().toLowerCase();
+  if (email && ADMIN_EMAILS.has(email)) {
+    return next();
+  }
+  log.warn("🚫 Accès admin refusé:", { email: email || "(inconnu)", path: req.path });
+  return res.status(403).json({ error: "Accès réservé à l'administrateur", code: "ADMIN_ONLY" });
+}
+
+
+// ✅ [ADMIN] Journalise une action admin (qui / quoi / quand / pourquoi). Fire-and-forget, non bloquant.
+function logAdminAction({ targetUserId, adminEmail, action, detail, motif }) {
+  supabaseAdmin.from('admin_audit_log').insert({
+    target_user_id: /^[0-9a-f-]{36}$/i.test(String(targetUserId || '')) ? targetUserId : null,
+    admin_email: String(adminEmail || '').slice(0, 254),
+    action: String(action || '').slice(0, 64),
+    detail: detail ? String(detail).slice(0, 500) : null,
+    motif: (motif && String(motif).trim()) ? String(motif).trim().slice(0, 500) : null,
+  }).then(() => { }).catch((e) => { log.warn('⚠️ admin_audit_log insert skipped:', e?.message); });
 }
 
 
@@ -3489,6 +3572,28 @@ app.post("/login", async (req, res) => {
       .eq("user_id", user_id)
       .single();
 
+    // 🔐 2FA : si ce compte a la 2FA activée, on N'OUVRE PAS la session ici.
+    //    On renvoie un "challenge" court (5 min) ; le code sera vérifié par POST /login/2fa.
+    {
+      const { data: mfaRow } = await supabaseAdmin
+        .from("user_mfa").select("enabled").eq("user_id", user_id).maybeSingle();
+      if (mfaRow && mfaRow.enabled) {
+        const challenge = jwt.sign(
+          {
+            id: user_id,
+            email: authData.user.email,
+            first_name: profile?.first_name || "Utilisateur",
+            last_name: profile?.last_name || "",
+            company_id: profile?.company_id || null,
+            mfa_pending: true,
+          },
+          SECRET_KEY,
+          { expiresIn: "5m" }
+        );
+        return res.json({ success: false, mfaRequired: true, challenge: challenge });
+      }
+    }
+
     // ✅ 3) Fermer anciennes sessions (non bloquant)
     await supabaseAdmin
       .from("token_sessions")
@@ -3554,6 +3659,88 @@ app.post("/login", async (req, res) => {
       success: false,
       error: "Erreur serveur lors de la connexion.",
     });
+  }
+});
+
+
+// 🔐 [2FA] Vérifie le code à 6 chiffres (ou un code de secours) puis ouvre la session.
+//    Reçoit le "challenge" émis par /login (jwt court). Rate-limité par app.use('/login', authLimiter).
+app.post("/login/2fa", async (req, res) => {
+  const GENERIC = "Code invalide. Réessayez.";
+  try {
+    const { challenge, code } = req.body || {};
+    if (!challenge || !code) return res.status(400).json({ success: false, error: GENERIC });
+
+    let payload;
+    try { payload = jwt.verify(challenge, SECRET_KEY); }
+    catch (_) { return res.status(401).json({ success: false, error: "Session expirée. Reconnecte-toi." }); }
+    if (!payload || !payload.mfa_pending || !payload.id) {
+      return res.status(401).json({ success: false, error: GENERIC });
+    }
+    const user_id = payload.id;
+
+    const { data: mfaRow } = await supabaseAdmin
+      .from("user_mfa").select("secret, enabled, recovery_codes").eq("user_id", user_id).maybeSingle();
+    if (!mfaRow || !mfaRow.enabled || !mfaRow.secret) {
+      return res.status(401).json({ success: false, error: GENERIC });
+    }
+
+    const { authenticator } = require("otplib");
+    const clean = String(code).trim();
+    let ok = false, usedRecovery = false, remaining = null;
+
+    // 1) Code TOTP (6 chiffres)
+    if (/^\d{6}$/.test(clean.replace(/\s/g, ""))) {
+      ok = authenticator.verify({ token: clean.replace(/\s/g, ""), secret: mfaRow.secret });
+    }
+    // 2) Sinon, code de secours (usage unique)
+    if (!ok) {
+      const bcrypt = require("bcryptjs");
+      const codes = Array.isArray(mfaRow.recovery_codes) ? mfaRow.recovery_codes : [];
+      const idx = codes.findIndex((h) => { try { return bcrypt.compareSync(clean.toUpperCase(), h); } catch (_) { return false; } });
+      if (idx !== -1) { ok = true; usedRecovery = true; remaining = codes.filter((_, i) => i !== idx); }
+    }
+    if (!ok) return res.status(401).json({ success: false, error: GENERIC });
+
+    // Code de secours consommé → on le retire (usage unique)
+    if (usedRecovery && remaining) {
+      await supabaseAdmin.from("user_mfa").update({ recovery_codes: remaining, updated_at: new Date().toISOString() }).eq("user_id", user_id);
+    }
+
+    // ✅ Tout est bon → on ouvre la session (mêmes étapes que /login)
+    await supabaseAdmin.from("token_sessions")
+      .update({ is_active: false, revoked_at: new Date().toISOString() })
+      .eq("user_id", user_id).eq("is_active", true);
+
+    const token = jwt.sign(
+      { id: user_id, email: payload.email, first_name: payload.first_name, last_name: payload.last_name },
+      SECRET_KEY, { expiresIn: "24h" }
+    );
+    const tokenHash = hashToken(token);
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await supabaseAdmin.from("token_sessions").insert([{
+      user_id: user_id, token_hash: tokenHash, device_id: "web",
+      user_agent: req.headers["user-agent"], ip: req.ip,
+      expires_at: expiresAt.toISOString(), is_active: true,
+    }]);
+    res.cookie("auth_token", token, {
+      httpOnly: true, secure: IS_PROD, sameSite: IS_PROD ? "none" : "lax",
+      maxAge: 24 * 60 * 60 * 1000, path: "/",
+    });
+
+    logAdminAction({
+      targetUserId: user_id, adminEmail: payload.email,
+      action: usedRecovery ? "login_2fa_recovery" : "login_2fa",
+      detail: usedRecovery ? "Connexion via un code de secours" : "Connexion validée par 2FA",
+    });
+
+    return res.json({
+      success: true, redirect: "/app/choix_irl_digital.html",
+      user: { id: user_id, email: payload.email, first_name: payload.first_name, last_name: payload.last_name, company_id: payload.company_id || null },
+    });
+  } catch (error) {
+    log.error("💥 /login/2fa:", safeError(error));
+    return res.status(500).json({ success: false, error: "Erreur serveur." });
   }
 });
 
@@ -3803,6 +3990,1086 @@ app.post('/api/update-profile', authenticateToken, requireCsrf, async (req, res)
   }
 });
 
+
+// ✅ Suivi d'usage (analytics) — enregistre l'ouverture d'une page.
+//    Ne stocke QUE : qui (via le cookie), quelle page, quand. Jamais de contenu.
+app.post('/api/track', authenticateToken, requireCsrf, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(204).end();
+
+    // Nom de page reçu du front : on borne et on nettoie (défensif)
+    const page = String(req.body?.page || '').trim().slice(0, 120);
+    if (!page) return res.status(204).end();
+
+    // Insertion "fire-and-forget"
+    await supabaseAdmin
+      .from('activity_log')
+      .insert({ user_id: userId, page });
+
+    return res.status(204).end();
+  } catch (e) {
+    // ⚠️ Un échec de tracking ne doit JAMAIS gêner l'utilisateur
+    log.warn('⚠️ /api/track insert failed:', e?.message);
+    return res.status(204).end();
+  }
+});
+
+
+// ✅ [ADMIN] Vérifie que l'appelant est admin (gate de la future page admin)
+app.get('/api/admin/check', authenticateToken, requireAdmin, (req, res) => {
+  return res.json({ ok: true, email: req.user?.email || null });
+});
+
+
+// ✅ [ADMIN] Renvoie les stats d'usage (pages via vues + emails via API admin)
+app.get('/api/admin/analytics', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const [pagesRes, actRes, usersList, profsRes, compsRes] = await Promise.all([
+      supabaseAdmin
+        .from('v_admin_pages_stats')
+        .select('*')
+        .order('opens', { ascending: false }),
+      supabaseAdmin
+        .from('v_admin_user_activity')
+        .select('*'),
+      supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 }),
+      supabaseAdmin.from('profiles').select('user_id, company_id'),
+      supabaseAdmin.from('companies').select('id, owner_id, display_name, legal_name'),
+    ]);
+
+    if (pagesRes.error) throw pagesRes.error;
+    if (actRes.error) throw actRes.error;
+    if (usersList.error) throw usersList.error;
+    if (profsRes.error) throw profsRes.error;
+    if (compsRes.error) throw compsRes.error;
+
+    // Map user_id -> activité (depuis la vue, ne lit que activity_log)
+    const actMap = new Map((actRes.data || []).map((r) => [r.user_id, r]));
+
+    // Entreprise : 2 chemins (lien direct company_id OU propriétaire owner_id pour les vieux comptes)
+    const profMap     = new Map((profsRes.data || []).map((p) => [p.user_id, p]));
+    const compById    = new Map((compsRes.data || []).map((c) => [c.id, c]));
+    const compByOwner = new Map((compsRes.data || []).map((c) => [c.owner_id, c]));
+
+    // Emails via l'API admin (lecture sûre de auth.users) + on inclut TOUS les comptes (même inactifs)
+    const users = (usersList.data?.users || [])
+      .map((u) => {
+        const a = actMap.get(u.id);
+        const p = profMap.get(u.id) || {};
+        const comp = compById.get(p.company_id) || compByOwner.get(u.id) || null;
+        const company = comp ? (comp.display_name || comp.legal_name || null) : null;
+        return { user_id: u.id, email: u.email || null, company, opens: a?.opens || 0, last_seen: a?.last_seen || null };
+      })
+      .sort((x, y) => {
+        if (!x.last_seen && !y.last_seen) return 0;
+        if (!x.last_seen) return 1;
+        if (!y.last_seen) return -1;
+        return String(y.last_seen).localeCompare(String(x.last_seen));
+      });
+
+    return res.json({ ok: true, pages: pagesRes.data || [], users });
+  } catch (e) {
+    log.error('❌ /api/admin/analytics:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur analytics' });
+  }
+});
+
+
+// ===== [ADMIN] Statistiques d'usage avancées (temps actif ESTIMÉ + sessions) =====
+// Tout est calculé en Node à partir de activity_log (qui / page / quand) : AUCUNE nouvelle table SQL.
+// Règles d'estimation : session coupée après 30 min d'inactivité ; temps d'une page = écart jusqu'à
+// la suivante de la session, plafonné à 5 min ; dernière page d'une session = 1 min forfaitaire.
+const USAGE_SESSION_GAP_MS = 30 * 60 * 1000;
+const USAGE_PAGE_CAP_MS    = 5 * 60 * 1000;
+const USAGE_LAST_PAGE_MS   = 60 * 1000;
+
+// Catégorie d'une page (alignée sur les 3 modes INTEGORA + Admin / Compte / Parcours / Plateforme).
+function usageCategory(page, folder) {
+  if (!page) return 'Autre';
+  if (String(page).startsWith('admin')) return 'Admin';
+  if (!folder) {
+    if (page === 'profile' || page === 'support') return 'Compte';
+    if (page === 'choix_irl_digital') return 'Parcours';
+    if (page === 'tableau_de_pilotage') return 'Plateforme';
+    if (page === 'jeu_irl') return "Activités d'équipe";
+    return 'Autre';
+  }
+  const root = String(folder).split('/')[0];
+  if (['bien_etre_irl', 'collaboration_irl', 'competition_amicale', 'connaissance_des_collegues_irl', 'creativite_irl'].includes(root)) return "Activités d'équipe";
+  if (['recrutement', 'integration', 'manager_autrement'].includes(root)) return 'Supports RH';
+  if (root === 'appui_managerial') return String(folder).includes('/outils') ? 'Outils interactifs' : 'Supports RH';
+  return 'Autre';
+}
+
+// Date de début ISO selon la période demandée (null = depuis le début).
+function usageSince(period) {
+  const now = Date.now();
+  switch (period) {
+    case '7d':  return new Date(now - 7 * 86400000).toISOString();
+    case '30d': return new Date(now - 30 * 86400000).toISOString();
+    case 'month': { const d = new Date(); return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)).toISOString(); }
+    case '3m':  return new Date(now - 90 * 86400000).toISOString();
+    case 'year': return new Date(now - 365 * 86400000).toISOString();
+    case 'all': default: return null;
+  }
+}
+
+app.get('/api/admin/usage', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const scope = ['admin', 'all'].includes(req.query?.scope) ? req.query.scope : 'client';
+    const period = String(req.query?.period || '30d');
+    const sinceIso = usageSince(period);
+
+    // 0) Comptes : emails + entreprises (servent au filtrage des comptes internes ET à l'affichage)
+    const [usersList, profsRes, compsRes] = await Promise.all([
+      supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 }),
+      supabaseAdmin.from('profiles').select('user_id, company_id'),
+      supabaseAdmin.from('companies').select('id, owner_id, display_name, legal_name'),
+    ]);
+    const emailOf = new Map((usersList.data?.users || []).map((u) => [u.id, u.email || null]));
+    const profMap = new Map((profsRes.data || []).map((p) => [p.user_id, p]));
+    const compById = new Map((compsRes.data || []).map((c) => [c.id, c]));
+    const compByOwner = new Map((compsRes.data || []).map((c) => [c.owner_id, c]));
+    const companyOf = (uid) => {
+      const p = profMap.get(uid) || {};
+      const c = compById.get(p.company_id) || compByOwner.get(uid) || null;
+      return c ? (c.display_name || c.legal_name || null) : null;
+    };
+    // Comptes internes INTEGORA (admin / support) repérés par le domaine email → exclus de l'usage CLIENT.
+    const internalSet = new Set();
+    (usersList.data?.users || []).forEach((u) => { if ((u.email || '').toLowerCase().endsWith('@integora.fr')) internalSet.add(u.id); });
+
+    // 1) Lecture des événements (paginée, garde-fou à 100k lignes)
+    const rows = [];
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      let q = supabaseAdmin.from('activity_log')
+        .select('user_id, page, created_at')
+        .order('created_at', { ascending: true })
+        .range(from, from + PAGE - 1);
+      if (sinceIso) q = q.gte('created_at', sinceIso);
+      const { data, error } = await q;
+      if (error) throw error;
+      rows.push(...(data || []));
+      if (!data || data.length < PAGE || rows.length >= 100000) break;
+    }
+
+    // 2) Dossier de chaque page (pour la catégorie). Pages admin exclues de getAppPages → repérées par préfixe.
+    const folderOf = new Map(getAppPages().map((p) => [p.page, p.folder]));
+
+    // 3) Filtre périmètre + regroupement par compte (ordre chronologique conservé)
+    const byUser = new Map();
+    for (const e of rows) {
+      // « Utilisation client » : on exclut entièrement les comptes internes (admin/support).
+      if (scope === 'client' && internalSet.has(e.user_id)) continue;
+      const cat = usageCategory(e.page, folderOf.get(e.page) || null);
+      if (scope === 'client' && cat === 'Admin') continue;
+      if (scope === 'admin' && cat !== 'Admin') continue;
+      e._cat = cat;
+      if (!byUser.has(e.user_id)) byUser.set(e.user_id, []);
+      byUser.get(e.user_id).push(e);
+    }
+
+    // 4) Agrégation : temps actif estimé + sessions, par page ET par compte
+    const pageAgg = new Map();
+    const accountsRaw = [];
+    let totalSessions = 0;
+    for (const [uid, evs] of byUser) {
+      let sessions = 0, userTime = 0, lastSeen = 0;
+      const distinct = new Set();
+      for (let i = 0; i < evs.length; i++) {
+        const t = new Date(evs[i].created_at).getTime();
+        const prevT = i > 0 ? new Date(evs[i - 1].created_at).getTime() : null;
+        const nextT = i < evs.length - 1 ? new Date(evs[i + 1].created_at).getTime() : null;
+        if (i === 0 || (t - prevT) > USAGE_SESSION_GAP_MS) sessions++;
+        const sessionEnd = (nextT === null) || ((nextT - t) > USAGE_SESSION_GAP_MS);
+        const dur = sessionEnd ? USAGE_LAST_PAGE_MS : Math.min(nextT - t, USAGE_PAGE_CAP_MS);
+        userTime += dur;
+        distinct.add(evs[i].page);
+        if (t > lastSeen) lastSeen = t;
+        let pa = pageAgg.get(evs[i].page);
+        if (!pa) {
+          pa = { page: evs[i].page, folder: folderOf.get(evs[i].page) || null, category: evs[i]._cat, opens: 0, users: new Set(), timeMs: 0, lastOpen: 0 };
+          pageAgg.set(evs[i].page, pa);
+        }
+        pa.opens++; pa.users.add(uid); pa.timeMs += dur; if (t > pa.lastOpen) pa.lastOpen = t;
+      }
+      totalSessions += sessions;
+      accountsRaw.push({ user_id: uid, opens: evs.length, distinctPages: distinct.size, sessions, activeTimeMs: userTime, last_seen: lastSeen ? new Date(lastSeen).toISOString() : null });
+    }
+
+    // 5) Comptes enrichis (emails + entreprises calculés à l'étape 0)
+    const accounts = accountsRaw
+      .map((a) => ({ ...a, email: emailOf.get(a.user_id) || null, company: companyOf(a.user_id) }))
+      .sort((x, y) => (y.activeTimeMs - x.activeTimeMs));
+
+    // 6) Pages triées (par ouvertures) + KPI globaux
+    const pages = Array.from(pageAgg.values()).map((p) => ({
+      page: p.page, folder: p.folder, category: p.category, opens: p.opens, users: p.users.size,
+      timeMs: p.timeMs, avgTimeMs: p.opens ? Math.round(p.timeMs / p.opens) : 0,
+      last_open: p.lastOpen ? new Date(p.lastOpen).toISOString() : null,
+    })).sort((a, b) => b.opens - a.opens);
+
+    const pageViews = pages.reduce((s, p) => s + p.opens, 0);
+    const activeTimeMs = accounts.reduce((s, a) => s + a.activeTimeMs, 0);
+    const top = pages[0] || null;
+    const kpis = {
+      pageViews,
+      activeAccounts: accounts.length,
+      activeTimeMs,
+      totalSessions,
+      avgSessionMs: totalSessions ? Math.round(activeTimeMs / totalSessions) : 0,
+      topPage: top ? { page: top.page, opens: top.opens } : null,
+    };
+
+    // Détail d'UN compte (optionnel) : ses pages consultées avec temps actif estimé, dans le périmètre demandé.
+    let userPages = null;
+    const reqUserId = String(req.query?.userId || '').trim();
+    if (/^[0-9a-f-]{36}$/i.test(reqUserId) && byUser.has(reqUserId)) {
+      const evs = byUser.get(reqUserId);
+      const upm = new Map();
+      for (let i = 0; i < evs.length; i++) {
+        const t = new Date(evs[i].created_at).getTime();
+        const nextT = i < evs.length - 1 ? new Date(evs[i + 1].created_at).getTime() : null;
+        const sessionEnd = (nextT === null) || ((nextT - t) > USAGE_SESSION_GAP_MS);
+        const dur = sessionEnd ? USAGE_LAST_PAGE_MS : Math.min(nextT - t, USAGE_PAGE_CAP_MS);
+        let up = upm.get(evs[i].page);
+        if (!up) { up = { page: evs[i].page, folder: folderOf.get(evs[i].page) || null, category: evs[i]._cat, opens: 0, timeMs: 0, lastOpen: 0 }; upm.set(evs[i].page, up); }
+        up.opens++; up.timeMs += dur; if (t > up.lastOpen) up.lastOpen = t;
+      }
+      userPages = Array.from(upm.values()).map((u) => ({
+        page: u.page, folder: u.folder, category: u.category, opens: u.opens, timeMs: u.timeMs,
+        last_open: u.lastOpen ? new Date(u.lastOpen).toISOString() : null,
+      })).sort((a, b) => b.opens - a.opens);
+    }
+
+    return res.json({ ok: true, scope, period, kpis, pages, accounts, userPages });
+  } catch (e) {
+    log.error('❌ /api/admin/usage:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur statistiques' });
+  }
+});
+
+
+// ✅ [ADMIN] Détail d'activité d'UN compte : pages lues + TOUTES les pages jamais ouvertes.
+// Lecture seule, à la demande (1 compte à la fois). Liste des pages = automatique (scan app/).
+app.get('/api/admin/user-activity', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.query?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+
+    // 3 lectures en parallèle : pages (regroupées) + frise semaines + frise mois
+    const [pageRes, weekRes, monthRes] = await Promise.all([
+      supabaseAdmin.rpc('admin_user_page_activity', { uid: userId }),
+      supabaseAdmin.rpc('admin_user_weekly_activity', { uid: userId }),
+      supabaseAdmin.rpc('admin_user_monthly_activity', { uid: userId }),
+    ]);
+    if (pageRes.error) throw pageRes.error;
+    if (weekRes.error) throw weekRes.error;
+    if (monthRes.error) throw monthRes.error;
+    const data = pageRes.data;
+
+    const allPages = getAppPages();                       // [{ page, folder }]
+    const folderOf = new Map(allPages.map((p) => [p.page, p.folder]));
+
+    // Pages lues (on rattache le dossier pour le regroupement à l'écran)
+    const activity = (data || []).map((r) => ({
+      page: r.page,
+      opens: Number(r.opens) || 0,
+      last_open: r.last_open || null,
+      folder: folderOf.has(r.page) ? folderOf.get(r.page) : null,
+    }));
+
+    // Pages jamais ouvertes = toutes les pages connues - celles qu'il a ouvertes
+    const openedSet = new Set(activity.map((r) => r.page));
+    const neverOpened = allPages.filter((p) => !openedSet.has(p.page));
+
+    // Frise des 12 dernières semaines (semaines à 0 incluses pour voir le décrochage)
+    const weekly = (weekRes.data || []).map((w) => ({
+      year: w.iso_year,
+      week: w.iso_week,
+      week_start: w.week_start,
+      opens: Number(w.opens) || 0,
+    }));
+
+    // Frise des 12 derniers mois (mois à 0 inclus)
+    const monthly = (monthRes.data || []).map((m) => ({
+      year: m.yr,
+      month: m.mon,
+      month_start: m.month_start,
+      opens: Number(m.opens) || 0,
+    }));
+
+    return res.json({ ok: true, activity, neverOpened, weekly, monthly, totalPages: allPages.length });
+  } catch (e) {
+    log.error('❌ /api/admin/user-activity:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur activité compte' });
+  }
+});
+
+
+// ✅ [ADMIN] Pages ouvertes par UN compte pendant UNE semaine ISO précise (clic sur une barre de la frise).
+app.get('/api/admin/user-activity-week', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.query?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+    const year = parseInt(req.query?.year, 10);
+    const week = parseInt(req.query?.week, 10);
+    if (!Number.isInteger(year) || year < 2020 || year > 2100) {
+      return res.status(400).json({ ok: false, error: 'année invalide' });
+    }
+    if (!Number.isInteger(week) || week < 1 || week > 53) {
+      return res.status(400).json({ ok: false, error: 'semaine invalide' });
+    }
+
+    const { data, error } = await supabaseAdmin.rpc('admin_user_page_activity_week', { uid: userId, y: year, w: week });
+    if (error) throw error;
+
+    const folderOf = new Map(getAppPages().map((p) => [p.page, p.folder]));
+    const activity = (data || []).map((r) => ({
+      page: r.page,
+      opens: Number(r.opens) || 0,
+      last_open: r.last_open || null,
+      folder: folderOf.has(r.page) ? folderOf.get(r.page) : null,
+    }));
+
+    return res.json({ ok: true, activity, year, week });
+  } catch (e) {
+    log.error('❌ /api/admin/user-activity-week:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur activité semaine' });
+  }
+});
+
+
+// ✅ [ADMIN] Pages ouvertes par UN compte pendant UN mois précis (clic sur une barre de la frise mois).
+app.get('/api/admin/user-activity-month', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.query?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+    const year = parseInt(req.query?.year, 10);
+    const month = parseInt(req.query?.month, 10);
+    if (!Number.isInteger(year) || year < 2020 || year > 2100) {
+      return res.status(400).json({ ok: false, error: 'année invalide' });
+    }
+    if (!Number.isInteger(month) || month < 1 || month > 12) {
+      return res.status(400).json({ ok: false, error: 'mois invalide' });
+    }
+
+    const { data, error } = await supabaseAdmin.rpc('admin_user_page_activity_month', { uid: userId, y: year, mo: month });
+    if (error) throw error;
+
+    const folderOf = new Map(getAppPages().map((p) => [p.page, p.folder]));
+    const activity = (data || []).map((r) => ({
+      page: r.page,
+      opens: Number(r.opens) || 0,
+      last_open: r.last_open || null,
+      folder: folderOf.has(r.page) ? folderOf.get(r.page) : null,
+    }));
+
+    return res.json({ ok: true, activity, year, month });
+  } catch (e) {
+    log.error('❌ /api/admin/user-activity-month:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur activité mois' });
+  }
+});
+
+
+// ✅ [ADMIN] Tendance globale de l'app : total des visites + comptes actifs, mois par mois (14 derniers mois).
+app.get('/api/admin/global-monthly', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin.rpc('admin_global_monthly');
+    if (error) throw error;
+    const months = (data || []).map((m) => ({
+      year: m.yr, month: m.mon, month_start: m.month_start,
+      opens: Number(m.opens) || 0, active_users: Number(m.active_users) || 0,
+    }));
+    return res.json({ ok: true, months });
+  } catch (e) {
+    log.error('❌ /api/admin/global-monthly:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur tendance mensuelle' });
+  }
+});
+
+
+// ✅ [ADMIN] Pages les plus ouvertes pendant UN mois précis (clic sur un mois de la tendance).
+app.get('/api/admin/global-month', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const year = parseInt(req.query?.year, 10);
+    const month = parseInt(req.query?.month, 10);
+    if (!Number.isInteger(year) || year < 2020 || year > 2100) {
+      return res.status(400).json({ ok: false, error: 'année invalide' });
+    }
+    if (!Number.isInteger(month) || month < 1 || month > 12) {
+      return res.status(400).json({ ok: false, error: 'mois invalide' });
+    }
+    const { data, error } = await supabaseAdmin.rpc('admin_global_month_pages', { y: year, mo: month });
+    if (error) throw error;
+    const folderOf = new Map(getAppPages().map((p) => [p.page, p.folder]));
+    const pages = (data || []).map((r) => ({
+      page: r.page, opens: Number(r.opens) || 0, users: Number(r.users) || 0,
+      folder: folderOf.has(r.page) ? folderOf.get(r.page) : null,
+    }));
+    return res.json({ ok: true, pages, year, month });
+  } catch (e) {
+    log.error('❌ /api/admin/global-month:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur pages du mois' });
+  }
+});
+
+
+// ✅ [ADMIN] Liste des comptes avec infos profil + abonnement
+app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const [usersList, profsRes, subsRes, compsRes, actRes] = await Promise.all([
+      supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 }),
+      supabaseAdmin.from('profiles').select('user_id, first_name, last_name, phone, company_id'),
+      supabaseAdmin.from('subscriptions').select('user_id, plan, status, tier, current_paid_tier, current_period_end, trial_end, cancel_at, started_at, stripe_subscription_id, access_locked, access_locked_reason'),
+      supabaseAdmin.from('companies').select('id, owner_id, display_name, legal_name'),
+      supabaseAdmin.from('v_admin_user_activity').select('user_id, last_seen'),
+    ]);
+    if (usersList.error) throw usersList.error;
+    if (profsRes.error) throw profsRes.error;
+    if (subsRes.error) throw subsRes.error;
+    if (compsRes.error) throw compsRes.error;
+    if (actRes.error) throw actRes.error;
+
+    const profMap = new Map((profsRes.data || []).map((p) => [p.user_id, p]));
+    const subMap  = new Map((subsRes.data  || []).map((s) => [s.user_id, s]));
+    // Entreprise : lien direct (company_id) OU propriétaire (owner_id) pour les vieux comptes
+    const compById    = new Map((compsRes.data || []).map((c) => [c.id, c]));
+    const compByOwner = new Map((compsRes.data || []).map((c) => [c.owner_id, c]));
+    // Dernière activité (depuis activity_log via la vue)
+    const actMap = new Map((actRes.data || []).map((a) => [a.user_id, a]));
+
+    const users = (usersList.data?.users || []).map((u) => {
+      const p = profMap.get(u.id) || {};
+      const s = subMap.get(u.id) || {};
+      const comp = compById.get(p.company_id) || compByOwner.get(u.id) || null;
+      const company = comp ? (comp.display_name || comp.legal_name || null) : null;
+      return {
+        user_id: u.id,
+        email: u.email || null,
+        company,
+        first_name: p.first_name || null,
+        last_name: p.last_name || null,
+        phone: p.phone || null,
+        plan: s.plan || null,
+        status: s.status || null,
+        tier: s.tier || null,
+        current_paid_tier: s.current_paid_tier || null,
+        current_period_end: s.current_period_end || null,
+        trial_end: s.trial_end || null,
+        cancel_at: s.cancel_at || null,
+        started_at: s.started_at || null,
+        has_stripe: !!s.stripe_subscription_id,
+        suspended: s.access_locked === true && String(s.access_locked_reason || '').toLowerCase() === 'admin_suspended',
+        payment_failed: s.access_locked === true && String(s.access_locked_reason || '').toLowerCase() === 'payment_failed',
+        last_seen: (actMap.get(u.id) || {}).last_seen || null,
+      };
+    }).sort((a, b) => String(a.email || '').localeCompare(String(b.email || '')));
+
+    return res.json({ ok: true, users });
+  } catch (e) {
+    log.error('❌ /api/admin/users:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur liste comptes' });
+  }
+});
+
+
+// ✅ [ADMIN] Modifie nom/prénom/téléphone d'un compte (table profiles)
+app.post('/api/admin/users/update-profile', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+
+    // Nettoyage défensif (backend = source de vérité, MÊMES limites que le profil self-service :
+    // prénom 50, nom 50, téléphone 5-15 chiffres)
+    const firstName = String(req.body?.firstName || '').trim().slice(0, 50) || null;
+    const lastName  = String(req.body?.lastName  || '').trim().slice(0, 50) || null;
+    const phone     = String(req.body?.phone || '').replace(/\D/g, '').slice(0, 15) || null;
+
+    const { data, error } = await supabaseAdmin
+      .from('profiles')
+      .update({ first_name: firstName, last_name: lastName, phone, updated_at: new Date().toISOString() })
+      .eq('user_id', userId)
+      .select('user_id, first_name, last_name, phone')
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ ok: false, error: error.message });
+    if (!data) return res.status(404).json({ ok: false, error: 'Profil introuvable' });
+
+    // 🔄 Synchronise le "Display name" des métadonnées Supabase Auth avec le profil.
+    //    Non bloquant : si ça échoue, le profil (source de vérité) est déjà à jour.
+    try {
+      const { data: cur } = await supabaseAdmin.auth.admin.getUserById(userId);
+      const meta = cur?.user?.user_metadata || {};
+      const display = ((firstName || '') + ' ' + (lastName || '')).trim();
+      await supabaseAdmin.auth.admin.updateUserById(userId, {
+        user_metadata: {
+          ...meta,
+          first_name: firstName,
+          last_name: lastName,
+          display_name: display || null,
+          name: display || null,
+          full_name: display || null,
+        },
+      });
+    } catch (metaErr) {
+      log.warn('⚠️ admin update-profile: sync métadonnées auth échouée:', metaErr?.message);
+    }
+
+    // 📝 Audit RGPD : qui a modifié quoi
+    log.info('🛠️ [ADMIN] profil modifié', { by: req.user?.email, target: userId });
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'update_profile', detail: 'Profil modifié (nom / prénom / téléphone)' });
+
+    return res.json({ ok: true, user: data });
+  } catch (e) {
+    log.error('💥 admin update-profile:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
+
+
+// ✅ [ADMIN] Change l'email d'un compte (auth.users + auth.identities via API admin)
+app.post('/api/admin/users/change-email', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+
+    const newEmail = String(req.body?.email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail) || newEmail.length > 254) {
+      return res.status(400).json({ ok: false, error: 'Email invalide' });
+    }
+
+    // Met à jour auth.users ET auth.identities ensemble (+ email confirmé)
+    const { error: updErr } = await supabaseAdmin.auth.admin.updateUserById(userId, {
+      email: newEmail,
+      email_confirm: true,
+    });
+    if (updErr) {
+      // ex : "email already registered"
+      return res.status(400).json({ ok: false, error: updErr.message });
+    }
+
+    // Best-effort : synchronise aussi l'email du client Stripe s'il existe (non bloquant)
+    try {
+      const { data: sub } = await supabaseAdmin
+        .from('subscriptions').select('stripe_customer_id').eq('user_id', userId).maybeSingle();
+      if (sub?.stripe_customer_id) {
+        await stripe.customers.update(sub.stripe_customer_id, { email: newEmail });
+      }
+    } catch (stripeErr) {
+      log.warn('⚠️ admin change-email: sync Stripe échouée:', stripeErr?.message);
+    }
+
+    log.info('🛠️ [ADMIN] email modifié', { by: req.user?.email, target: userId });
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'change_email', detail: "Email de connexion du compte modifié" });
+    return res.json({ ok: true, email: newEmail });
+  } catch (e) {
+    log.error('💥 admin change-email:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
+
+
+// ✅ [ADMIN] Envoie un lien de réinitialisation de mot de passe au compte
+app.post('/api/admin/users/send-password-reset', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+
+    // Email récupéré côté serveur (source sûre = auth.users), pas envoyé par le front
+    const { data: cur, error: getErr } = await supabaseAdmin.auth.admin.getUserById(userId);
+    if (getErr || !cur?.user?.email) {
+      return res.status(404).json({ ok: false, error: 'Compte introuvable' });
+    }
+    const email = cur.user.email;
+
+    const FRONT = process.env.FRONTEND_URL || (IS_PROD ? 'https://integora.fr' : 'http://localhost:3000');
+    const { error: resetErr } = await supabaseAdmin.auth.resetPasswordForEmail(email, {
+      redirectTo: `${FRONT}/reset-password.html`,
+    });
+    if (resetErr) return res.status(400).json({ ok: false, error: resetErr.message });
+
+    log.info('🛠️ [ADMIN] lien reset mdp envoyé', { by: req.user?.email, target: userId });
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'send_password_reset', detail: 'Lien de réinitialisation du mot de passe envoyé' });
+    return res.json({ ok: true, email });
+  } catch (e) {
+    log.error('💥 admin send-password-reset:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
+
+
+// ✅ [ADMIN] Offre/prolonge un abonnement (comptes SANS Stripe uniquement)
+app.post('/api/admin/users/grant-subscription', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+
+    // Date d'échéance exacte (AAAA-MM-JJ), validée côté serveur
+    const endDateRaw = String(req.body?.endDate || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(endDateRaw)) {
+      return res.status(400).json({ ok: false, error: 'Date invalide (format attendu AAAA-MM-JJ)' });
+    }
+    const now = new Date();
+    const newEnd = new Date(endDateRaw + 'T23:59:59');
+    if (isNaN(newEnd.getTime())) {
+      return res.status(400).json({ ok: false, error: 'Date invalide' });
+    }
+    if (newEnd <= now) {
+      return res.status(400).json({ ok: false, error: 'La date doit être dans le futur' });
+    }
+    const maxDate = new Date(now); maxDate.setFullYear(maxDate.getFullYear() + 5);
+    if (newEnd > maxDate) {
+      return res.status(400).json({ ok: false, error: 'Date trop lointaine (max 5 ans)' });
+    }
+
+    const { data: sub, error: subErr } = await supabaseAdmin
+      .from('subscriptions')
+      .select('plan, status, tier, current_paid_tier, current_period_end, stripe_subscription_id')
+      .eq('user_id', userId).maybeSingle();
+    if (subErr) return res.status(500).json({ ok: false, error: subErr.message });
+    if (!sub) return res.status(404).json({ ok: false, error: 'Abonnement introuvable' });
+
+    // 🔒 Refuse si géré par Stripe (Stripe écraserait la date au prochain événement)
+    if (sub.stripe_subscription_id) {
+      return res.status(400).json({ ok: false, error: "Abonnement Stripe actif — prolongation manuelle non supportée (à gérer côté Stripe)." });
+    }
+
+    // Type d'accès cible : 'trial' (accès limité) ou 'paid' (accès complet)
+    const targetPlan = req.body?.plan === 'trial' ? 'trial' : 'paid';
+
+    let update;
+    if (targetPlan === 'trial') {
+      // Essai : l'accès reste LIMITÉ, la date = fin de l'essai
+      update = {
+        plan: 'trial',
+        status: 'trialing',
+        trial_end: newEnd.toISOString(),
+        current_period_end: null,
+        cancel_at: null,
+        canceled_at: null,
+        updated_at: new Date().toISOString(),
+      };
+    } else {
+      // Payant : accès COMPLET, la date = échéance de l'abonnement
+      update = {
+        plan: 'paid',
+        status: 'active',
+        current_period_end: newEnd.toISOString(),
+        trial_end: null,
+        cancel_at: null,
+        canceled_at: null,
+        updated_at: new Date().toISOString(),
+      };
+      const tierToUse = sub.current_paid_tier || sub.tier || null;
+      if (tierToUse) update.current_paid_tier = tierToUse;
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('subscriptions').update(update).eq('user_id', userId)
+      .select('plan, status, current_period_end, trial_end, current_paid_tier').maybeSingle();
+    if (error) return res.status(400).json({ ok: false, error: error.message });
+
+    log.info('🛠️ [ADMIN] abo modifié', { by: req.user?.email, target: userId, plan: targetPlan, newEnd: newEnd.toISOString() });
+    logAdminAction({
+      targetUserId: userId, adminEmail: req.user?.email, action: 'grant_subscription',
+      detail: (targetPlan === 'paid' ? 'Payant' : 'Essai') + " jusqu'au " + newEnd.toISOString().slice(0, 10).split('-').reverse().join('/'),
+      motif: req.body?.motif,
+    });
+    return res.json({ ok: true, subscription: data });
+  } catch (e) {
+    log.error('💥 admin grant-subscription:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
+
+
+// ✅ [ADMIN] Clôture/résilie un abonnement (manuel = immédiat ; Stripe = à l'échéance)
+app.post('/api/admin/users/close-subscription', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+
+    const { data: sub, error: subErr } = await supabaseAdmin
+      .from('subscriptions')
+      .select('plan, status, current_period_end, trial_end, stripe_subscription_id')
+      .eq('user_id', userId).maybeSingle();
+    if (subErr) return res.status(500).json({ ok: false, error: subErr.message });
+    if (!sub) return res.status(404).json({ ok: false, error: 'Abonnement introuvable' });
+
+    const nowIso = new Date().toISOString();
+
+    if (sub.stripe_subscription_id) {
+      // Résiliation Stripe : à l'échéance (le client garde l'accès déjà payé, pas de renouvellement)
+      let cancelAt = sub.current_period_end || null;
+      try {
+        const updated = await stripe.subscriptions.update(sub.stripe_subscription_id, { cancel_at_period_end: true });
+        if (updated?.cancel_at) cancelAt = new Date(updated.cancel_at * 1000).toISOString();
+      } catch (stripeErr) {
+        return res.status(400).json({ ok: false, error: 'Échec résiliation Stripe : ' + (stripeErr?.message || '') });
+      }
+      await supabaseAdmin.from('subscriptions').update({ cancel_at: cancelAt, updated_at: nowIso }).eq('user_id', userId);
+      log.info('🛠️ [ADMIN] abo résilié (Stripe, à échéance)', { by: req.user?.email, target: userId });
+      logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'close_subscription', detail: "Résiliation Stripe à l'échéance (pas de renouvellement)", motif: req.body?.motif });
+      return res.json({ ok: true, mode: 'stripe_period_end', cancel_at: cancelAt });
+    }
+
+    // Manuel : on coupe l'accès IMMÉDIATEMENT (status canceled + échéances au présent)
+    const { data, error } = await supabaseAdmin
+      .from('subscriptions')
+      .update({ status: 'canceled', current_period_end: nowIso, trial_end: nowIso, canceled_at: nowIso, updated_at: nowIso })
+      .eq('user_id', userId)
+      .select('plan, status, current_period_end, trial_end').maybeSingle();
+    if (error) return res.status(400).json({ ok: false, error: error.message });
+
+    log.info('🛠️ [ADMIN] abo clôturé (manuel, immédiat)', { by: req.user?.email, target: userId });
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'close_subscription', detail: 'Accès coupé immédiatement (manuel)', motif: req.body?.motif });
+    return res.json({ ok: true, mode: 'immediate', subscription: data });
+  } catch (e) {
+    log.error('💥 admin close-subscription:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
+
+
+// ✅ [ADMIN] Réactive le renouvellement d'un abonnement Stripe (annule la résiliation programmée)
+app.post('/api/admin/users/reactivate-subscription', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+    const { data: sub, error: subErr } = await supabaseAdmin
+      .from('subscriptions').select('stripe_subscription_id').eq('user_id', userId).maybeSingle();
+    if (subErr) return res.status(500).json({ ok: false, error: subErr.message });
+    if (!sub) return res.status(404).json({ ok: false, error: 'Abonnement introuvable' });
+    if (!sub.stripe_subscription_id) {
+      return res.status(400).json({ ok: false, error: "Pas d'abonnement Stripe — utilise Offrir/Prolonger pour réactiver un accès manuel." });
+    }
+    try {
+      await stripe.subscriptions.update(sub.stripe_subscription_id, { cancel_at_period_end: false });
+    } catch (stripeErr) {
+      return res.status(400).json({ ok: false, error: 'Échec Stripe : ' + (stripeErr?.message || '') });
+    }
+    await supabaseAdmin.from('subscriptions')
+      .update({ cancel_at: null, status: 'active', updated_at: new Date().toISOString() })
+      .eq('user_id', userId);
+    log.info('🛠️ [ADMIN] renouvellement réactivé (Stripe)', { by: req.user?.email, target: userId });
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'reactivate_renewal', detail: 'Renouvellement automatique Stripe réactivé' });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error('💥 admin reactivate-subscription:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
+
+
+// ✅ [ADMIN] Suspendre un compte (blocage admin, n'affecte PAS la facturation)
+app.post('/api/admin/users/suspend', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+    // Anti-verrouillage : un admin ne peut pas se suspendre lui-même
+    if (userId === req.user?.id) {
+      return res.status(400).json({ ok: false, error: 'Vous ne pouvez pas suspendre votre propre compte.' });
+    }
+    const { error } = await supabaseAdmin
+      .from('subscriptions')
+      .update({ access_locked: true, access_locked_reason: 'admin_suspended', access_locked_at: new Date().toISOString() })
+      .eq('user_id', userId);
+    if (error) throw error;
+    log.info('🛠️ [ADMIN] compte suspendu', { by: req.user?.email, target: userId });
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'suspend', detail: "Accès suspendu (blocage admin)", motif: req.body?.motif });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error('💥 admin suspend:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur suspension' });
+  }
+});
+
+
+// ✅ [ADMIN] Réactiver un compte suspendu (ne lève QUE les suspensions admin, jamais un verrou facturation)
+app.post('/api/admin/users/reactivate', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+    const { error } = await supabaseAdmin
+      .from('subscriptions')
+      .update({ access_locked: false, access_locked_reason: null, access_locked_at: null })
+      .eq('user_id', userId)
+      .eq('access_locked_reason', 'admin_suspended'); // sécurité : ne touche pas un verrou facturation
+    if (error) throw error;
+    log.info('🛠️ [ADMIN] compte réactivé', { by: req.user?.email, target: userId });
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'reactivate', detail: 'Accès réactivé (fin de suspension)' });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error('💥 admin reactivate:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur réactivation' });
+  }
+});
+
+
+// ✅ [ADMIN] Historique des actions admin sur UN compte (les 50 dernières)
+app.get('/api/admin/user-audit', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.query?.userId || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+    const { data, error } = await supabaseAdmin
+      .from('admin_audit_log')
+      .select('action, detail, motif, admin_email, created_at')
+      .eq('target_user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) throw error;
+    return res.json({ ok: true, history: data || [] });
+  } catch (e) {
+    log.error('❌ /api/admin/user-audit:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur historique' });
+  }
+});
+
+
+// ===== [ADMIN] Maintenance plateforme (Phase 1 : panneau de contrôle, sans blocage réel) =====
+// Stocke les opérations de maintenance (globale / partielle / bandeau). Le BLOCAGE effectif
+// sera branché en Phase 2 (auth-guard.js + /api/maintenance/status). Ici : lister / créer / terminer.
+
+// Liste (100 dernières, récentes d'abord) — sert à l'état actuel + l'historique de la page admin.
+app.get('/api/admin/maintenance', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('maintenance')
+      .select('id, type, scope_kind, scope_value, message, starts_at, ends_at, allow_admins, visibility, active, created_by, created_at')
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    return res.json({ ok: true, items: data || [] });
+  } catch (e) {
+    log.error('❌ /api/admin/maintenance (list):', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur maintenance' });
+  }
+});
+
+// Crée une opération de maintenance
+app.post('/api/admin/maintenance', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const type = String(req.body?.type || '').trim();
+    if (!['global', 'partial', 'banner'].includes(type)) {
+      return res.status(400).json({ ok: false, error: 'Type invalide' });
+    }
+    const message = String(req.body?.message || '').trim().slice(0, 500);
+    if (!message) return res.status(400).json({ ok: false, error: 'Message requis' });
+
+    let scopeKind = null, scopeValue = null;
+    if (type === 'partial') {
+      scopeKind = req.body?.scopeKind === 'page' ? 'page' : 'category';
+      scopeValue = String(req.body?.scopeValue || '').trim().slice(0, 120);
+      if (!scopeValue) return res.status(400).json({ ok: false, error: 'Périmètre requis pour une maintenance partielle' });
+    }
+
+    const parseDate = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); };
+    const startsAt = parseDate(req.body?.startsAt);
+    const endsAt = parseDate(req.body?.endsAt);
+    const allowAdmins = req.body?.allowAdmins !== false; // défaut : true
+
+    const row = {
+      type, scope_kind: scopeKind, scope_value: scopeValue, message,
+      starts_at: startsAt, ends_at: endsAt, allow_admins: allowAdmins,
+      visibility: 'all', active: true, created_by: req.user?.email || null,
+    };
+    const { data, error } = await supabaseAdmin.from('maintenance').insert(row).select().maybeSingle();
+    if (error) return res.status(400).json({ ok: false, error: error.message });
+
+    const label = type === 'global' ? 'Maintenance globale'
+      : (type === 'banner' ? "Bandeau d'information"
+        : ('Maintenance partielle — ' + (scopeValue || '')));
+    logAdminAction({ targetUserId: null, adminEmail: req.user?.email, action: 'maintenance_create', detail: label });
+    return res.json({ ok: true, item: data });
+  } catch (e) {
+    log.error('❌ /api/admin/maintenance (create):', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
+
+// Termine (désactive) une opération de maintenance
+app.post('/api/admin/maintenance/end', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const id = parseInt(String(req.body?.id || ''), 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'id invalide' });
+    const { error } = await supabaseAdmin.from('maintenance').update({ active: false }).eq('id', id);
+    if (error) throw error;
+    logAdminAction({ targetUserId: null, adminEmail: req.user?.email, action: 'maintenance_end', detail: 'Maintenance #' + id + ' terminée' });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error('❌ /api/admin/maintenance (end):', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
+
+// ✅ [PHASE 2] État de maintenance vu par le FRONT (auth-guard) — tout utilisateur connecté.
+// Renvoie : maintenance globale active, pages bloquées (partielles dépliées), bandeau, + isAdmin.
+// FAIL-OPEN : toute erreur → "aucune maintenance" pour ne JAMAIS bloquer par accident.
+app.get('/api/maintenance/status', authenticateToken, async (req, res) => {
+  try {
+    const email = String(req.user?.email || '').trim().toLowerCase();
+    const isAdmin = !!email && ADMIN_EMAILS.has(email);
+
+    const { data, error } = await supabaseAdmin
+      .from('maintenance')
+      .select('id, type, scope_kind, scope_value, message, starts_at, ends_at, allow_admins, active')
+      .eq('active', true);
+    if (error) throw error;
+
+    const now = Date.now();
+    const live = (data || []).filter((m) => {
+      if (m.starts_at && new Date(m.starts_at).getTime() > now) return false;   // planifiée → pas encore
+      if (m.ends_at && new Date(m.ends_at).getTime() <= now) return false;       // fin dépassée
+      return true;
+    });
+
+    let global = null, banner = null;
+    const pages = {};
+    const ADMIN_PAGES = ['admin', 'admin-users', 'admin-subscriptions', 'admin-stats', 'admin-maintenance'];
+    const appPages = getAppPages();
+    const prettifyPage = (p) => { const t = String(p || '').replace(/_/g, ' '); return t.charAt(0).toUpperCase() + t.slice(1); };
+
+    for (const m of live) {
+      if (m.type === 'global') {
+        if (!global) global = { message: m.message, allowAdmins: m.allow_admins !== false, endsAt: m.ends_at || null };
+      } else if (m.type === 'banner') {
+        if (!banner) banner = { id: m.id, message: m.message };
+      } else if (m.type === 'partial' && m.scope_value) {
+        if (m.scope_kind === 'page') {
+          pages[m.scope_value] = { message: m.message, allowAdmins: m.allow_admins !== false, scopeKind: 'page', scopeLabel: prettifyPage(m.scope_value), endsAt: m.ends_at || null };
+        } else { // catégorie : on déplie en noms de pages
+          const info = { message: m.message, allowAdmins: m.allow_admins !== false, scopeKind: 'category', scopeLabel: m.scope_value, endsAt: m.ends_at || null };
+          if (m.scope_value === 'Administration interne') ADMIN_PAGES.forEach((p) => { pages[p] = info; });
+          appPages.forEach((p) => { if (usageCategory(p.page, p.folder) === m.scope_value) pages[p.page] = info; });
+        }
+      }
+    }
+
+    return res.json({ ok: true, isAdmin, global, banner, pages });
+  } catch (e) {
+    log.error('❌ /api/maintenance/status:', e?.message);
+    return res.json({ ok: true, isAdmin: false, global: null, banner: null, pages: {} }); // fail-open
+  }
+});
+
+
+// ===== [ADMIN] 2FA (TOTP) — PHASE A : enrôlement uniquement (n'affecte PAS encore le login) =====
+const { authenticator } = require('otplib');
+const QRCode = require('qrcode');
+authenticator.options = { window: 4 }; // tolère ±2 min de décalage d'horloge PC/téléphone (sûr : code 6 chiffres + rate-limit login)
+
+function genRecoveryCode() {
+  const hex = require('crypto').randomBytes(4).toString('hex').toUpperCase();
+  return hex.slice(0, 4) + '-' + hex.slice(4, 8);
+}
+
+// État 2FA du compte admin courant
+app.get('/api/admin/mfa/status', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data } = await supabaseAdmin.from('user_mfa').select('enabled').eq('user_id', req.user.id).maybeSingle();
+    return res.json({ ok: true, enabled: !!(data && data.enabled) });
+  } catch (e) {
+    log.error('❌ mfa/status:', e?.message);
+    return res.json({ ok: true, enabled: false });
+  }
+});
+
+// Démarre l'enrôlement : génère un secret (NON activé) + le QR à scanner
+app.post('/api/admin/mfa/enroll', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const secret = authenticator.generateSecret();
+    const uri = authenticator.keyuri(req.user.email || 'admin', 'INTEGORA Admin', secret);
+    const qr = await QRCode.toDataURL(uri);
+    const { error } = await supabaseAdmin.from('user_mfa').upsert(
+      { user_id: req.user.id, secret: secret, enabled: false, recovery_codes: [], updated_at: new Date().toISOString() },
+      { onConflict: 'user_id' }
+    );
+    if (error) return res.status(400).json({ ok: false, error: error.message });
+    return res.json({ ok: true, secret: secret, qr: qr });
+  } catch (e) {
+    log.error('❌ mfa/enroll:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
+
+// Confirme l'enrôlement : vérifie le 1er code → active la 2FA + renvoie les codes de secours (affichés UNE fois)
+app.post('/api/admin/mfa/confirm', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const code = String(req.body?.code || '').replace(/\D/g, '');
+    const { data } = await supabaseAdmin.from('user_mfa').select('secret').eq('user_id', req.user.id).maybeSingle();
+    if (!data || !data.secret) return res.status(400).json({ ok: false, error: "Aucun enrôlement en cours. Relance l'activation." });
+    if (!authenticator.verify({ token: code, secret: data.secret })) {
+      if (!IS_PROD) {
+        const prev = authenticator.options;
+        authenticator.options = Object.assign({}, prev, { window: 20 }); // cherche le code sur ±10 min
+        const delta = authenticator.checkDelta(code, data.secret);
+        authenticator.options = prev;
+        log.warn('🔎 [DEV] MFA échec — reçu:', code, '· attendu:', authenticator.generate(data.secret), '· delta(±10min):', delta,
+          delta === null
+            ? '→ SECRET DIFFÉRENT : vieille entrée Google Auth, supprime-la et rescanne le QR actuel'
+            : ('→ décalage horloge ≈ ' + (delta * 30) + 's (augmenter window ou synchroniser)'));
+      }
+      return res.status(400).json({ ok: false, error: "Code incorrect. Vérifie l'heure de ton téléphone et réessaie." });
+    }
+    const bcrypt = require('bcryptjs');
+    const codes = [], hashes = [];
+    for (let i = 0; i < 8; i++) { const c = genRecoveryCode(); codes.push(c); hashes.push(bcrypt.hashSync(c, 10)); }
+    const { error } = await supabaseAdmin.from('user_mfa').update({ enabled: true, recovery_codes: hashes, updated_at: new Date().toISOString() }).eq('user_id', req.user.id);
+    if (error) return res.status(400).json({ ok: false, error: error.message });
+    logAdminAction({ targetUserId: req.user.id, adminEmail: req.user.email, action: 'mfa_enabled', detail: '2FA (TOTP) activée' });
+    return res.json({ ok: true, recoveryCodes: codes });
+  } catch (e) {
+    log.error('❌ mfa/confirm:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
+
+// Désactive la 2FA (nécessite un code valide)
+app.post('/api/admin/mfa/disable', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const code = String(req.body?.code || '').replace(/\D/g, '');
+    const { data } = await supabaseAdmin.from('user_mfa').select('secret, enabled').eq('user_id', req.user.id).maybeSingle();
+    if (!data || !data.enabled) return res.json({ ok: true });
+    if (!authenticator.verify({ token: code, secret: data.secret })) {
+      return res.status(400).json({ ok: false, error: 'Code incorrect.' });
+    }
+    const { error } = await supabaseAdmin.from('user_mfa').update({ enabled: false, recovery_codes: [], updated_at: new Date().toISOString() }).eq('user_id', req.user.id);
+    if (error) return res.status(400).json({ ok: false, error: error.message });
+    logAdminAction({ targetUserId: req.user.id, adminEmail: req.user.email, action: 'mfa_disabled', detail: '2FA (TOTP) désactivée' });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error('❌ mfa/disable:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+  }
+});
 
 
 app.post("/api/company/update-billing", authenticateToken, async (req, res) => {

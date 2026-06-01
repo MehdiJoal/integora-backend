@@ -4865,6 +4865,171 @@ app.get('/api/admin/user-audit', authenticateToken, requireAdmin, async (req, re
 });
 
 
+// ===== [ADMIN] Export RGPD des données d'un compte (lecture seule, à la demande) =====
+// Génère un document HTML lisible (ouvrable dans un navigateur, imprimable en PDF) listant
+// EN FRANÇAIS CLAIR toutes les données personnelles détenues sur la personne.
+// Ne renvoie JAMAIS de secret : mot de passe, jeton de session, secret 2FA, codes de récup.
+const RGPD_PAGE_LABELS = {
+  admin: 'Espace administration', 'admin-users': 'Gestion des comptes utilisateurs',
+  'admin-subscriptions': 'Gestion des accès clients', 'admin-stats': "Statistiques d'utilisation",
+  'admin-maintenance': 'Maintenance', 'admin-security': 'Sécurité du compte',
+  profile: 'Profil utilisateur', support: 'Support', choix_irl_digital: 'Choix du format',
+  tableau_de_pilotage: 'Tableau de pilotage', jeu_irl: 'Jeux en présentiel',
+  le_relai_des_mimes: 'Le Relais des Mimes', carte_rh_express: 'Cartes RH Express',
+  invento: 'Invento', instant_zen: 'Instant Zen', qui_est_qui: 'Qui est qui ?',
+  un_mot_pour_avancer: 'Un mot pour avancer', fiche_de_poste: 'Fiche de poste',
+  entretiens_rh: 'Entretiens RH', thermometre_des_situations: 'Thermomètre des situations',
+};
+function rgpdPrettify(s) {
+  if (!s) return '';
+  const t = String(s).replace(/_/g, ' ').replace(/\//g, ' › ');
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+function rgpdPageLabel(p) { return RGPD_PAGE_LABELS[p] || rgpdPrettify(p); }
+function rgpdEsc(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function rgpdDateFR(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '—';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} à ${p(d.getHours())}h${p(d.getMinutes())}`;
+}
+
+app.get('/api/admin/users/:id/export', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.params?.id || '').trim();
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'userId invalide' });
+    }
+
+    // 1) Identité + données liées (tout en lecture seule)
+    const authU = await supabaseAdmin.auth.admin.getUserById(userId);
+    const email = authU?.data?.user?.email || null;
+    const accountCreated = authU?.data?.user?.created_at || null;
+
+    const [profRes, subRes, mfaRes, actRes, sessRes, supRes] = await Promise.all([
+      supabaseAdmin.from('profiles').select('first_name, last_name, phone, company_id, avatar_url, terms_accepted_at, terms_version').eq('user_id', userId).maybeSingle(),
+      supabaseAdmin.from('subscriptions').select('plan, status, tier, current_paid_tier, current_period_end, trial_end, cancel_at, started_at, stripe_subscription_id').eq('user_id', userId).maybeSingle(),
+      supabaseAdmin.from('user_mfa').select('enabled').eq('user_id', userId).maybeSingle(),
+      supabaseAdmin.from('activity_log').select('page, created_at').eq('user_id', userId).order('created_at', { ascending: false }).limit(5000),
+      supabaseAdmin.from('token_sessions').select('expires_at, is_active').eq('user_id', userId).order('expires_at', { ascending: false }).limit(200),
+      supabaseAdmin.from('support_tickets').select('subject, message, type, status, created_at').eq('user_id', userId).order('created_at', { ascending: false }).limit(200),
+    ]);
+
+    const prof = profRes?.data || {};
+    let company = null;
+    if (prof.company_id) {
+      const c = await supabaseAdmin.from('companies').select('display_name, legal_name').eq('id', prof.company_id).maybeSingle();
+      company = c?.data ? (c.data.display_name || c.data.legal_name || null) : null;
+    }
+    let contactTickets = [];
+    if (email) {  // contact_tickets relié par EMAIL (pas de user_id sur cette table)
+      const ct = await supabaseAdmin.from('contact_tickets').select('subject, message, status, created_at').eq('email', email).order('created_at', { ascending: false }).limit(200);
+      contactTickets = ct?.data || [];
+    }
+
+    const sub = subRes?.data || {};
+    const mfaOn = !!(mfaRes?.data?.enabled);
+    const activity = actRes?.data || [];
+    const sessions = sessRes?.data || [];
+    const supportTickets = supRes?.data || [];
+
+    // 2) Activité regroupée par page (bien plus lisible que des milliers de lignes)
+    const byPage = new Map();
+    for (const a of activity) {
+      let e = byPage.get(a.page);
+      if (!e) { e = { page: a.page, count: 0, last: a.created_at }; byPage.set(a.page, e); }
+      e.count++;
+      if (new Date(a.created_at) > new Date(e.last)) e.last = a.created_at;
+    }
+    const pageRows = Array.from(byPage.values()).sort((x, y) => y.count - x.count);
+
+    // 3) Construction du document HTML lisible
+    const fullName = [prof.first_name, prof.last_name].filter(Boolean).join(' ') || '—';
+    const row = (l, v) => `<tr><th>${rgpdEsc(l)}</th><td>${rgpdEsc(v ?? '—')}</td></tr>`;
+    const ticketBlock = (t) => `
+      <div class="ticket">
+        <div class="ticket-h"><strong>${rgpdEsc(t.subject || 'Demande')}</strong>
+          <span class="muted"> — ${rgpdDateFR(t.created_at)}${t.status ? ' · ' + rgpdEsc(t.status) : ''}</span></div>
+        <div class="ticket-m">${rgpdEsc(t.message || '').replace(/\n/g, '<br>')}</div>
+      </div>`;
+
+    const html = `<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Export de mes données — INTEGORA</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#1f2937;max-width:820px;margin:0 auto;padding:32px 20px;line-height:1.5}
+  h1{font-size:1.5rem;margin:0 0 4px} h2{font-size:1.1rem;margin:28px 0 10px;color:#2563eb;border-bottom:1px solid #e5e7eb;padding-bottom:6px}
+  .intro{color:#4b5563;font-size:.95rem} .muted{color:#6b7280}
+  table{border-collapse:collapse;width:100%;margin:6px 0} th,td{text-align:left;padding:7px 10px;border-bottom:1px solid #eef1f4;vertical-align:top;font-size:.93rem}
+  th{width:42%;color:#374151;font-weight:600}
+  .ticket{border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;margin:8px 0} .ticket-m{margin-top:6px;white-space:normal;color:#374151;font-size:.92rem}
+  .foot{margin-top:36px;font-size:.78rem;color:#9ca3af;border-top:1px solid #e5e7eb;padding-top:12px}
+  .empty{color:#9ca3af;font-style:italic;font-size:.9rem}
+</style></head><body>
+  <h1>Export de mes données personnelles</h1>
+  <p class="intro">Document généré par INTEGORA le ${rgpdDateFR(new Date().toISOString())}. Il rassemble l'ensemble des informations que nous détenons sur ce compte, conformément au RGPD (droit d'accès). Vous pouvez l'enregistrer en PDF via « Imprimer ».</p>
+
+  <h2>Vos informations personnelles</h2>
+  <table>
+    ${row('Nom complet', fullName)}${row('Adresse e-mail', email)}${row('Téléphone', prof.phone)}
+    ${row('Compte créé le', rgpdDateFR(accountCreated))}
+    ${row('Conditions acceptées le', prof.terms_accepted_at ? rgpdDateFR(prof.terms_accepted_at) : '—')}
+    ${row('Version des conditions', prof.terms_version)}
+    ${row('Photo de profil', prof.avatar_url ? 'Oui (enregistrée)' : 'Aucune')}
+  </table>
+
+  <h2>Votre entreprise</h2>
+  <table>${row('Entreprise', company)}</table>
+
+  <h2>Votre abonnement</h2>
+  <table>
+    ${row('Formule', sub.plan)}${row('Statut', sub.status)}${row('Palier', sub.current_paid_tier || sub.tier)}
+    ${row('Début', sub.started_at ? rgpdDateFR(sub.started_at) : '—')}
+    ${row('Fin de période en cours', sub.current_period_end ? rgpdDateFR(sub.current_period_end) : '—')}
+    ${row("Fin d'essai", sub.trial_end ? rgpdDateFR(sub.trial_end) : '—')}
+    ${row('Facturation', sub.stripe_subscription_id ? 'Gérée par Stripe (vos données de paiement sont conservées par Stripe, pas par INTEGORA)' : 'Aucune facturation Stripe')}
+  </table>
+
+  <h2>Sécurité de votre compte</h2>
+  <table>
+    ${mfaOn ? row('Double authentification', 'Activée') : ''}
+    ${row('Nombre de sessions enregistrées', String(sessions.length))}
+  </table>
+
+  <h2>Votre activité sur la plateforme</h2>
+  ${pageRows.length ? `<table><tr><th>Page consultée</th><td>Consultations / dernière visite</td></tr>
+    ${pageRows.map(p => `<tr><th>${rgpdEsc(rgpdPageLabel(p.page))}</th><td>${p.count} fois · dernière le ${rgpdDateFR(p.last)}</td></tr>`).join('')}
+  </table><p class="muted" style="font-size:.82rem">Total : ${activity.length} consultations enregistrées.</p>`
+   : '<p class="empty">Aucune activité enregistrée.</p>'}
+
+  <h2>Vos demandes au support</h2>
+  ${(supportTickets.length || contactTickets.length)
+    ? supportTickets.map(t => ticketBlock(t)).join('') + contactTickets.map(t => ticketBlock(t)).join('')
+    : '<p class="empty">Aucune demande enregistrée.</p>'}
+
+  <div class="foot">
+    Références techniques (usage interne) — Identifiant du compte : ${rgpdEsc(userId)}.<br>
+    Les données de paiement (carte, factures) sont conservées par notre prestataire Stripe conformément à ses obligations légales.
+  </div>
+</body></html>`;
+
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'export_rgpd', detail: 'Export RGPD des données généré' });
+
+    const safe = String(email || userId).replace(/[^a-z0-9._-]/gi, '_').slice(0, 60);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="export-donnees-${safe}.html"`);
+    return res.send(html);
+  } catch (e) {
+    log.error('❌ /api/admin/users/:id/export:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur export' });
+  }
+});
+
+
 // ===== [ADMIN] Maintenance plateforme (Phase 1 : panneau de contrôle, sans blocage réel) =====
 // Stocke les opérations de maintenance (globale / partielle / bandeau). Le BLOCAGE effectif
 // sera branché en Phase 2 (auth-guard.js + /api/maintenance/status). Ici : lister / créer / terminer.
@@ -7635,6 +7800,50 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
     const now = new Date();
     const today = now.toISOString().slice(0, 10); // YYYY-MM-DD
 
+    // ✅ MÉNAGE QUOTIDIEN — exécuté EN PREMIER, avant les éventuels return anticipés ci-dessous,
+    //    pour qu'il tourne CHAQUE nuit, qu'il y ait des rappels à envoyer ou non.
+    //    (a) Purge RGPD : activity_log > 13 mois · token_sessions expirées > 30 j · pending_signups > 30 j
+    //    (b) Auto-close des contact_tickets ouverts > 30 j (support_tickets reste manuel).
+    const purged = {};
+    try {
+      const ms = Date.now();
+      const cutActivity = new Date(ms - 395 * 86400000).toISOString(); // 13 mois (norme CNIL mesure d'audience)
+      const cut30 = new Date(ms - 30 * 86400000).toISOString();
+
+      const pa = await supabaseAdmin.from('activity_log').delete({ count: 'exact' }).lt('created_at', cutActivity);
+      if (!pa.error) purged.activity_log = pa.count || 0; else log.warn('⚠️ Purge activity_log:', safeError(pa.error));
+
+      const ps = await supabaseAdmin.from('token_sessions').delete({ count: 'exact' }).lt('expires_at', cut30);
+      if (!ps.error) purged.token_sessions = ps.count || 0; else log.warn('⚠️ Purge token_sessions:', safeError(ps.error));
+
+      const pp = await supabaseAdmin.from('pending_signups').delete({ count: 'exact' }).lt('created_at', cut30);
+      if (!pp.error) purged.pending_signups = pp.count || 0; else log.warn('⚠️ Purge pending_signups:', safeError(pp.error));
+
+      if (Object.values(purged).some((n) => n > 0)) log.info('🧹 Purge RGPD:', purged);
+    } catch (e) {
+      log.warn('⚠️ Purge RGPD exception:', safeError(e));
+    }
+
+    let autoClosed = 0;
+    try {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - 30);
+      const { data: closedRows, error: autoCloseErr } = await supabaseAdmin
+        .from("contact_tickets")
+        .update({ status: "closed" })
+        .eq("status", "open")
+        .lt("created_at", cutoff.toISOString())
+        .select("id");
+      if (autoCloseErr) {
+        log.warn("⚠️ Auto-close contact_tickets failed:", safeError(autoCloseErr));
+      } else {
+        autoClosed = (closedRows || []).length;
+        if (autoClosed > 0) log.info(`🧹 Auto-close: ${autoClosed} contact_ticket(s) > 30j cloture(s)`);
+      }
+    } catch (e) {
+      log.warn("⚠️ Auto-close contact_tickets exception:", safeError(e));
+    }
+
     // ✅ 1. Récupérer tous les abonnements actifs (1 requête)
     const { data: subs, error: subsErr } = await supabaseAdmin
       .from("subscriptions")
@@ -7642,7 +7851,7 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
       .in("status", ["active", "trialing"]);
 
     if (subsErr) throw subsErr;
-    if (!subs?.length) return res.json({ ok: true, sent: 0, detail: "Aucun abonnement actif" });
+    if (!subs?.length) return res.json({ ok: true, sent: 0, autoClosed, purged, detail: "Aucun abonnement actif" });
 
     // ✅ Définir les rappels à vérifier par plan
     const paidReminders = [
@@ -7689,7 +7898,7 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
       }
     }
 
-    if (!candidates.length) return res.json({ ok: true, sent: 0, detail: "Aucun rappel à envoyer" });
+    if (!candidates.length) return res.json({ ok: true, sent: 0, autoClosed, purged, detail: "Aucun rappel à envoyer" });
 
     // ✅ 3. Charger en bulk les rappels déjà envoyés (1 requête au lieu de N)
     const userIds = [...new Set(candidates.map(c => c.sub.user_id))];
@@ -7748,34 +7957,7 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
       }
     }
 
-    // ✅ AUTO-CLOSE des tickets contact_tickets ouverts depuis > 30 jours
-    //    Mehdi n'a pas a aller dans Supabase fermer les vieux tickets.
-    //    Si une demande contact (general/demo/commercial/quote_50_plus/etc.) n'a
-    //    pas ete traitee en 30j, le systeme la cloture automatiquement.
-    //    support_tickets reste manuel (peut prendre + de temps a resoudre).
-    let autoClosed = 0;
-    try {
-      const cutoff = new Date();
-      cutoff.setDate(cutoff.getDate() - 30);
-      const { data: closedRows, error: autoCloseErr } = await supabaseAdmin
-        .from("contact_tickets")
-        .update({ status: "closed" })
-        .eq("status", "open")
-        .lt("created_at", cutoff.toISOString())
-        .select("id");
-      if (autoCloseErr) {
-        log.warn("⚠️ Auto-close contact_tickets failed:", safeError(autoCloseErr));
-      } else {
-        autoClosed = (closedRows || []).length;
-        if (autoClosed > 0) {
-          log.info(`🧹 Auto-close: ${autoClosed} contact_ticket(s) > 30j cloture(s)`);
-        }
-      }
-    } catch (e) {
-      log.warn("⚠️ Auto-close contact_tickets exception:", safeError(e));
-    }
-
-    return res.json({ ok: true, sent, autoClosed, errors: errors.length ? errors : undefined });
+    return res.json({ ok: true, sent, autoClosed, purged, errors: errors.length ? errors : undefined });
   } catch (err) {
     log.error("❌ Cron expiration-reminders:", safeError(err));
     return res.status(500).json({ error: "Erreur interne cron" });

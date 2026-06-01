@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "pages": "node gen-app-pages.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.76.1",

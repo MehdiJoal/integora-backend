@@ -641,7 +641,10 @@ function getAppPages() {
   if (_appPagesCache) return _appPagesCache;
   const pages = [];
   const walk = (dir, folder) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (e) { return; } // dossier absent (ex: backend API-only sur Render, frontend sur Vercel) → on ignore
+    for (const entry of entries) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         // on ignore les dossiers techniques (pas des pages)
@@ -655,6 +658,14 @@ function getAppPages() {
     }
   };
   walk(APP_DIR, "");
+  // Fallback : si le scan disque est vide (backend API-only sur Render, frontend sur Vercel),
+  // on lit la liste figée livrée avec le backend (app-pages.json, généré depuis le frontend).
+  if (pages.length === 0) {
+    try {
+      const bundled = JSON.parse(fs.readFileSync(path.join(__dirname, "app-pages.json"), "utf8"));
+      if (Array.isArray(bundled) && bundled.length) { _appPagesCache = bundled; return bundled; }
+    } catch (e) { /* pas de fallback disponible */ }
+  }
   _appPagesCache = pages;
   return pages;
 }

@@ -629,7 +629,7 @@ if (IS_PROD) {
 
 
 // ==================== STATIC PUBLIC / STATIC APP (PROPRE) ====================
-const APP_VERSION = "1.0.0"; // ← incrémenter à chaque déploiement
+const APP_VERSION = "1.1.0"; // ← incrémenter à chaque déploiement
 const FRONTEND_DIR = path.join(__dirname, "../frontend");
 const APP_DIR = path.join(FRONTEND_DIR, "app");
 

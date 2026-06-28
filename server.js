@@ -590,7 +590,16 @@ const globalLimiter = rateLimit({
 
 // 🔥 PROTECTION CONTRE LES ATTACKS CONNUES
 app.use(cookieParser());
-app.use(express.json({ limit: '10kb' })); // Limite taille JSON
+// Limite taille JSON : 10 ko par défaut (sécurité). Exception : les routes de
+// synchronisation "document" (collaborateurs / journal) envoient la LISTE COMPLÈTE,
+// donc 512 ko. La taille de CHAQUE document reste bornée DANS ces routes (défense en profondeur).
+const PILOTAGE_LARGE_JSON_PATHS = new Set([
+  '/api/pilotage/collaborators/sync',
+  '/api/pilotage/journal/sync',
+]);
+const _jsonSmall = express.json({ limit: '10kb' });
+const _jsonLarge = express.json({ limit: '512kb' });
+app.use((req, res, next) => (PILOTAGE_LARGE_JSON_PATHS.has(req.path) ? _jsonLarge : _jsonSmall)(req, res, next));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
 
@@ -2043,10 +2052,10 @@ async function resolveUserFromCookie(req) {
     .catch(() => { });
 
   // 3) Profil + abo (parallèle)
-  const [profileResult, subscriptionResult] = await Promise.all([
+  const [profileResult, ownSubscription] = await Promise.all([
     supabaseAdmin
       .from("profiles")
-      .select("user_id, first_name, last_name, company_id, avatar_url, terms_accepted_at, terms_version")
+      .select("user_id, first_name, last_name, company_id, avatar_url, terms_accepted_at, terms_version, role, archived_at, companies:company_id ( display_name, legal_name )")
       .eq("user_id", decoded.id)
       .maybeSingle(),
     getActiveSubscription(decoded.id),
@@ -2061,6 +2070,30 @@ async function resolveUserFromCookie(req) {
     throw new Error("PROFILE_NOT_FOUND");
   }
 
+  // ✅ Accès retiré (membre archivé par l'admin) -> on refuse l'accès.
+  //    handleAuthenticationError nettoie le cookie et redirige : déconnexion propre.
+  if (profileResult.data.archived_at) {
+    log.warn("🚫 ACCOUNT_ARCHIVED (accès retiré)", { user_id: decoded.id });
+    throw new Error("ACCOUNT_ARCHIVED");
+  }
+
+  // ✅ Rôle dans l'entreprise (admin = payeur/propriétaire, membre = invité)
+  const role = String(profileResult.data.role || 'admin').toLowerCase();
+
+  // ✅ ACCÈS HÉRITÉ : un membre n'a pas d'abonnement propre.
+  // Son accès dépend de l'abonnement de l'ADMIN de son entreprise (companies.owner_id).
+  let subscriptionResult = ownSubscription;
+  if (role === 'membre' && profileResult.data.company_id) {
+    const { data: company } = await supabaseAdmin
+      .from("companies")
+      .select("owner_id")
+      .eq("id", profileResult.data.company_id)
+      .maybeSingle();
+    if (company?.owner_id) {
+      subscriptionResult = await getActiveSubscription(company.owner_id);
+    }
+  }
+
   // ✅ Date d'expiration unifiée (trial_end pour trial, current_period_end ou dérivée pour payant)
   const subscriptionEndDate = subscriptionResult.plan === 'trial'
     ? (subscriptionResult.trial_end || null)
@@ -2072,6 +2105,8 @@ async function resolveUserFromCookie(req) {
     first_name: profileResult.data.first_name,
     last_name: profileResult.data.last_name,
     company_id: profileResult.data.company_id,
+    company_name: profileResult.data.companies?.display_name || profileResult.data.companies?.legal_name || null,
+    role,
     avatar_url: profileResult.data.avatar_url,
     subscription_type: subscriptionResult.plan,
     has_active_subscription: subscriptionResult.hasActiveSubscription,
@@ -3579,9 +3614,18 @@ app.post("/login", async (req, res) => {
     // ✅ 2) PROFIL avec client ADMIN (non bloquant)
     const { data: profile } = await supabaseAdmin
       .from("profiles")
-      .select("first_name, last_name, company_id")
+      .select("first_name, last_name, company_id, archived_at")
       .eq("user_id", user_id)
       .single();
+
+    // 🚫 Accès retiré (membre archivé par l'admin) : on n'ouvre pas de session.
+    if (profile?.archived_at) {
+      return res.status(403).json({
+        success: false,
+        error: "Votre accès à cet espace a été retiré. Contactez l'administrateur de votre entreprise.",
+        code: "ACCESS_REVOKED",
+      });
+    }
 
     // 🔐 2FA : si ce compte a la 2FA activée, on N'OUVRE PAS la session ici.
     //    On renvoie un "challenge" court (5 min) ; le code sera vérifié par POST /login/2fa.
@@ -3910,7 +3954,12 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
       last_name: profile.last_name,
       phone: profile.phone,
       company_id: profile.company_id,
-      avatar_url: profile.avatar_url  // ⚠️ CRITIQUE : toujours inclure
+      avatar_url: profile.avatar_url,  // ⚠️ CRITIQUE : toujours inclure
+      // ✅ Rôle + accès (déjà résolus sur req.user, aucune requête en plus) :
+      // sert à la page profil pour afficher les bons onglets (équipe / abonnement).
+      role: req.user.role,
+      subscription_type: req.user.subscription_type,
+      has_active_subscription: req.user.has_active_subscription
     };
 
     res.json(responseData);
@@ -6700,9 +6749,1757 @@ app.post("/api/auth/set-initial-password", async (req, res) => {
       user_id: user.id,
     });
 
+    // ✅ Membre invité : on enregistre la PRISE DE CONNAISSANCE des conditions
+    //    au moment de la création du mot de passe. L'admin (le souscripteur) a
+    //    déjà accepté les CGUV pour son entreprise lors de l'inscription ; le
+    //    membre est informé ici (mention affichée sur create-password.html).
+    //    Best-effort : n'empêche pas la création du compte si l'update échoue.
+    if (String(user.user_metadata?.role || "").toLowerCase() === "membre") {
+      const { error: termsErr } = await supabaseAdmin
+        .from("profiles")
+        .update({
+          terms_accepted_at: new Date().toISOString(),
+          terms_version: CURRENT_TERMS_VERSION,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("user_id", user.id);
+      if (termsErr) {
+        log.warn("⚠️ set-initial-password: enregistrement CGUV membre échoué:", safeError(termsErr));
+      }
+    }
+
     return res.json({ success: true });
   } catch (e) {
     log.error("❌ /api/auth/set-initial-password:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+
+// ============================================================
+// ÉQUIPE — Gestion des membres (admin payant uniquement)
+// Étape 1 du chantier multi-tenant : un admin payant peut inviter
+// jusqu'à MAX_TEAM_MEMBERS collègues, qui obtiennent de vrais comptes
+// Supabase rattachés à la même entreprise en rôle "membre".
+// ============================================================
+const MAX_TEAM_MEMBERS = 2; // membres invités maximum (hors admin)
+
+// Garde-fou commun : route réservée à l'admin d'une entreprise.
+function requireCompanyAdmin(req, res) {
+  const me = req.user;
+  if (!me || me.role !== 'admin') {
+    res.status(403).json({ error: "Réservé à l'administrateur de l'entreprise", code: "NOT_ADMIN" });
+    return null;
+  }
+  return me;
+}
+
+// Renvoie l'équipe SI l'utilisateur courant y a accès (admin -> toute équipe de SA company ;
+// membre -> uniquement les équipes où il figure dans team_members). Sinon null.
+// Socle de sécurité réutilisé par toutes les routes de données du pilotage.
+async function getAccessibleTeam(me, teamId) {
+  if (!me || !me.company_id) return null;
+  if (!/^[0-9a-f-]{36}$/i.test(String(teamId || ""))) return null;
+  const { data: team, error } = await supabaseAdmin
+    .from("teams")
+    .select("id, company_id, archived_at")
+    .eq("id", teamId)
+    .maybeSingle();
+  if (error || !team || team.company_id !== me.company_id) return null;
+  if (me.role === 'admin') return team;
+  const { data: link } = await supabaseAdmin
+    .from("team_members")
+    .select("team_id")
+    .eq("team_id", teamId)
+    .eq("user_id", me.id)
+    .maybeSingle();
+  return link ? team : null;
+}
+
+// --- Inviter un membre ---
+app.post("/api/team/invite", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+
+    // Compte payant actif uniquement (les essais ne peuvent pas inviter)
+    if (!(me.subscription_type === 'paid' && me.has_active_subscription)) {
+      return res.status(403).json({ error: "Réservé aux abonnements payants actifs", code: "NOT_PAID" });
+    }
+    if (!me.company_id) {
+      return res.status(400).json({ error: "Aucune entreprise rattachée au compte", code: "NO_COMPANY" });
+    }
+
+    const email = normalizeEmail(req.body?.email);
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return res.status(400).json({ error: "Email invalide" });
+    }
+    if (email === normalizeEmail(me.email)) {
+      return res.status(400).json({ error: "Vous ne pouvez pas vous inviter vous-même" });
+    }
+    const firstName = String(req.body?.first_name || "").trim().slice(0, 50) || null;
+    const lastName = String(req.body?.last_name || "").trim().slice(0, 50) || null;
+
+    // Limite de membres pour cette entreprise
+    const { count: memberCount, error: countErr } = await supabaseAdmin
+      .from("profiles")
+      .select("user_id", { count: "exact", head: true })
+      .eq("company_id", me.company_id)
+      .eq("role", "membre")
+      .is("archived_at", null);
+    if (countErr) {
+      log.error("❌ team/invite count error:", safeError(countErr));
+      return res.status(500).json({ error: "Erreur lecture des membres" });
+    }
+    if ((memberCount || 0) >= MAX_TEAM_MEMBERS) {
+      return res.status(409).json({ error: `Limite atteinte (${MAX_TEAM_MEMBERS} membres maximum)`, code: "LIMIT_REACHED" });
+    }
+
+    // Invitation Supabase : crée le compte Auth + envoie l'email d'invitation.
+    // Le membre choisit lui-même son mot de passe sur create-password.html (Option B).
+    const FRONT = process.env.FRONTEND_URL || (IS_PROD ? "https://integora.fr" : "http://localhost:3000");
+    const redirectTo = `${FRONT}/create-password.html`;
+
+    // Nom de l'entreprise -> alimente le champ "Organisation" de l'email d'invitation
+    const { data: companyRow } = await supabaseAdmin
+      .from("companies")
+      .select("display_name, legal_name")
+      .eq("id", me.company_id)
+      .maybeSingle();
+    const companyName = companyRow?.display_name || companyRow?.legal_name || "";
+
+    const { data: inviteData, error: inviteErr } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+      redirectTo,
+      data: {
+        first_name: firstName,
+        last_name: lastName,
+        company_name: companyName,
+        role: "membre",
+        company_id: me.company_id,
+        invited_by: me.id,
+      },
+    });
+
+    if (inviteErr) {
+      const msg = String(inviteErr.message || "");
+      if (msg.toLowerCase().includes("already been registered")) {
+        return res.status(409).json({ error: "Cet email a déjà un compte Integora", code: "EMAIL_TAKEN" });
+      }
+      log.error("❌ team/invite inviteUserByEmail:", safeError(inviteErr));
+      return res.status(500).json({ error: "Erreur lors de l'invitation" });
+    }
+
+    const newUserId = inviteData?.user?.id || null;
+    if (!newUserId) {
+      return res.status(500).json({ error: "Compte non créé" });
+    }
+
+    // Ligne profil du membre, rattachée à l'entreprise, en rôle "membre"
+    const { error: profErr } = await supabaseAdmin
+      .from("profiles")
+      .upsert(
+        {
+          user_id: newUserId,
+          first_name: firstName,
+          last_name: lastName,
+          company_id: me.company_id,
+          role: "membre",
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" }
+      );
+
+    if (profErr) {
+      log.error("❌ team/invite profiles upsert:", safeError(profErr));
+      // Rollback best-effort : pas de compte Auth fantôme sans profil
+      await supabaseAdmin.auth.admin.deleteUser(newUserId).catch(() => { });
+      return res.status(500).json({ error: "Erreur création du profil membre" });
+    }
+
+    return res.json({
+      ok: true,
+      member: { user_id: newUserId, email, first_name: firstName, last_name: lastName, status: "invited" },
+    });
+  } catch (e) {
+    log.error("❌ /api/team/invite:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Lister les membres de mon entreprise ---
+app.get("/api/team/members", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+
+    if (!me.company_id) {
+      return res.json({ members: [], used: 0, max: MAX_TEAM_MEMBERS });
+    }
+
+    const { data: rows, error } = await supabaseAdmin
+      .from("profiles")
+      .select("user_id, first_name, last_name, created_at, archived_at")
+      .eq("company_id", me.company_id)
+      .eq("role", "membre")
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      log.error("❌ team/members select error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture des membres" });
+    }
+
+    // Équipes attribuées à chaque membre (table team_members, scopée company) : 1 requête, regroupée par user.
+    const teamsByUser = {};
+    {
+      const { data: links, error: linkErr } = await supabaseAdmin
+        .from("team_members")
+        .select("user_id, team_id")
+        .eq("company_id", me.company_id);
+      if (linkErr) {
+        log.error("❌ team/members links error:", safeError(linkErr));
+        return res.status(500).json({ error: "Erreur lecture des accès" });
+      }
+      for (const l of (links || [])) {
+        (teamsByUser[l.user_id] = teamsByUser[l.user_id] || []).push(l.team_id);
+      }
+    }
+
+    // Email + statut depuis Supabase Auth (profiles ne stocke pas l'email).
+    // On sépare les membres ACTIFS des membres ARCHIVÉS (accès retiré).
+    // ⚡ PERF : les lectures Auth (email + statut) par membre sont lancées EN PARALLÈLE
+    // (au lieu d'un await séquentiel par membre = N allers-retours → plusieurs secondes).
+    const enriched = await Promise.all((rows || []).map(async (r) => {
+      let email = null;
+      let status = "invited";
+      try {
+        const { data: au } = await supabaseAdmin.auth.admin.getUserById(r.user_id);
+        email = au?.user?.email || null;
+        status = au?.user?.user_metadata?.password_initialized ? "active" : "invited";
+      } catch (_) { /* membre listé même si lecture Auth indisponible */ }
+      return { r, email, status };
+    }));
+    const active = [];
+    const archived = [];
+    for (const { r, email, status } of enriched) {
+      const base = { user_id: r.user_id, email, first_name: r.first_name, last_name: r.last_name, teams: teamsByUser[r.user_id] || [] };
+      if (r.archived_at) {
+        archived.push({ ...base, archived_at: r.archived_at });
+      } else {
+        active.push({ ...base, status });
+      }
+    }
+
+    return res.json({ active, archived, used: active.length, max: MAX_TEAM_MEMBERS });
+  } catch (e) {
+    log.error("❌ /api/team/members:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Définir les équipes d'un membre (réconcilie team_members) ---
+// C'est CE qui détermine ce qu'un membre voit (cf. getAccessibleTeam / GET /api/pilotage/teams).
+app.post("/api/team/members/:userId/teams", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+    if (!me.company_id) return res.status(400).json({ error: "Aucune entreprise rattachée", code: "NO_COMPANY" });
+
+    const userId = String(req.params.userId || "");
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) return res.status(400).json({ error: "Identifiant invalide" });
+
+    // 🔒 Le membre cible doit être de MA company et de rôle 'membre'.
+    const { data: target, error: tErr } = await supabaseAdmin
+      .from("profiles")
+      .select("user_id, company_id, role")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (tErr) { log.error("❌ member teams target:", safeError(tErr)); return res.status(500).json({ error: "Erreur serveur" }); }
+    if (!target || target.company_id !== me.company_id || String(target.role || "").toLowerCase() !== "membre") {
+      return res.status(404).json({ error: "Membre introuvable dans votre entreprise" });
+    }
+
+    let teamIds = Array.isArray(req.body?.team_ids) ? req.body.team_ids.map((x) => String(x)) : null;
+    if (!teamIds) return res.status(400).json({ error: "Liste d'équipes invalide" });
+    teamIds = [...new Set(teamIds)];
+    for (const tid of teamIds) {
+      if (!/^[0-9a-f-]{36}$/i.test(tid)) return res.status(400).json({ error: "Identifiant d'équipe invalide" });
+    }
+
+    // 🔒 Toutes les équipes demandées doivent appartenir à MA company.
+    if (teamIds.length) {
+      const { data: validTeams, error: vErr } = await supabaseAdmin
+        .from("teams")
+        .select("id")
+        .eq("company_id", me.company_id)
+        .in("id", teamIds);
+      if (vErr) { log.error("❌ member teams validate:", safeError(vErr)); return res.status(500).json({ error: "Erreur serveur" }); }
+      const validSet = new Set((validTeams || []).map((t) => t.id));
+      if (teamIds.some((t) => !validSet.has(t))) {
+        return res.status(400).json({ error: "Une équipe n'appartient pas à votre entreprise" });
+      }
+    }
+
+    // Réconciliation : on lit l'existant, on ajoute le manquant, on retire le surplus (scopé company + user).
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from("team_members")
+      .select("team_id")
+      .eq("company_id", me.company_id)
+      .eq("user_id", userId);
+    if (exErr) { log.error("❌ member teams existing:", safeError(exErr)); return res.status(500).json({ error: "Erreur serveur" }); }
+    const existingSet = new Set((existing || []).map((r) => r.team_id));
+    const toAdd = teamIds.filter((t) => !existingSet.has(t));
+    const toRemove = [...existingSet].filter((t) => !teamIds.includes(t));
+
+    if (toAdd.length) {
+      const rows = toAdd.map((t) => ({ team_id: t, user_id: userId, company_id: me.company_id, created_by: me.id }));
+      const { error: insErr } = await supabaseAdmin.from("team_members").insert(rows);
+      if (insErr) { log.error("❌ member teams insert:", safeError(insErr)); return res.status(500).json({ error: "Erreur d'enregistrement" }); }
+    }
+    if (toRemove.length) {
+      const { error: delErr } = await supabaseAdmin
+        .from("team_members")
+        .delete()
+        .eq("company_id", me.company_id)
+        .eq("user_id", userId)
+        .in("team_id", toRemove);
+      if (delErr) { log.error("❌ member teams delete:", safeError(delErr)); return res.status(500).json({ error: "Erreur de synchronisation" }); }
+    }
+
+    return res.json({ ok: true, teams: teamIds });
+  } catch (e) {
+    log.error("❌ /api/team/members/:userId/teams:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Retirer un membre de mon entreprise ---
+app.delete("/api/team/members/:userId", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+
+    const targetId = String(req.params.userId || "");
+    if (!/^[0-9a-f-]{36}$/i.test(targetId)) {
+      return res.status(400).json({ error: "Identifiant invalide" });
+    }
+    if (targetId === me.id) {
+      return res.status(400).json({ error: "Vous ne pouvez pas vous retirer vous-même" });
+    }
+
+    // La cible doit être un MEMBRE de MON entreprise (sinon 404, jamais d'accès croisé)
+    const { data: target, error: tErr } = await supabaseAdmin
+      .from("profiles")
+      .select("user_id, company_id, role, archived_at")
+      .eq("user_id", targetId)
+      .maybeSingle();
+
+    if (tErr) {
+      log.error("❌ team/archive select error:", safeError(tErr));
+      return res.status(500).json({ error: "Erreur lecture du membre" });
+    }
+    if (!target || target.company_id !== me.company_id || target.role !== 'membre') {
+      return res.status(404).json({ error: "Membre introuvable dans votre entreprise" });
+    }
+    if (target.archived_at) {
+      return res.json({ ok: true, already: true }); // déjà archivé
+    }
+
+    // ✅ "Retirer l'accès" = ARCHIVER (jamais supprimer). On garde le compte et le
+    //    nom pour la traçabilité ("Créé par ...") ; on coupe seulement l'accès.
+    const nowIso = new Date().toISOString();
+    const { error: archErr } = await supabaseAdmin
+      .from("profiles")
+      .update({ archived_at: nowIso, updated_at: nowIso })
+      .eq("user_id", targetId);
+    if (archErr) {
+      log.error("❌ team/archive update error:", safeError(archErr));
+      return res.status(500).json({ error: "Erreur lors du retrait de l'accès" });
+    }
+
+    // Couper ses sessions (déconnexion immédiate)
+    const { error: sessErr } = await supabaseAdmin
+      .from("token_sessions")
+      .update({ is_active: false, revoked_at: nowIso })
+      .eq("user_id", targetId)
+      .eq("is_active", true);
+    if (sessErr) log.warn("⚠️ team/archive sessions:", safeError(sessErr));
+
+    // Retirer ses accès aux équipes (liens d'accès, PAS du contenu métier)
+    const { error: tmErr } = await supabaseAdmin
+      .from("team_members")
+      .delete()
+      .eq("user_id", targetId);
+    if (tmErr) log.warn("⚠️ team/archive team_members:", safeError(tmErr));
+
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("❌ DELETE /api/team/members:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Réactiver un membre archivé (lui rendre l'accès) ---
+app.post("/api/team/members/:userId/reactivate", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+
+    const targetId = String(req.params.userId || "");
+    if (!/^[0-9a-f-]{36}$/i.test(targetId)) {
+      return res.status(400).json({ error: "Identifiant invalide" });
+    }
+
+    // La cible doit être un membre ARCHIVÉ de MON entreprise
+    const { data: target, error: tErr } = await supabaseAdmin
+      .from("profiles")
+      .select("user_id, company_id, role, archived_at")
+      .eq("user_id", targetId)
+      .maybeSingle();
+    if (tErr) {
+      log.error("❌ team/reactivate select error:", safeError(tErr));
+      return res.status(500).json({ error: "Erreur lecture du membre" });
+    }
+    if (!target || target.company_id !== me.company_id || target.role !== 'membre') {
+      return res.status(404).json({ error: "Membre introuvable dans votre entreprise" });
+    }
+    if (!target.archived_at) {
+      return res.json({ ok: true, already: true }); // déjà actif
+    }
+
+    // 🚧 GARDE-FOU : jamais plus de MAX_TEAM_MEMBERS membres ACTIFS.
+    const { count: activeCount, error: countErr } = await supabaseAdmin
+      .from("profiles")
+      .select("user_id", { count: "exact", head: true })
+      .eq("company_id", me.company_id)
+      .eq("role", "membre")
+      .is("archived_at", null);
+    if (countErr) {
+      log.error("❌ team/reactivate count error:", safeError(countErr));
+      return res.status(500).json({ error: "Erreur serveur" });
+    }
+    if ((activeCount || 0) >= MAX_TEAM_MEMBERS) {
+      return res.status(409).json({
+        error: `Limite atteinte (${MAX_TEAM_MEMBERS} membres maximum). Retirez d'abord l'accès d'un membre actif.`,
+        code: "LIMIT_REACHED",
+      });
+    }
+
+    // Réactivation : on enlève l'archivage. Le compte/mot de passe existant
+    // restent valides -> le membre peut se reconnecter immédiatement.
+    const { error: updErr } = await supabaseAdmin
+      .from("profiles")
+      .update({ archived_at: null, updated_at: new Date().toISOString() })
+      .eq("user_id", targetId);
+    if (updErr) {
+      log.error("❌ team/reactivate update error:", safeError(updErr));
+      return res.status(500).json({ error: "Erreur lors de la réactivation" });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("❌ /api/team/members/:id/reactivate:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+
+// ============================================================
+// ÉQUIPES — Gestion des équipes de l'entreprise (admin uniquement)
+// Brique du chantier multi-tenant. On ARCHIVE plutôt que supprimer :
+// le contenu métier rattaché (à venir) ne doit jamais être détruit.
+// ============================================================
+const TEAM_NAME_MAX = 60;
+// Couleur d'équipe : donnée PARTAGÉE entreprise (colonne teams.color). Clés autorisées
+// alignées sur le front (TEAM_COLORS). null = pas de couleur choisie (le front retombe sur
+// un repli stable par position).
+const TEAM_COLOR_KEYS = ['blue', 'green', 'violet', 'cyan', 'orange', 'rose', 'amber', 'teal', 'pink'];
+function sanitizeTeamColor(v) {
+  const c = String(v || '').trim().toLowerCase();
+  return TEAM_COLOR_KEYS.includes(c) ? c : null;
+}
+
+// --- Lister les équipes (actives) de mon entreprise ---
+app.get("/api/teams", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+    if (!me.company_id) return res.json({ teams: [] });
+
+    const { data, error } = await supabaseAdmin
+      .from("teams")
+      .select("id, name, color, created_at, archived_at")
+      .eq("company_id", me.company_id)
+      .is("archived_at", null)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      log.error("❌ teams list error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture des équipes" });
+    }
+    return res.json({ teams: data || [] });
+  } catch (e) {
+    log.error("❌ /api/teams GET:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Équipes ACCESSIBLES à l'utilisateur courant (socle du tableau de pilotage) ---
+// Admin  : toutes les équipes actives de SON entreprise.
+// Membre : uniquement les équipes où il figure dans team_members (scopées company_id).
+// Lecture seule, ouverte admin ET membre (le pilotage doit être consultable par les membres).
+app.get("/api/pilotage/teams", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    if (!me) return res.status(401).json({ error: "Non authentifié" });
+    if (!me.company_id) return res.json({ teams: [], role: me.role || null });
+
+    if (me.role === 'admin') {
+      // On renvoie AUSSI les archivées (archived_at non null) : le front gère
+      // la liste active ET la modale "Équipes archivées".
+      const { data, error } = await supabaseAdmin
+        .from("teams")
+        .select("id, name, color, created_at, archived_at")
+        .eq("company_id", me.company_id)
+        .order("created_at", { ascending: true });
+      if (error) {
+        log.error("❌ pilotage/teams admin error:", safeError(error));
+        return res.status(500).json({ error: "Erreur lecture des équipes" });
+      }
+      return res.json({ teams: data || [], role: 'admin' });
+    }
+
+    // Membre : on récupère d'abord ses rattachements, puis les équipes correspondantes.
+    const { data: links, error: linkErr } = await supabaseAdmin
+      .from("team_members")
+      .select("team_id")
+      .eq("company_id", me.company_id)
+      .eq("user_id", me.id);
+    if (linkErr) {
+      log.error("❌ pilotage/teams member links error:", safeError(linkErr));
+      return res.status(500).json({ error: "Erreur lecture des équipes" });
+    }
+    const teamIds = (links || []).map((r) => r.team_id);
+    if (!teamIds.length) return res.json({ teams: [], role: 'membre' });
+
+    const { data, error } = await supabaseAdmin
+      .from("teams")
+      .select("id, name, color, created_at, archived_at")
+      .eq("company_id", me.company_id)
+      .in("id", teamIds)
+      .is("archived_at", null)
+      .order("created_at", { ascending: true });
+    if (error) {
+      log.error("❌ pilotage/teams member error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture des équipes" });
+    }
+    return res.json({ teams: data || [], role: 'membre' });
+  } catch (e) {
+    log.error("❌ /api/pilotage/teams GET:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// =========================================================================
+// PILOTAGE — BOOTSTRAP : toutes les données d'UNE équipe en UN seul appel.
+// ⚡ PERF : 6 requêtes Supabase lancées EN PARALLÈLE côté serveur (le backend est
+//    proche de Supabase) → 1 seul aller-retour navigateur au lieu de 6-12.
+//    Même isolation que les routes individuelles (getAccessibleTeam + company_id forcé).
+// =========================================================================
+app.get("/api/pilotage/bootstrap", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.query.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+
+    const [monthly, goals, thermometres, annotations, collaborators, journal] = await Promise.all([
+      supabaseAdmin.from("pilotage_monthly_kpis")
+        .select("month, absenteeism, overtime, training, headcount")
+        .eq("company_id", me.company_id).eq("team_id", teamId)
+        .order("month", { ascending: true }),
+      supabaseAdmin.from("pilotage_goals")
+        .select("id, kpi_key, title, start_value, start_week_num, target_value, deadline, description, created_at")
+        .eq("company_id", me.company_id).eq("team_id", teamId)
+        .order("created_at", { ascending: true }),
+      supabaseAdmin.from("pilotage_thermometres")
+        .select("id, year, week_num, date, participants, distribution, note, is_retroactive, created_at, updated_at")
+        .eq("company_id", me.company_id).eq("team_id", teamId)
+        .order("year", { ascending: true }).order("week_num", { ascending: true }),
+      supabaseAdmin.from("pilotage_annotations")
+        .select("id, year, week_num, category, kpi_key, title, description, author, created_at")
+        .eq("company_id", me.company_id).eq("team_id", teamId)
+        .order("created_at", { ascending: true }),
+      supabaseAdmin.from("pilotage_collaborators")
+        .select("id, data")
+        .eq("company_id", me.company_id).eq("team_id", teamId)
+        .order("created_at", { ascending: true }),
+      supabaseAdmin.from("pilotage_journal")
+        .select("id, data")
+        .eq("company_id", me.company_id).eq("team_id", teamId)
+        .order("created_at", { ascending: true }),
+    ]);
+
+    const failed = [monthly, goals, thermometres, annotations, collaborators, journal].find((r) => r.error);
+    if (failed) {
+      log.error("❌ pilotage/bootstrap:", safeError(failed.error));
+      return res.status(500).json({ error: "Erreur de chargement du tableau" });
+    }
+
+    return res.json({
+      team_id: teamId,
+      monthly_kpis: monthly.data || [],
+      goals: goals.data || [],
+      thermometres: thermometres.data || [],
+      annotations: annotations.data || [],
+      collaborators: collaborators.data || [],
+      journal: journal.data || [],
+    });
+  } catch (e) {
+    log.error("❌ /api/pilotage/bootstrap:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// =========================================================================
+// PILOTAGE — KPI MENSUELS (absentéisme / charge / formation + effectif)
+// =========================================================================
+const PILOTAGE_MONTHLY_KEYS = ["absenteeism", "overtime", "training"];
+
+// Lire les KPI mensuels d'une équipe (accès admin OU membre de l'équipe).
+app.get("/api/pilotage/monthly-kpis", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.query.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+
+    const { data, error } = await supabaseAdmin
+      .from("pilotage_monthly_kpis")
+      .select("month, absenteeism, overtime, training, headcount")
+      .eq("company_id", me.company_id)
+      .eq("team_id", teamId)
+      .order("month", { ascending: true });
+    if (error) {
+      log.error("❌ pilotage/monthly-kpis GET error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture des indicateurs" });
+    }
+    return res.json({ items: data || [] });
+  } catch (e) {
+    log.error("❌ /api/pilotage/monthly-kpis GET:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// Enregistrer UNE valeur d'indicateur pour un mois (upsert ; company_id/team_id FORCÉS serveur).
+// L'effectif (headcount) est figé au 1er enregistrement du mois (on ne l'écrase plus ensuite).
+app.post("/api/pilotage/monthly-kpis/set", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.body?.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+
+    const month = String(req.body?.month || "");
+    if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: "Mois invalide" });
+    const kpiKey = String(req.body?.kpi_key || "");
+    if (!PILOTAGE_MONTHLY_KEYS.includes(kpiKey)) return res.status(400).json({ error: "Indicateur invalide" });
+
+    let value = req.body?.value;
+    if (value === null || value === undefined || value === "") value = null;
+    else { value = Number(value); if (!Number.isFinite(value)) return res.status(400).json({ error: "Valeur invalide" }); }
+
+    let headcount = req.body?.headcount;
+    headcount = (headcount === null || headcount === undefined || headcount === "") ? null : Math.trunc(Number(headcount));
+    if (headcount != null && !Number.isFinite(headcount)) headcount = null;
+
+    const { data: existing, error: readErr } = await supabaseAdmin
+      .from("pilotage_monthly_kpis")
+      .select("id, absenteeism, overtime, training, headcount")
+      .eq("company_id", me.company_id)
+      .eq("team_id", teamId)
+      .eq("month", month)
+      .maybeSingle();
+    if (readErr) {
+      log.error("❌ pilotage/monthly-kpis read error:", safeError(readErr));
+      return res.status(500).json({ error: "Erreur serveur" });
+    }
+
+    const row = {
+      company_id: me.company_id,
+      team_id: teamId,
+      month,
+      absenteeism: existing ? existing.absenteeism : null,
+      overtime: existing ? existing.overtime : null,
+      training: existing ? existing.training : null,
+      headcount: existing ? existing.headcount : null,
+      updated_at: new Date().toISOString(),
+    };
+    row[kpiKey] = value;
+    if (!row.headcount && headcount > 0) row.headcount = headcount; // figé au 1er enregistrement (≥1 ; null OU 0 = effectif pas encore connu → à (re)remplir)
+
+    let result, error;
+    if (existing) {
+      ({ data: result, error } = await supabaseAdmin
+        .from("pilotage_monthly_kpis")
+        .update(row)
+        .eq("id", existing.id)
+        .select("month, absenteeism, overtime, training, headcount")
+        .single());
+    } else {
+      ({ data: result, error } = await supabaseAdmin
+        .from("pilotage_monthly_kpis")
+        .insert(row)
+        .select("month, absenteeism, overtime, training, headcount")
+        .single());
+    }
+    if (error) {
+      log.error("❌ pilotage/monthly-kpis write error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lors de l'enregistrement" });
+    }
+    return res.json({ ok: true, item: result });
+  } catch (e) {
+    log.error("❌ /api/pilotage/monthly-kpis/set:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// =========================================================================
+// PILOTAGE — OBJECTIFS (1 par KPI par équipe ; unique(team_id,kpi_key) en base)
+// =========================================================================
+const PILOTAGE_GOAL_KEYS = ["absenteeism", "overtime", "engagement", "training"];
+
+function sanitizeGoalPayload(body) {
+  const out = {};
+  if (typeof body.title === "string") out.title = body.title.trim().slice(0, 200);
+  if (body.kpi_key !== undefined) out.kpi_key = String(body.kpi_key);
+  if (body.target_value !== undefined) {
+    const n = Number(body.target_value);
+    out.target_value = Number.isFinite(n) ? n : null;
+  }
+  if (body.deadline !== undefined) {
+    out.deadline = (typeof body.deadline === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.deadline)) ? body.deadline : null;
+  }
+  if (body.description !== undefined) out.description = String(body.description || "").slice(0, 1000);
+  if (body.start_value !== undefined) {
+    out.start_value = (body.start_value === null || body.start_value === "") ? null
+      : (Number.isFinite(Number(body.start_value)) ? Number(body.start_value) : null);
+  }
+  if (body.start_week_num !== undefined) {
+    const w = (body.start_week_num === null || body.start_week_num === "") ? null : Math.trunc(Number(body.start_week_num));
+    out.start_week_num = (w != null && Number.isFinite(w)) ? w : null;
+  }
+  return out;
+}
+
+// Renvoie l'objectif SI il appartient à la company de l'utilisateur ET à une équipe
+// qu'il peut atteindre. Sinon null. (On ne fait JAMAIS confiance à l'id seul.)
+async function getOwnedGoal(me, goalId) {
+  if (!me || !me.company_id) return null;
+  if (!/^[0-9a-f-]{36}$/i.test(String(goalId || ""))) return null;
+  const { data: g, error } = await supabaseAdmin
+    .from("pilotage_goals")
+    .select("id, company_id, team_id, kpi_key")
+    .eq("id", goalId)
+    .maybeSingle();
+  if (error || !g || g.company_id !== me.company_id) return null;
+  const team = await getAccessibleTeam(me, g.team_id);
+  return team ? g : null;
+}
+
+app.get("/api/pilotage/goals", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.query.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+    const { data, error } = await supabaseAdmin
+      .from("pilotage_goals")
+      .select("id, kpi_key, title, start_value, start_week_num, target_value, deadline, description, created_at")
+      .eq("company_id", me.company_id)
+      .eq("team_id", teamId)
+      .order("created_at", { ascending: true });
+    if (error) {
+      log.error("❌ pilotage/goals GET:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture des objectifs" });
+    }
+    return res.json({ items: data || [] });
+  } catch (e) {
+    log.error("❌ /api/pilotage/goals GET:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.post("/api/pilotage/goals", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.body?.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+    const p = sanitizeGoalPayload(req.body || {});
+    if (!p.title) return res.status(400).json({ error: "Titre requis" });
+    if (!PILOTAGE_GOAL_KEYS.includes(p.kpi_key)) return res.status(400).json({ error: "Indicateur invalide" });
+    if (p.target_value == null) return res.status(400).json({ error: "Valeur cible invalide" });
+
+    const { data, error } = await supabaseAdmin
+      .from("pilotage_goals")
+      .insert({
+        company_id: me.company_id,   // forcé serveur
+        team_id: teamId,             // forcé serveur (équipe déjà validée)
+        kpi_key: p.kpi_key,
+        title: p.title,
+        target_value: p.target_value,
+        deadline: p.deadline ?? null,
+        description: p.description ?? null,
+        start_value: p.start_value ?? null,
+        start_week_num: p.start_week_num ?? null,
+        created_by: me.id,
+      })
+      .select("id, kpi_key, title, start_value, start_week_num, target_value, deadline, description, created_at")
+      .single();
+    if (error) {
+      if (String(error.code) === "23505") return res.status(409).json({ error: "Un objectif existe déjà pour cet indicateur", code: "GOAL_EXISTS" });
+      log.error("❌ pilotage/goals POST:", safeError(error));
+      return res.status(500).json({ error: "Erreur création de l'objectif" });
+    }
+    return res.json({ ok: true, item: data });
+  } catch (e) {
+    log.error("❌ /api/pilotage/goals POST:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.patch("/api/pilotage/goals/:id", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const owned = await getOwnedGoal(me, req.params.id);
+    if (!owned) return res.status(404).json({ error: "Objectif introuvable ou non autorisé" });
+    const p = sanitizeGoalPayload(req.body || {});
+    const update = { updated_at: new Date().toISOString() };
+    if (p.title !== undefined) { if (!p.title) return res.status(400).json({ error: "Titre requis" }); update.title = p.title; }
+    if (p.kpi_key !== undefined) { if (!PILOTAGE_GOAL_KEYS.includes(p.kpi_key)) return res.status(400).json({ error: "Indicateur invalide" }); update.kpi_key = p.kpi_key; }
+    if (p.target_value !== undefined) { if (p.target_value == null) return res.status(400).json({ error: "Valeur cible invalide" }); update.target_value = p.target_value; }
+    if (p.deadline !== undefined) update.deadline = p.deadline;
+    if (p.description !== undefined) update.description = p.description;
+    if (p.start_value !== undefined) update.start_value = p.start_value;
+    if (p.start_week_num !== undefined) update.start_week_num = p.start_week_num;
+
+    const { data, error } = await supabaseAdmin
+      .from("pilotage_goals")
+      .update(update)
+      .eq("id", owned.id)
+      .select("id, kpi_key, title, start_value, start_week_num, target_value, deadline, description, created_at")
+      .single();
+    if (error) {
+      if (String(error.code) === "23505") return res.status(409).json({ error: "Un objectif existe déjà pour cet indicateur", code: "GOAL_EXISTS" });
+      log.error("❌ pilotage/goals PATCH:", safeError(error));
+      return res.status(500).json({ error: "Erreur mise à jour de l'objectif" });
+    }
+    return res.json({ ok: true, item: data });
+  } catch (e) {
+    log.error("❌ /api/pilotage/goals PATCH:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.delete("/api/pilotage/goals/:id", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const owned = await getOwnedGoal(me, req.params.id);
+    if (!owned) return res.status(404).json({ error: "Objectif introuvable ou non autorisé" });
+    const { error } = await supabaseAdmin.from("pilotage_goals").delete().eq("id", owned.id);
+    if (error) {
+      log.error("❌ pilotage/goals DELETE:", safeError(error));
+      return res.status(500).json({ error: "Erreur suppression de l'objectif" });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("❌ /api/pilotage/goals DELETE:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// =========================================================================
+// PILOTAGE — THERMOMÈTRES (climat hebdo : 1 par (équipe, année, semaine))
+// =========================================================================
+function sanitizeDistribution(d) {
+  if (!Array.isArray(d) || d.length !== 10) return null;
+  const out = d.map((x) => Math.trunc(Number(x)));
+  if (out.some((x) => !Number.isFinite(x) || x < 0)) return null;
+  return out;
+}
+
+app.get("/api/pilotage/thermometres", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.query.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+    const { data, error } = await supabaseAdmin
+      .from("pilotage_thermometres")
+      .select("id, year, week_num, date, participants, distribution, note, is_retroactive, created_at, updated_at")
+      .eq("company_id", me.company_id)
+      .eq("team_id", teamId)
+      .order("year", { ascending: true })
+      .order("week_num", { ascending: true });
+    if (error) {
+      log.error("❌ pilotage/thermometres GET:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture des thermomètres" });
+    }
+    return res.json({ items: data || [] });
+  } catch (e) {
+    log.error("❌ /api/pilotage/thermometres GET:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// Upsert d'un thermomètre pour une (année, semaine) — company_id/team_id forcés serveur.
+app.post("/api/pilotage/thermometres", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.body?.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+
+    const year = Math.trunc(Number(req.body?.year));
+    const weekNum = Math.trunc(Number(req.body?.week_num));
+    if (!Number.isFinite(year) || year < 2000 || year > 2100) return res.status(400).json({ error: "Année invalide" });
+    if (!Number.isFinite(weekNum) || weekNum < 1 || weekNum > 53) return res.status(400).json({ error: "Semaine invalide" });
+    const participants = Math.trunc(Number(req.body?.participants));
+    if (!Number.isFinite(participants) || participants < 1) return res.status(400).json({ error: "Nombre de participants invalide" });
+    const dist = sanitizeDistribution(req.body?.distribution);
+    if (!dist) return res.status(400).json({ error: "Répartition invalide (10 entiers ≥ 0 attendus)" });
+    const total = dist.reduce((a, b) => a + b, 0);
+    if (total < 1) return res.status(400).json({ error: "Au moins une note est requise" });
+    if (total > participants) return res.status(400).json({ error: "Le total des réponses dépasse le nombre de participants" });
+    const date = (typeof req.body?.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.body.date)) ? req.body.date : null;
+    const note = String(req.body?.note || "").slice(0, 2000);
+    const isRetro = req.body?.is_retroactive === true;
+
+    const { data: existing, error: readErr } = await supabaseAdmin
+      .from("pilotage_thermometres")
+      .select("id")
+      .eq("company_id", me.company_id)
+      .eq("team_id", teamId)
+      .eq("year", year)
+      .eq("week_num", weekNum)
+      .maybeSingle();
+    if (readErr) {
+      log.error("❌ pilotage/thermometres read:", safeError(readErr));
+      return res.status(500).json({ error: "Erreur serveur" });
+    }
+
+    const row = {
+      company_id: me.company_id, team_id: teamId, year, week_num: weekNum,
+      date, participants, distribution: dist, note, is_retroactive: isRetro,
+      updated_at: new Date().toISOString(),
+    };
+    let result, error;
+    if (existing) {
+      ({ data: result, error } = await supabaseAdmin
+        .from("pilotage_thermometres")
+        .update(row)
+        .eq("id", existing.id)
+        .select("id, year, week_num, date, participants, distribution, note, is_retroactive, created_at, updated_at")
+        .single());
+    } else {
+      row.created_by = me.id;
+      ({ data: result, error } = await supabaseAdmin
+        .from("pilotage_thermometres")
+        .insert(row)
+        .select("id, year, week_num, date, participants, distribution, note, is_retroactive, created_at, updated_at")
+        .single());
+    }
+    if (error) {
+      log.error("❌ pilotage/thermometres write:", safeError(error));
+      return res.status(500).json({ error: "Erreur lors de l'enregistrement" });
+    }
+    return res.json({ ok: true, item: result });
+  } catch (e) {
+    log.error("❌ /api/pilotage/thermometres POST:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// =========================================================================
+// PILOTAGE — ANNOTATIONS (repères posés sur la courbe d'évolution)
+// =========================================================================
+const PILOTAGE_ANNOTATION_CATS = ["event", "change", "action", "note"];
+
+async function getOwnedAnnotation(me, annId) {
+  if (!me || !me.company_id) return null;
+  if (!/^[0-9a-f-]{36}$/i.test(String(annId || ""))) return null;
+  const { data: a, error } = await supabaseAdmin
+    .from("pilotage_annotations")
+    .select("id, company_id, team_id")
+    .eq("id", annId)
+    .maybeSingle();
+  if (error || !a || a.company_id !== me.company_id) return null;
+  const team = await getAccessibleTeam(me, a.team_id);
+  return team ? a : null;
+}
+
+function sanitizeAnnotationPayload(body) {
+  const out = {};
+  if (typeof body.title === "string") out.title = body.title.trim().slice(0, 200);
+  if (body.category !== undefined) out.category = String(body.category);
+  if (body.kpi_key !== undefined) {
+    const k = String(body.kpi_key || "");
+    // Annotation liée à UN indicateur (ou null = visible partout). On n'accepte que les vrais KPI.
+    out.kpi_key = ["absenteeism", "overtime", "training", "engagement"].includes(k) ? k : null;
+  }
+  if (body.description !== undefined) out.description = String(body.description || "").slice(0, 2000);
+  if (body.author !== undefined) out.author = String(body.author || "").slice(0, 120);
+  if (body.year !== undefined) { const y = Math.trunc(Number(body.year)); out.year = Number.isFinite(y) ? y : null; }
+  if (body.week_num !== undefined) { const w = Math.trunc(Number(body.week_num)); out.week_num = Number.isFinite(w) ? w : null; }
+  return out;
+}
+
+app.get("/api/pilotage/annotations", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.query.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+    const { data, error } = await supabaseAdmin
+      .from("pilotage_annotations")
+      .select("id, year, week_num, category, kpi_key, title, description, author, created_at")
+      .eq("company_id", me.company_id)
+      .eq("team_id", teamId)
+      .order("created_at", { ascending: true });
+    if (error) {
+      log.error("❌ pilotage/annotations GET:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture des annotations" });
+    }
+    return res.json({ items: data || [] });
+  } catch (e) {
+    log.error("❌ /api/pilotage/annotations GET:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.post("/api/pilotage/annotations", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.body?.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+    const p = sanitizeAnnotationPayload(req.body || {});
+    if (!p.title) return res.status(400).json({ error: "Titre requis" });
+    if (!PILOTAGE_ANNOTATION_CATS.includes(p.category)) return res.status(400).json({ error: "Catégorie invalide" });
+
+    const { data, error } = await supabaseAdmin
+      .from("pilotage_annotations")
+      .insert({
+        company_id: me.company_id,   // forcé serveur
+        team_id: teamId,             // forcé serveur (équipe déjà validée)
+        year: p.year ?? null,
+        week_num: p.week_num ?? null,
+        category: p.category,
+        kpi_key: p.kpi_key ?? null,   // indicateur lié (null = visible partout)
+        title: p.title,
+        description: p.description ?? null,
+        author: p.author ?? null,
+        created_by: me.id,
+      })
+      .select("id, year, week_num, category, kpi_key, title, description, author, created_at")
+      .single();
+    if (error) {
+      log.error("❌ pilotage/annotations POST:", safeError(error));
+      return res.status(500).json({ error: "Erreur création de l'annotation" });
+    }
+    return res.json({ ok: true, item: data });
+  } catch (e) {
+    log.error("❌ /api/pilotage/annotations POST:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.patch("/api/pilotage/annotations/:id", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const owned = await getOwnedAnnotation(me, req.params.id);
+    if (!owned) return res.status(404).json({ error: "Annotation introuvable ou non autorisée" });
+    const p = sanitizeAnnotationPayload(req.body || {});
+    const update = { updated_at: new Date().toISOString() };
+    if (p.title !== undefined) { if (!p.title) return res.status(400).json({ error: "Titre requis" }); update.title = p.title; }
+    if (p.category !== undefined) { if (!PILOTAGE_ANNOTATION_CATS.includes(p.category)) return res.status(400).json({ error: "Catégorie invalide" }); update.category = p.category; }
+    if (p.description !== undefined) update.description = p.description;
+    if (p.year !== undefined) update.year = p.year;
+    if (p.week_num !== undefined) update.week_num = p.week_num;
+
+    const { data, error } = await supabaseAdmin
+      .from("pilotage_annotations")
+      .update(update)
+      .eq("id", owned.id)
+      .select("id, year, week_num, category, kpi_key, title, description, author, created_at")
+      .single();
+    if (error) {
+      log.error("❌ pilotage/annotations PATCH:", safeError(error));
+      return res.status(500).json({ error: "Erreur mise à jour de l'annotation" });
+    }
+    return res.json({ ok: true, item: data });
+  } catch (e) {
+    log.error("❌ /api/pilotage/annotations PATCH:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.delete("/api/pilotage/annotations/:id", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const owned = await getOwnedAnnotation(me, req.params.id);
+    if (!owned) return res.status(404).json({ error: "Annotation introuvable ou non autorisée" });
+    const { error } = await supabaseAdmin.from("pilotage_annotations").delete().eq("id", owned.id);
+    if (error) {
+      log.error("❌ pilotage/annotations DELETE:", safeError(error));
+      return res.status(500).json({ error: "Erreur suppression de l'annotation" });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("❌ /api/pilotage/annotations DELETE:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// =========================================================================
+// PILOTAGE — COLLABORATEURS (modèle DOCUMENT : 1 collaborateur = 1 ligne JSONB)
+// L'objet complet (personne + notes + entretiens + points à suivre) vit dans
+// la colonne `data`. Isolation : company_id + team_id forcés serveur + RLS.
+// =========================================================================
+const UUID_RX = /^[0-9a-f-]{36}$/i;
+
+app.get("/api/pilotage/collaborators", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.query.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+    const { data, error } = await supabaseAdmin
+      .from("pilotage_collaborators")
+      .select("id, data")
+      .eq("company_id", me.company_id)
+      .eq("team_id", teamId)
+      .order("created_at", { ascending: true });
+    if (error) {
+      log.error("❌ pilotage/collaborators GET:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture des collaborateurs" });
+    }
+    return res.json({ items: data || [] });
+  } catch (e) {
+    log.error("❌ /api/pilotage/collaborators GET:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// ============================================================
+// FUSION JSONB PAR IDENTIFIANT (multi-utilisateurs sans perte) — testée (scratchpad/merge_test.js)
+//  - Ajouts de plusieurs comptes → coexistent (union par clé id / at / createdAt)
+//  - Modif du même élément → la plus récente gagne (editedAt/updatedAt/at)
+//  - Suppression → soft-delete (_del:true + horodatage) : se résout par la même fusion,
+//    impossible à ressusciter par un onglet périmé. (Purge des _del anciens : à prévoir.)
+// ============================================================
+function _pilKey(it) {
+  if (!it || typeof it !== "object") return null;
+  if (it.id != null) return "id:" + it.id;
+  if (it._uid != null) return "u:" + it._uid;     // entretiens (clé interne)
+  if (it.at != null) return "at:" + it.at;
+  if (it.createdAt != null) return "ct:" + it.createdAt;
+  return null;
+}
+function _pilTime(it) {
+  // Récence = le PLUS RÉCENT de tous les horodatages connus (édition, statut, archivage…).
+  // => un changement de statut/archive (qui ne bump pas updatedAt) est quand même vu comme "récent"
+  //    par la fusion, sans toucher au libellé "Modifié le" des cartes (qui, lui, lit updatedAt).
+  if (!it || typeof it !== "object") return "";
+  let t = "";
+  for (const k of ["editedAt", "updatedAt", "lastActivityAt", "archivedAt", "at", "createdAt"]) {
+    const v = it[k];
+    if (typeof v === "string" && v > t) t = v;
+  }
+  return t;
+}
+function pilMergeJson(base, inc) {
+  if (Array.isArray(base) && Array.isArray(inc)) {
+    const all = base.concat(inc);
+    const hasKeys = all.some((it) => _pilKey(it) != null);
+    if (!hasKeys) {
+      const allPrim = all.every((x) => x == null || typeof x !== "object");
+      return allPrim ? [...new Set(all)] : inc;
+    }
+    const out = [];
+    const pos = new Map();
+    const put = (it) => {
+      const k = _pilKey(it);
+      if (k == null) { out.push(it); return; }
+      if (pos.has(k)) out[pos.get(k)] = pilMergeJson(out[pos.get(k)], it);
+      else { pos.set(k, out.length); out.push(it); }
+    };
+    base.forEach(put); inc.forEach(put);
+    return out;
+  }
+  if (base && inc && typeof base === "object" && typeof inc === "object" && !Array.isArray(base) && !Array.isArray(inc)) {
+    const incNewer = _pilTime(inc) >= _pilTime(base);
+    const out = {};
+    for (const k of new Set([...Object.keys(base), ...Object.keys(inc)])) {
+      const a = base[k], b = inc[k];
+      if (a !== undefined && b !== undefined) {
+        if (a && typeof a === "object" && b && typeof b === "object") out[k] = pilMergeJson(a, b);
+        else out[k] = incNewer ? b : a;
+      } else {
+        out[k] = (b !== undefined) ? b : a;
+      }
+    }
+    return out;
+  }
+  return (inc !== undefined) ? inc : base;
+}
+
+// Synchronise l'ÉTAT COMPLET des collaborateurs d'une équipe : FUSIONNE chaque fiche
+// avec sa version en base (par id), supprime ceux disparus. company_id/team_id FORCÉS serveur.
+app.post("/api/pilotage/collaborators/sync", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.body?.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+
+    const members = Array.isArray(req.body?.members) ? req.body.members : null;
+    if (!members) return res.status(400).json({ error: "Liste de collaborateurs invalide" });
+    if (members.length > 500) return res.status(400).json({ error: "Trop de collaborateurs" });
+    for (const m of members) {
+      if (!m || typeof m !== "object" || !UUID_RX.test(String(m.id || ""))) {
+        return res.status(400).json({ error: "Identifiant de collaborateur invalide" });
+      }
+      // Borne la taille de CHAQUE fiche (le maxlength HTML est seulement côté client).
+      // 64 ko : marge pour la fusion + historique + soft-delete (purge des _del anciens à prévoir).
+      if (JSON.stringify(m).length > 65536) {
+        return res.status(400).json({ error: "Fiche collaborateur trop volumineuse" });
+      }
+    }
+    const keepIds = members.map((m) => String(m.id));
+
+    // On récupère la version ACTUELLE de chaque fiche (pour FUSIONNER au lieu d'écraser),
+    // ET 🔒 CYBER : aucun id du payload ne doit appartenir à une AUTRE entreprise/équipe
+    // (sinon un client malveillant pourrait écraser/voler la ligne d'un autre tenant).
+    const existingById = new Map();   // id → data jsonb en base
+    if (keepIds.length) {
+      const { data: clash, error: clashErr } = await supabaseAdmin
+        .from("pilotage_collaborators")
+        .select("id, company_id, team_id, data")
+        .in("id", keepIds);
+      if (clashErr) {
+        log.error("❌ collaborators sync clash check:", safeError(clashErr));
+        return res.status(500).json({ error: "Erreur serveur" });
+      }
+      const hijack = (clash || []).some((r) => r.company_id !== me.company_id || r.team_id !== teamId);
+      if (hijack) return res.status(403).json({ error: "Conflit d'identifiants" });
+      for (const r of (clash || [])) existingById.set(String(r.id), r.data);
+    }
+
+    const rows = members.map((m) => {
+      const prev = existingById.get(String(m.id));
+      // FUSION par id si la fiche existe déjà → les ajouts des autres comptes ne sont pas écrasés.
+      const data = prev ? pilMergeJson(prev, m) : m;
+      return {
+        id: String(m.id),
+        company_id: me.company_id,   // forcé serveur
+        team_id: teamId,             // forcé serveur
+        name: (String((data && data.name) || m.name || "").slice(0, 200) || "—"),
+        data,                        // objet collaborateur fusionné
+        updated_at: new Date().toISOString(),
+      };
+    });
+
+    if (rows.length) {
+      const { error: upErr } = await supabaseAdmin
+        .from("pilotage_collaborators")
+        .upsert(rows, { onConflict: "id" });
+      if (upErr) {
+        log.error("❌ collaborators sync upsert:", safeError(upErr));
+        return res.status(500).json({ error: "Erreur d'enregistrement" });
+      }
+    }
+
+    // CONCURRENCE : on ne supprime QUE ce qui a été explicitement supprimé côté client
+    // (deleted_ids), JAMAIS "ce qui manque" — sinon on écraserait un ajout fait entre-temps
+    // par un autre utilisateur de la même équipe. Suppression scopée company+team (cyber).
+    let delIds = Array.isArray(req.body?.deleted_ids) ? req.body.deleted_ids.map((x) => String(x)).filter((x) => UUID_RX.test(x)) : [];
+    delIds = [...new Set(delIds)];
+    if (delIds.length) {
+      const { error: delErr } = await supabaseAdmin
+        .from("pilotage_collaborators")
+        .delete()
+        .eq("company_id", me.company_id)
+        .eq("team_id", teamId)
+        .in("id", delIds);
+      if (delErr) {
+        log.error("❌ collaborators sync delete:", safeError(delErr));
+        return res.status(500).json({ error: "Erreur de synchronisation" });
+      }
+    }
+
+    return res.json({ ok: true, count: rows.length });
+  } catch (e) {
+    log.error("❌ /api/pilotage/collaborators/sync:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// =========================================================================
+// PILOTAGE — JOURNAL D'ÉQUIPE (modèle DOCUMENT : 1 entrée = 1 ligne JSONB)
+// Par équipe. Isolation : company_id + team_id forcés serveur + RLS.
+// =========================================================================
+app.get("/api/pilotage/journal", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.query.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+    const { data, error } = await supabaseAdmin
+      .from("pilotage_journal")
+      .select("id, data")
+      .eq("company_id", me.company_id)
+      .eq("team_id", teamId)
+      .order("created_at", { ascending: true });
+    if (error) {
+      log.error("❌ pilotage/journal GET:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture du journal" });
+    }
+    return res.json({ items: data || [] });
+  } catch (e) {
+    log.error("❌ /api/pilotage/journal GET:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.post("/api/pilotage/journal/sync", authenticateToken, async (req, res) => {
+  try {
+    const me = req.user;
+    const teamId = String(req.body?.team_id || "");
+    const team = await getAccessibleTeam(me, teamId);
+    if (!team) return res.status(404).json({ error: "Équipe introuvable ou non autorisée" });
+
+    const entries = Array.isArray(req.body?.entries) ? req.body.entries : null;
+    if (!entries) return res.status(400).json({ error: "Liste d'entrées invalide" });
+    if (entries.length > 5000) return res.status(400).json({ error: "Trop d'entrées" });
+    for (const e of entries) {
+      if (!e || typeof e !== "object" || !UUID_RX.test(String(e.id || ""))) {
+        return res.status(400).json({ error: "Identifiant d'entrée invalide" });
+      }
+      // Borne la taille de CHAQUE entrée (le maxlength HTML est seulement côté client).
+      // 32 ko : marge pour la fusion (suivis multi-comptes) + soft-delete.
+      if (JSON.stringify(e).length > 32768) {
+        return res.status(400).json({ error: "Entrée de journal trop volumineuse" });
+      }
+    }
+    const keepIds = entries.map((e) => String(e.id));
+
+    // Fusion multi-utilisateurs : version ACTUELLE de chaque entrée (pour fusionner au lieu d'écraser),
+    // ET 🔒 CYBER : aucun id du payload ne doit appartenir à une autre entreprise/équipe.
+    const existingById = new Map();   // id → data jsonb en base
+    if (keepIds.length) {
+      const { data: clash, error: clashErr } = await supabaseAdmin
+        .from("pilotage_journal")
+        .select("id, company_id, team_id, data")
+        .in("id", keepIds);
+      if (clashErr) {
+        log.error("❌ journal sync clash check:", safeError(clashErr));
+        return res.status(500).json({ error: "Erreur serveur" });
+      }
+      const hijack = (clash || []).some((r) => r.company_id !== me.company_id || r.team_id !== teamId);
+      if (hijack) return res.status(403).json({ error: "Conflit d'identifiants" });
+      for (const r of (clash || [])) existingById.set(String(r.id), r.data);
+    }
+
+    const rows = entries.map((e) => {
+      const prev = existingById.get(String(e.id));
+      // FUSION par id si l'entrée existe déjà → suivis ajoutés par d'autres comptes non écrasés.
+      const data = prev ? pilMergeJson(prev, e) : e;
+      return {
+        id: String(e.id),
+        company_id: me.company_id,   // forcé serveur
+        team_id: teamId,             // forcé serveur
+        data,
+        updated_at: new Date().toISOString(),
+      };
+    });
+
+    if (rows.length) {
+      const { error: upErr } = await supabaseAdmin
+        .from("pilotage_journal")
+        .upsert(rows, { onConflict: "id" });
+      if (upErr) {
+        log.error("❌ journal sync upsert:", safeError(upErr));
+        return res.status(500).json({ error: "Erreur d'enregistrement" });
+      }
+    }
+
+    // CONCURRENCE : suppressions EXPLICITES uniquement (deleted_ids), jamais "ce qui manque".
+    let delIds = Array.isArray(req.body?.deleted_ids) ? req.body.deleted_ids.map((x) => String(x)).filter((x) => UUID_RX.test(x)) : [];
+    delIds = [...new Set(delIds)];
+    if (delIds.length) {
+      const { error: delErr } = await supabaseAdmin
+        .from("pilotage_journal")
+        .delete()
+        .eq("company_id", me.company_id)
+        .eq("team_id", teamId)
+        .in("id", delIds);
+      if (delErr) {
+        log.error("❌ journal sync delete:", safeError(delErr));
+        return res.status(500).json({ error: "Erreur de synchronisation" });
+      }
+    }
+
+    return res.json({ ok: true, count: rows.length });
+  } catch (e) {
+    log.error("❌ /api/pilotage/journal/sync:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Créer une équipe ---
+app.post("/api/teams", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+    if (!me.company_id) {
+      return res.status(400).json({ error: "Aucune entreprise rattachée au compte", code: "NO_COMPANY" });
+    }
+
+    const name = String(req.body?.name || "").trim();
+    if (!name) return res.status(400).json({ error: "Le nom de l'équipe est requis" });
+    if (name.length > TEAM_NAME_MAX) {
+      return res.status(400).json({ error: `Nom trop long (${TEAM_NAME_MAX} caractères maximum)` });
+    }
+
+    // Pas deux équipes actives du même nom dans l'entreprise
+    const { data: existing, error: existErr } = await supabaseAdmin
+      .from("teams")
+      .select("id")
+      .eq("company_id", me.company_id)
+      .is("archived_at", null)
+      .ilike("name", name)
+      .maybeSingle();
+    if (existErr) {
+      log.error("❌ teams create check error:", safeError(existErr));
+      return res.status(500).json({ error: "Erreur serveur" });
+    }
+    if (existing) {
+      return res.status(409).json({ error: "Une équipe porte déjà ce nom", code: "NAME_TAKEN" });
+    }
+
+    const { data: team, error } = await supabaseAdmin
+      .from("teams")
+      .insert({
+        company_id: me.company_id,
+        name,
+        color: sanitizeTeamColor(req.body?.color),
+        created_by: me.id,
+      })
+      .select("id, name, color, created_at, archived_at")
+      .single();
+
+    if (error) {
+      log.error("❌ teams create error:", safeError(error));
+      return res.status(500).json({ error: "Erreur création de l'équipe" });
+    }
+    return res.json({ ok: true, team });
+  } catch (e) {
+    log.error("❌ /api/teams POST:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Renommer une équipe ---
+app.patch("/api/teams/:id", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+
+    const teamId = String(req.params.id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(teamId)) {
+      return res.status(400).json({ error: "Identifiant invalide" });
+    }
+    const name = String(req.body?.name || "").trim();
+    if (!name) return res.status(400).json({ error: "Le nom de l'équipe est requis" });
+    if (name.length > TEAM_NAME_MAX) {
+      return res.status(400).json({ error: `Nom trop long (${TEAM_NAME_MAX} caractères maximum)` });
+    }
+
+    // L'équipe doit appartenir à MON entreprise
+    const { data: team, error: tErr } = await supabaseAdmin
+      .from("teams")
+      .select("id, company_id")
+      .eq("id", teamId)
+      .maybeSingle();
+    if (tErr) return res.status(500).json({ error: "Erreur lecture de l'équipe" });
+    if (!team || team.company_id !== me.company_id) {
+      return res.status(404).json({ error: "Équipe introuvable dans votre entreprise" });
+    }
+
+    // Couleur = donnée partagée entreprise : on la met à jour si le client l'envoie.
+    const updatePatch = { name, updated_at: new Date().toISOString() };
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, "color")) {
+      updatePatch.color = sanitizeTeamColor(req.body.color);
+    }
+    const { data: updated, error } = await supabaseAdmin
+      .from("teams")
+      .update(updatePatch)
+      .eq("id", teamId)
+      .select("id, name, color, created_at, archived_at")
+      .single();
+    if (error) {
+      log.error("❌ teams rename error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lors du renommage" });
+    }
+    return res.json({ ok: true, team: updated });
+  } catch (e) {
+    log.error("❌ /api/teams PATCH:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Archiver une équipe (jamais de suppression brutale) ---
+app.post("/api/teams/:id/archive", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+
+    const teamId = String(req.params.id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(teamId)) {
+      return res.status(400).json({ error: "Identifiant invalide" });
+    }
+
+    const { data: team, error: tErr } = await supabaseAdmin
+      .from("teams")
+      .select("id, company_id, archived_at")
+      .eq("id", teamId)
+      .maybeSingle();
+    if (tErr) return res.status(500).json({ error: "Erreur lecture de l'équipe" });
+    if (!team || team.company_id !== me.company_id) {
+      return res.status(404).json({ error: "Équipe introuvable dans votre entreprise" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("teams")
+      .update({ archived_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq("id", teamId);
+    if (error) {
+      log.error("❌ teams archive error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lors de l'archivage" });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("❌ /api/teams archive:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Réactiver une équipe archivée (miroir de l'archivage) ---
+app.post("/api/teams/:id/restore", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+
+    const teamId = String(req.params.id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(teamId)) {
+      return res.status(400).json({ error: "Identifiant invalide" });
+    }
+
+    const { data: team, error: tErr } = await supabaseAdmin
+      .from("teams")
+      .select("id, company_id, archived_at")
+      .eq("id", teamId)
+      .maybeSingle();
+    if (tErr) return res.status(500).json({ error: "Erreur lecture de l'équipe" });
+    if (!team || team.company_id !== me.company_id) {
+      return res.status(404).json({ error: "Équipe introuvable dans votre entreprise" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("teams")
+      .update({ archived_at: null, updated_at: new Date().toISOString() })
+      .eq("id", teamId);
+    if (error) {
+      log.error("❌ teams restore error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lors de la réactivation" });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("❌ /api/teams restore:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Supprimer DÉFINITIVEMENT une équipe ARCHIVÉE (+ toutes ses données, en cascade) ---
+// Irréversible. company_id forcé. Les tables pilotage_* ont team_id ON DELETE CASCADE
+// → supprimer la ligne de l'équipe efface automatiquement tout son contenu.
+app.delete("/api/teams/:id", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+
+    const teamId = String(req.params.id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(teamId)) return res.status(400).json({ error: "Identifiant invalide" });
+
+    const { data: team, error: tErr } = await supabaseAdmin
+      .from("teams")
+      .select("id, company_id, archived_at")
+      .eq("id", teamId)
+      .maybeSingle();
+    if (tErr) return res.status(500).json({ error: "Erreur lecture de l'équipe" });
+    if (!team || team.company_id !== me.company_id) {
+      return res.status(404).json({ error: "Équipe introuvable dans votre entreprise" });
+    }
+    // Garde-fou : suppression définitive UNIQUEMENT sur une équipe déjà archivée (2 étapes).
+    if (!team.archived_at) {
+      return res.status(409).json({ error: "Archivez l'équipe avant de la supprimer définitivement", code: "NOT_ARCHIVED" });
+    }
+
+    // Retire d'abord les accès membres (au cas où team_members n'aurait pas ON DELETE CASCADE).
+    await supabaseAdmin.from("team_members").delete().eq("company_id", me.company_id).eq("team_id", teamId);
+
+    // Supprime l'équipe → cascade sur pilotage_* (collaborateurs, KPI, thermos, objectifs, annotations, journal).
+    const { error: delErr } = await supabaseAdmin
+      .from("teams")
+      .delete()
+      .eq("id", teamId)
+      .eq("company_id", me.company_id);   // double garde cyber
+    if (delErr) {
+      log.error("❌ teams delete-perm:", safeError(delErr));
+      return res.status(500).json({ error: "Erreur lors de la suppression" });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("❌ /api/teams DELETE:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Lister les membres d'une équipe ---
+app.get("/api/teams/:id/members", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+    const teamId = String(req.params.id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(teamId)) {
+      return res.status(400).json({ error: "Identifiant invalide" });
+    }
+
+    // L'équipe doit appartenir à MON entreprise
+    const { data: team, error: tErr } = await supabaseAdmin
+      .from("teams").select("id, company_id").eq("id", teamId).maybeSingle();
+    if (tErr) return res.status(500).json({ error: "Erreur lecture de l'équipe" });
+    if (!team || team.company_id !== me.company_id) {
+      return res.status(404).json({ error: "Équipe introuvable dans votre entreprise" });
+    }
+
+    const { data: links, error } = await supabaseAdmin
+      .from("team_members")
+      .select("user_id, created_at")
+      .eq("team_id", teamId)
+      .order("created_at", { ascending: true });
+    if (error) {
+      log.error("❌ team members list error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lecture des membres" });
+    }
+
+    // Compléter avec prénom/nom (profiles)
+    const userIds = (links || []).map((l) => l.user_id);
+    const profilesById = {};
+    if (userIds.length) {
+      const { data: profs } = await supabaseAdmin
+        .from("profiles").select("user_id, first_name, last_name").in("user_id", userIds);
+      (profs || []).forEach((p) => { profilesById[p.user_id] = p; });
+    }
+    const members = (links || []).map((l) => ({
+      user_id: l.user_id,
+      first_name: profilesById[l.user_id]?.first_name || null,
+      last_name: profilesById[l.user_id]?.last_name || null,
+    }));
+    return res.json({ members });
+  } catch (e) {
+    log.error("❌ /api/teams/:id/members GET:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Ajouter un membre à une équipe ---
+app.post("/api/teams/:id/members", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+    const teamId = String(req.params.id || "");
+    const targetId = String(req.body?.user_id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(teamId) || !/^[0-9a-f-]{36}$/i.test(targetId)) {
+      return res.status(400).json({ error: "Identifiant invalide" });
+    }
+
+    // L'équipe doit être à MON entreprise (et active)
+    const { data: team, error: tErr } = await supabaseAdmin
+      .from("teams").select("id, company_id, archived_at").eq("id", teamId).maybeSingle();
+    if (tErr) return res.status(500).json({ error: "Erreur lecture de l'équipe" });
+    if (!team || team.company_id !== me.company_id) {
+      return res.status(404).json({ error: "Équipe introuvable dans votre entreprise" });
+    }
+    if (team.archived_at) {
+      return res.status(409).json({ error: "Cette équipe est archivée" });
+    }
+
+    // La cible doit être un MEMBRE de MON entreprise
+    const { data: target, error: pErr } = await supabaseAdmin
+      .from("profiles").select("user_id, company_id, role").eq("user_id", targetId).maybeSingle();
+    if (pErr) return res.status(500).json({ error: "Erreur lecture du membre" });
+    if (!target || target.company_id !== me.company_id || target.role !== 'membre') {
+      return res.status(404).json({ error: "Membre introuvable dans votre entreprise" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("team_members")
+      .insert({ team_id: teamId, user_id: targetId, company_id: me.company_id, created_by: me.id });
+    if (error) {
+      // 23505 = déjà dans l'équipe (contrainte d'unicité) -> on considère OK
+      if (String(error.code) === "23505") {
+        return res.json({ ok: true, already: true });
+      }
+      log.error("❌ team member add error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lors de l'ajout à l'équipe" });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("❌ /api/teams/:id/members POST:", safeError(e));
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// --- Retirer un membre d'une équipe (supprime le lien d'accès, pas la personne) ---
+app.delete("/api/teams/:id/members/:userId", authenticateToken, async (req, res) => {
+  try {
+    const me = requireCompanyAdmin(req, res);
+    if (!me) return;
+    const teamId = String(req.params.id || "");
+    const targetId = String(req.params.userId || "");
+    if (!/^[0-9a-f-]{36}$/i.test(teamId) || !/^[0-9a-f-]{36}$/i.test(targetId)) {
+      return res.status(400).json({ error: "Identifiant invalide" });
+    }
+
+    // L'équipe doit être à MON entreprise
+    const { data: team, error: tErr } = await supabaseAdmin
+      .from("teams").select("id, company_id").eq("id", teamId).maybeSingle();
+    if (tErr) return res.status(500).json({ error: "Erreur lecture de l'équipe" });
+    if (!team || team.company_id !== me.company_id) {
+      return res.status(404).json({ error: "Équipe introuvable dans votre entreprise" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("team_members").delete().eq("team_id", teamId).eq("user_id", targetId);
+    if (error) {
+      log.error("❌ team member remove error:", safeError(error));
+      return res.status(500).json({ error: "Erreur lors du retrait de l'équipe" });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("❌ /api/teams/:id/members DELETE:", safeError(e));
     return res.status(500).json({ error: "Erreur serveur" });
   }
 });

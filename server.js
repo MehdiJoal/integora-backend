@@ -2169,6 +2169,18 @@ function logAdminAction({ targetUserId, adminEmail, action, detail, motif }) {
   }).then(() => { }).catch((e) => { log.warn('⚠️ admin_audit_log insert skipped:', e?.message); });
 }
 
+// Journal technique d'entreprise (actions équipe/accès) — métadonnées only, AUCUN contenu métier.
+//   acteur = compte INTEGORA ayant fait l'action (JAMAIS le collaborateur suivi). Best-effort (fire-and-forget).
+function logTechAction({ companyId, teamId, actorUserId, action }) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(companyId || ''))) return;
+  supabaseAdmin.from('pilotage_tech_log').insert({
+    company_id: companyId,
+    team_id: /^[0-9a-f-]{36}$/i.test(String(teamId || '')) ? teamId : null,
+    actor_user_id: /^[0-9a-f-]{36}$/i.test(String(actorUserId || '')) ? actorUserId : null,
+    action: String(action || '').slice(0, 64),
+  }).then(() => { }).catch((e) => { log.warn('⚠️ pilotage_tech_log insert skipped:', e?.message); });
+}
+
 
 
 // Fonctions utilitaires
@@ -4539,6 +4551,723 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
   } catch (e) {
     log.error('❌ /api/admin/users:', e?.message);
     return res.status(500).json({ ok: false, error: 'Erreur liste comptes' });
+  }
+});
+
+
+// ✅ [ADMIN] Liste des entreprises — vue multi-tenant, LECTURE SEULE.
+//    Résumé par entreprise : nom, taille (palier d'abonnement du propriétaire),
+//    nb de comptes, nb d'équipes, abonnement, dernière activité.
+//    Aucun contenu métier — uniquement structure + compteurs (RGPD).
+app.get('/api/admin/companies', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const [compsRes, profsRes, subsRes, teamsRes, actRes, tmRes, collabListRes] = await Promise.all([
+      supabaseAdmin.from('companies').select('id, owner_id, display_name, legal_name'),
+      supabaseAdmin.from('profiles').select('user_id, company_id, role, archived_at'),
+      supabaseAdmin.from('subscriptions').select('user_id, plan, status, tier, current_paid_tier, current_period_end, trial_end'),
+      supabaseAdmin.from('teams').select('id, company_id, archived_at'),
+      supabaseAdmin.from('v_admin_user_activity').select('user_id, last_seen'),
+      supabaseAdmin.from('team_members').select('user_id, team_id'),
+      supabaseAdmin.from('pilotage_collaborators').select('company_id, team_id'),
+    ]);
+    for (const r of [compsRes, profsRes, subsRes, teamsRes, actRes, tmRes, collabListRes]) if (r.error) throw r.error;
+
+    const subMap = new Map((subsRes.data || []).map((s) => [s.user_id, s]));
+    const actMap = new Map((actRes.data || []).map((a) => [a.user_id, a]));
+
+    // Comptes (non archivés) regroupés par entreprise
+    const accountsByCompany = new Map();   // company_id -> Set(user_id)
+    for (const p of (profsRes.data || [])) {
+      if (!p.company_id || p.archived_at) continue;
+      if (!accountsByCompany.has(p.company_id)) accountsByCompany.set(p.company_id, new Set());
+      accountsByCompany.get(p.company_id).add(p.user_id);
+    }
+    // Équipes actives par entreprise
+    const teamsByCompany = new Map();
+    for (const t of (teamsRes.data || [])) {
+      if (!t.company_id || t.archived_at) continue;
+      teamsByCompany.set(t.company_id, (teamsByCompany.get(t.company_id) || 0) + 1);
+    }
+
+    // --- Diagnostic léger par entreprise (Niveau 1 : OK / Attention / Bloquant) ---
+    const teamSetsByCompany = new Map();   // company_id -> { all:Set, archived:Set }
+    for (const t of (teamsRes.data || [])) {
+      if (!t.company_id) continue;
+      if (!teamSetsByCompany.has(t.company_id)) teamSetsByCompany.set(t.company_id, { all: new Set(), archived: new Set() });
+      const e = teamSetsByCompany.get(t.company_id);
+      e.all.add(t.id); if (t.archived_at) e.archived.add(t.id);
+    }
+    const tmByUser = new Map();             // user_id -> [team_id...]
+    for (const l of (tmRes.data || [])) {
+      if (!tmByUser.has(l.user_id)) tmByUser.set(l.user_id, []);
+      tmByUser.get(l.user_id).push(l.team_id);
+    }
+    const profsByCompany = new Map();
+    for (const p of (profsRes.data || [])) {
+      if (!p.company_id) continue;
+      if (!profsByCompany.has(p.company_id)) profsByCompany.set(p.company_id, []);
+      profsByCompany.get(p.company_id).push(p);
+    }
+    const collabByCompany = new Map();      // company_id -> [team_id...]
+    for (const c of (collabListRes.data || [])) {
+      if (!c.company_id) continue;
+      if (!collabByCompany.has(c.company_id)) collabByCompany.set(c.company_id, []);
+      collabByCompany.get(c.company_id).push(c.team_id);
+    }
+    function diagFor(companyId) {
+      const tinfo = teamSetsByCompany.get(companyId) || { all: new Set(), archived: new Set() };
+      let blocked = false, warn = false;
+      for (const p of (profsByCompany.get(companyId) || [])) {
+        const assigned = tmByUser.get(p.user_id) || [];
+        if (p.archived_at) { if (assigned.length) blocked = true; continue; }   // archivé avec accès résiduel
+        if ((p.role || 'membre') === 'membre') {
+          const act = assigned.filter(id => tinfo.all.has(id) && !tinfo.archived.has(id));
+          if (act.length === 0) warn = true;                                    // membre actif sans équipe
+        }
+      }
+      for (const tid of (collabByCompany.get(companyId) || [])) {
+        if (!tid || !tinfo.all.has(tid) || tinfo.archived.has(tid)) blocked = true;   // donnée orpheline / équipe archivée
+      }
+      return blocked ? 'blocked' : (warn ? 'warn' : 'ok');
+    }
+
+    const companies = (compsRes.data || []).map((c) => {
+      const ids = accountsByCompany.get(c.id) || new Set();
+      if (c.owner_id) ids.add(c.owner_id);          // le propriétaire compte toujours
+      const ownerSub = subMap.get(c.owner_id) || {};
+      let lastActivity = null;
+      for (const id of ids) {
+        const ls = (actMap.get(id) || {}).last_seen;
+        if (ls && (!lastActivity || ls > lastActivity)) lastActivity = ls;
+      }
+      return {
+        id: c.id,
+        name: c.display_name || c.legal_name || '—',
+        size: ownerSub.current_paid_tier || ownerSub.tier || null,
+        accounts: ids.size,
+        teams: teamsByCompany.get(c.id) || 0,
+        plan: ownerSub.plan || null,
+        status: ownerSub.status || null,
+        current_period_end: ownerSub.current_period_end || null,
+        trial_end: ownerSub.trial_end || null,
+        last_activity: lastActivity,
+        diagnostic: diagFor(c.id),
+      };
+    }).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+    return res.json({ ok: true, companies });
+  } catch (e) {
+    log.error('❌ /api/admin/companies:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur liste entreprises' });
+  }
+});
+
+
+// ✅ [ADMIN] Fiche détaillée d'une entreprise — LECTURE SEULE.
+//    Comptes (propriétaire + membres + état), équipes, abonnement, et INDICATEURS
+//    DE SANTÉ (compteurs uniquement, jamais le contenu métier — RGPD).
+app.get('/api/admin/companies/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const companyId = String(req.params.id || '');
+    if (!/^[0-9a-f-]{36}$/i.test(companyId)) {
+      return res.status(400).json({ ok: false, error: 'Identifiant entreprise invalide' });
+    }
+
+    // 1) L'entreprise
+    const { data: company, error: cErr } = await supabaseAdmin
+      .from('companies').select('id, owner_id, display_name, legal_name, created_at')
+      .eq('id', companyId).maybeSingle();
+    if (cErr) throw cErr;
+    if (!company) return res.status(404).json({ ok: false, error: 'Entreprise introuvable' });
+
+    // 2) Comptes rattachés (profiles) + le propriétaire
+    const { data: profs, error: pErr } = await supabaseAdmin
+      .from('profiles').select('user_id, first_name, last_name, role, phone, archived_at')
+      .eq('company_id', companyId);
+    if (pErr) throw pErr;
+    const idSet = new Set((profs || []).filter(p => !p.archived_at).map(p => p.user_id));
+    if (company.owner_id) idSet.add(company.owner_id);
+    const idList = Array.from(idSet);
+    const SAFE = idList.length ? idList : ['00000000-0000-0000-0000-000000000000'];
+
+    // 3) Données liées (parallèle) : emails, abos, activité, 2FA, équipes, membres + santé pilotage
+    const [usersList, subsRes, actRes, mfaRes, teamsRes, tmRes,
+           collabRes, kpiRes, journalRes, thermoRes, goalsRes, auditRes, techRes] = await Promise.all([
+      supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 }),
+      supabaseAdmin.from('subscriptions').select('user_id, plan, status, tier, current_paid_tier, current_period_end, trial_end, cancel_at, stripe_subscription_id, access_locked, access_locked_reason').in('user_id', SAFE),
+      supabaseAdmin.from('v_admin_user_activity').select('user_id, last_seen').in('user_id', SAFE),
+      supabaseAdmin.from('user_mfa').select('user_id, enabled').in('user_id', SAFE),
+      supabaseAdmin.from('teams').select('id, name, archived_at').eq('company_id', companyId),
+      supabaseAdmin.from('team_members').select('team_id, user_id').eq('company_id', companyId),
+      supabaseAdmin.from('pilotage_collaborators').select('team_id, data, updated_at').eq('company_id', companyId),
+      supabaseAdmin.from('pilotage_monthly_kpis').select('team_id').eq('company_id', companyId),
+      supabaseAdmin.from('pilotage_journal').select('team_id, data').eq('company_id', companyId),
+      supabaseAdmin.from('pilotage_thermometres').select('team_id').eq('company_id', companyId),
+      supabaseAdmin.from('pilotage_goals').select('team_id').eq('company_id', companyId),
+      supabaseAdmin.from('admin_audit_log').select('action, admin_email, created_at').in('target_user_id', SAFE).order('created_at', { ascending: false }).limit(50),
+      supabaseAdmin.from('pilotage_tech_log').select('team_id, actor_user_id, action, created_at').eq('company_id', companyId).order('created_at', { ascending: false }).limit(50),
+    ]);
+    if (usersList.error) throw usersList.error;
+    for (const r of [subsRes, actRes, mfaRes, teamsRes, tmRes, collabRes, kpiRes, journalRes, thermoRes, goalsRes]) {
+      if (r.error) throw r.error;
+    }
+
+    const emailById = new Map((usersList.data?.users || []).map(u => [u.id, u.email]));
+    const initById  = new Map((usersList.data?.users || []).map(u => [u.id, !!u.user_metadata?.password_initialized]));
+    const subById   = new Map((subsRes.data || []).map(s => [s.user_id, s]));
+    const seenById  = new Map((actRes.data  || []).map(a => [a.user_id, a.last_seen]));
+    const mfaById   = new Map((mfaRes.data  || []).map(m => [m.user_id, !!m.enabled]));
+    const profById  = new Map((profs || []).map(p => [p.user_id, p]));
+
+    // Comptes : propriétaire en tête, puis membres
+    const accounts = idList.map((uid) => {
+      const p = profById.get(uid) || {};
+      const s = subById.get(uid) || {};
+      const suspended = s.access_locked === true && String(s.access_locked_reason || '').toLowerCase() === 'admin_suspended';
+      return {
+        user_id: uid,
+        email: emailById.get(uid) || null,
+        first_name: p.first_name || null,
+        last_name: p.last_name || null,
+        role: (uid === company.owner_id) ? 'propriétaire' : (p.role || 'membre'),
+        is_owner: uid === company.owner_id,
+        suspended,
+        twofa: mfaById.get(uid) || false,
+        last_seen: seenById.get(uid) || null,
+      };
+    }).sort((a, b) => Number(b.is_owner) - Number(a.is_owner) || String(a.email || '').localeCompare(String(b.email || '')));
+
+    // Équipes actives + nb de membres (actifs) + index des accès par utilisateur
+    const teamsByUser = new Map();                 // user_id -> [team_id...]
+    const membersByTeam = new Map();
+    for (const tm of (tmRes.data || [])) {
+      if (!teamsByUser.has(tm.user_id)) teamsByUser.set(tm.user_id, []);
+      teamsByUser.get(tm.user_id).push(tm.team_id);
+      if (idSet.has(tm.user_id)) membersByTeam.set(tm.team_id, (membersByTeam.get(tm.team_id) || 0) + 1);
+    }
+    const teamMeta = new Map((teamsRes.data || []).map(t => [t.id, { name: t.name || '—', archived: !!t.archived_at }]));
+    const activeTeamCount = (teamsRes.data || []).filter(t => !t.archived_at).length;
+    const teams = (teamsRes.data || []).filter(t => !t.archived_at).map(t => ({
+      id: t.id, name: t.name || '—', members: membersByTeam.get(t.id) || 0,
+    })).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+    // --- DIAGNOSTIC Bloc 1 : accès aux équipes (état OK / Attention / Bloqué) ---
+    function accessRow(uid, email, name, role, isOwner, archived, suspended) {
+      const assigned = teamsByUser.get(uid) || [];
+      const issues = []; let state = 'ok'; let teamNames = [], teamIds = [];
+      const isAdmin = isOwner || role === 'admin' || role === 'propriétaire';
+      if (!isAdmin) {
+        const act = assigned.filter(id => teamMeta.get(id) && !teamMeta.get(id).archived);
+        const arch = assigned.filter(id => teamMeta.get(id) && teamMeta.get(id).archived);
+        const unknown = assigned.filter(id => !teamMeta.get(id));
+        teamNames = act.map(id => teamMeta.get(id).name);
+        teamIds = act;
+        if (archived) {
+          if (assigned.length) { issues.push('Membre archivé avec accès résiduel'); state = 'blocked'; }
+        } else {
+          if (assigned.length === 0) { issues.push('Aucune équipe attribuée'); state = 'warn'; }
+          if (arch.length) { issues.push(arch.length + ' équipe(s) archivée(s) attribuée(s)'); if (state !== 'blocked') state = 'warn'; }
+          if (unknown.length) { issues.push('Accès à une équipe inexistante'); state = 'blocked'; }
+          // Accès complet VOLONTAIRE (toutes les équipes attribuées explicitement) = normal → OK + détail discret.
+          else if (activeTeamCount > 1 && act.length === activeTeamCount && !arch.length) { issues.push('Toutes les équipes attribuées'); }
+        }
+      }
+      return { user_id: uid, email, name, role, is_owner: isOwner, archived: !!archived, suspended: !!suspended,
+               all_teams: isAdmin, teams: teamNames, team_ids: teamIds,
+               invited: !isAdmin && !archived && !initById.get(uid),
+               state, issues };
+    }
+    const teamAccess = [];
+    for (const a of accounts) {
+      teamAccess.push(accessRow(a.user_id, a.email, [a.first_name, a.last_name].filter(Boolean).join(' '), a.role, a.is_owner, false, a.suspended));
+    }
+    for (const p of (profs || [])) {                 // archivés : visibles pour réactivation (accès résiduel = anomalie séparée)
+      if (!p.archived_at) continue;
+      teamAccess.push(accessRow(p.user_id, emailById.get(p.user_id) || null, [p.first_name, p.last_name].filter(Boolean).join(' '), p.role || 'membre', false, true, false));
+    }
+
+    // INDICATEURS DE SANTÉ PAR ÉQUIPE (Bloc 2) — on parcourt le jsonb pour COMPTER, jamais pour exposer
+    const ACTIVE_ETATS = new Set(['ouvert', 'echange_prevu', 'a_faire', 'en_cours']);
+    function blankHealth() {
+      return { collaborators: 0, topics: 0, topics_done: 0, active_topics: 0, planned_exchanges: 0,
+               journal_entries: 0, kpi_months: 0, thermometres: 0, goals: 0, last_activity: null };
+    }
+    const byTeam = new Map();   // team_id -> compteurs
+    function bucket(teamId) { if (!byTeam.has(teamId)) byTeam.set(teamId, blankHealth()); return byTeam.get(teamId); }
+
+    for (const row of (collabRes.data || [])) {
+      const h = bucket(row.team_id);
+      h.collaborators += 1;
+      const tps = (row.data && Array.isArray(row.data.topics)) ? row.data.topics : [];
+      for (const t of tps) {
+        h.topics += 1;
+        const e = t.etat || '';
+        if (e === 'traite' || e === 'fait') h.topics_done += 1;
+        if (ACTIVE_ETATS.has(e)) h.active_topics += 1;
+        if (e === 'echange_prevu') h.planned_exchanges += 1;
+      }
+      if (row.updated_at && (!h.last_activity || row.updated_at > h.last_activity)) h.last_activity = row.updated_at;
+    }
+    for (const row of (journalRes.data || [])) {
+      const d = row.data || {};
+      const arr = Array.isArray(d.entries) ? d.entries : (Array.isArray(d) ? d : []);
+      bucket(row.team_id).journal_entries += arr.length;
+    }
+    for (const row of (kpiRes.data || [])) bucket(row.team_id).kpi_months += 1;
+    for (const row of (thermoRes.data || [])) bucket(row.team_id).thermometres += 1;
+    for (const row of (goalsRes.data || [])) bucket(row.team_id).goals += 1;
+
+    // Santé par équipe ACTIVE (nom résolu)
+    const teamHealth = (teamsRes.data || []).filter(t => !t.archived_at).map(t => {
+      const h = byTeam.get(t.id) || blankHealth();
+      return Object.assign({ team_id: t.id, name: t.name || '—' }, h);
+    }).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+    // Santé GLOBALE = somme de toutes les équipes (y compris orphelines)
+    let topics = 0, topicsDone = 0, journalEntries = 0, kpiMonths = 0, thermoCount = 0, goalsCount = 0, lastSync = null;
+    for (const h of byTeam.values()) {
+      topics += h.topics; topicsDone += h.topics_done;
+      journalEntries += h.journal_entries; kpiMonths += h.kpi_months;
+      thermoCount += h.thermometres; goalsCount += h.goals;
+      if (h.last_activity && (!lastSync || h.last_activity > lastSync)) lastSync = h.last_activity;
+    }
+
+    // --- DIAGNOSTIC Bloc 3 : anomalies détectées (titre + description + action) ---
+    let dataArchivedTeam = 0, dataUnknownTeam = 0, dataNoTeam = 0, topicsNoCreated = 0;
+    for (const row of (collabRes.data || [])) {
+      const tid = row.team_id;
+      if (!tid) dataNoTeam += 1;
+      else if (!teamMeta.has(tid)) dataUnknownTeam += 1;
+      else if (teamMeta.get(tid).archived) dataArchivedTeam += 1;
+      const tps = (row.data && Array.isArray(row.data.topics)) ? row.data.topics : [];
+      for (const t of tps) if (!t.createdAt && !t.created_at) topicsNoCreated += 1;
+    }
+    const anomalies = [];
+    const A = (level, title, detail, hint) => anomalies.push({ level, title, detail, hint: hint || null });
+
+    for (const a of accounts) {
+      if (a.is_owner || a.role === 'admin' || a.role === 'propriétaire' || a.suspended) continue;
+      const act = (teamsByUser.get(a.user_id) || []).filter(id => teamMeta.get(id) && !teamMeta.get(id).archived);
+      if (act.length === 0) {
+        A('warn', 'Membre sans équipe attribuée',
+          (a.email || 'Ce membre') + " est actif mais n'est rattaché à aucune équipe : il ne voit aucun tableau de pilotage.",
+          'Lui attribuer au moins une équipe (Comptes › Gérer les accès).');
+      }
+    }
+    for (const p of (profs || [])) {
+      if (!p.archived_at || !(teamsByUser.get(p.user_id) || []).length) continue;
+      A('blocked', "Accès résiduel d'un membre archivé",
+        (emailById.get(p.user_id) || 'Un membre archivé') + " a été archivé (accès retiré) mais figure encore dans des accès d'équipe.",
+        'Retirer ses accès équipe pour finaliser le retrait.');
+    }
+    for (const t of (teamsRes.data || []).filter(t => !t.archived_at)) {
+      if (!(membersByTeam.get(t.id) || 0)) {
+        A('info', 'Équipe sans membre',
+          'L’équipe « ' + (t.name || '—') + ' » n’a aucun membre attribué (seul l’admin la voit).',
+          'Normal si gérée par l’admin seul ; sinon attribuer des membres.');
+      }
+    }
+    for (const t of teamHealth) {
+      const tot = t.collaborators + t.journal_entries + t.topics + t.kpi_months + t.thermometres + t.goals;
+      if (!tot) {
+        A('info', 'Équipe sans données de pilotage',
+          'L’équipe « ' + t.name + ' » ne contient aucune donnée (ni suivi, ni KPI, ni journal).',
+          'Équipe récente ou non utilisée — pas forcément un bug.');
+      }
+    }
+    if (dataArchivedTeam) {
+      A('blocked', 'Données sur une équipe archivée',
+        dataArchivedTeam + ' donnée(s) de pilotage sont rattachées à une équipe archivée : elles n’apparaissent plus dans l’application.',
+        'Restaurer l’équipe, ou réaffecter / supprimer ces données.');
+    }
+    if (dataUnknownTeam || dataNoTeam) {
+      A('blocked', 'Données orphelines',
+        (dataUnknownTeam + dataNoTeam) + ' donnée(s) pointent vers une équipe inexistante ou sans identifiant d’équipe (team_id).',
+        'Incohérence à investiguer (suppression d’équipe, migration).');
+    }
+    if (topicsNoCreated) {
+      A('info', 'Suivis sans date de création',
+        topicsNoCreated + ' suivi(s) n’ont pas de date de création enregistrée.',
+        'Donnée probablement ancienne — sans impact visible.');
+    }
+    const _ord = { blocked: 0, warn: 1, info: 2 };
+    anomalies.sort((x, y) => (_ord[x.level] != null ? _ord[x.level] : 9) - (_ord[y.level] != null ? _ord[y.level] : 9));
+
+    // --- DIAGNOSTIC Bloc 4 : dernières actions techniques (métadonnées only, AUCUN nom ni contenu) ---
+    const EV_LABELS = { created: 'Suivi créé', status_changed: 'Statut modifié', updated: 'Suivi modifié',
+      point_traite: 'Point traité', point_rouvert: 'Point rouvert', point_fait: 'Suivi terminé', suivi_demarre: 'Suivi démarré' };
+    const ST_LABELS = { open: 'Ouvert', treated: 'Traité', planned_next_step: 'Prévu', archived: 'Archivé' };
+    const ADMIN_LABELS = { update_profile: 'Profil modifié', change_email: 'Email changé', send_password_reset: 'Réinitialisation mot de passe',
+      grant_subscription: 'Abonnement accordé', close_subscription: 'Abonnement clôturé', reactivate_renewal: 'Renouvellement réactivé',
+      reactivate_subscription: 'Accès réactivé', suspend: 'Compte suspendu', reactivate: 'Compte réactivé', export_rgpd: 'Export RGPD',
+      team_access_set: 'Accès équipe modifié', member_removed: 'Accès retiré', member_reactivated: 'Membre réactivé',
+      invite_resent: 'Invitation renvoyée', member_invited: 'Membre invité', team_renamed: 'Équipe renommée' };
+    const actions = [];
+    for (const row of (collabRes.data || [])) {
+      const teamName = (teamMeta.get(row.team_id) || {}).name || null;
+      const tps = (row.data && Array.isArray(row.data.topics)) ? row.data.topics : [];
+      for (const t of tps) {
+        const evs = Array.isArray(t.events) ? t.events : [];
+        for (const ev of evs) {
+          const when = ev.createdAt || ev.date || ev.at || null;
+          if (!when) continue;
+          actions.push({
+            when,
+            type: EV_LABELS[ev.type] || 'Action de suivi',
+            zone: 'Suivis individuels',
+            team: teamName,
+            source: 'Pilotage',
+            // Auteur = compte INTEGORA ayant fait l'action (createdBy). JAMAIS le collaborateur suivi.
+            author: (ev.createdBy && ev.createdBy !== 'Vous') ? ev.createdBy : null,
+            status: ev.newStatus ? (ST_LABELS[ev.newStatus] || null) : null,
+          });
+        }
+      }
+    }
+    for (const row of ((auditRes && auditRes.data) || [])) {
+      actions.push({
+        when: row.created_at, type: ADMIN_LABELS[row.action] || row.action || 'Action admin',
+        zone: 'Administration', team: null, source: 'Admin', author: row.admin_email || null, status: null,
+      });
+    }
+    // Journal technique d'entreprise (actions équipe/accès) — acteur = compte INTEGORA, jamais le collaborateur.
+    const TECH_LABELS = { team_invite: 'Invitation envoyée', team_access_set: 'Accès équipe modifié',
+      member_removed: 'Accès retiré', member_reactivated: 'Membre réactivé', team_renamed: 'Équipe renommée' };
+    for (const row of ((techRes && techRes.data) || [])) {
+      const p = profById.get(row.actor_user_id);
+      const name = p ? [p.first_name, p.last_name].filter(Boolean).join(' ') : null;
+      actions.push({
+        when: row.created_at,
+        type: TECH_LABELS[row.action] || row.action || 'Action technique',
+        zone: 'Équipes & accès',
+        team: row.team_id ? ((teamMeta.get(row.team_id) || {}).name || null) : null,
+        source: 'Équipe',
+        author: name || emailById.get(row.actor_user_id) || null,
+        status: null,
+      });
+    }
+    actions.sort((a, b) => String(b.when).localeCompare(String(a.when)));
+    const recentActions = actions.slice(0, 40);
+
+    const ownerSub = subById.get(company.owner_id) || {};
+    return res.json({
+      ok: true,
+      company: {
+        id: company.id,
+        name: company.display_name || company.legal_name || '—',
+        legal_name: company.legal_name || null,
+        created_at: company.created_at || null,
+        size: ownerSub.current_paid_tier || ownerSub.tier || null,
+        plan: ownerSub.plan || null,
+        status: ownerSub.status || null,
+        current_period_end: ownerSub.current_period_end || null,
+        trial_end: ownerSub.trial_end || null,
+        has_stripe: !!ownerSub.stripe_subscription_id,
+      },
+      accounts,
+      teams,
+      team_access: teamAccess,
+      team_health: teamHealth,
+      anomalies,
+      actions: recentActions,
+      health: {
+        collaborators: (collabRes.data || []).length,
+        topics, topics_done: topicsDone,
+        kpi_months: kpiMonths,
+        journal_entries: journalEntries,
+        thermometres: thermoCount,
+        goals: goalsCount,
+        last_sync: lastSync,
+      },
+    });
+  } catch (e) {
+    log.error('❌ /api/admin/companies/:id:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur fiche entreprise' });
+  }
+});
+
+
+// ✅ [ADMIN] Gérer les accès équipe d'un membre d'une entreprise (override admin, inter-tenant).
+//    requireAdmin + requireCsrf. Le serveur VALIDE que le membre ET les équipes appartiennent
+//    bien à l'entreprise :id (zéro accès croisé). Action tracée (admin_audit_log).
+app.post('/api/admin/companies/:id/member-teams', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const companyId = String(req.params.id || '');
+    if (!/^[0-9a-f-]{36}$/i.test(companyId)) return res.status(400).json({ ok: false, error: 'Entreprise invalide' });
+    const userId = String(req.body?.user_id || '');
+    if (!/^[0-9a-f-]{36}$/i.test(userId)) return res.status(400).json({ ok: false, error: 'Membre invalide' });
+    let teamIds = Array.isArray(req.body?.team_ids) ? req.body.team_ids.map((x) => String(x)) : null;
+    if (!teamIds) return res.status(400).json({ ok: false, error: "Liste d'équipes invalide" });
+    teamIds = [...new Set(teamIds)];
+    for (const tid of teamIds) if (!/^[0-9a-f-]{36}$/i.test(tid)) return res.status(400).json({ ok: false, error: 'Équipe invalide' });
+
+    // Le membre doit appartenir à CETTE entreprise et être de rôle 'membre'
+    const { data: target, error: tErr } = await supabaseAdmin
+      .from('profiles').select('user_id, company_id, role').eq('user_id', userId).maybeSingle();
+    if (tErr) throw tErr;
+    if (!target || target.company_id !== companyId || String(target.role || '').toLowerCase() !== 'membre') {
+      return res.status(404).json({ ok: false, error: 'Membre introuvable dans cette entreprise' });
+    }
+
+    // Toutes les équipes demandées doivent appartenir à CETTE entreprise (et être actives)
+    if (teamIds.length) {
+      const { data: validTeams, error: vErr } = await supabaseAdmin
+        .from('teams').select('id').eq('company_id', companyId).is('archived_at', null).in('id', teamIds);
+      if (vErr) throw vErr;
+      const validSet = new Set((validTeams || []).map((t) => t.id));
+      if (teamIds.some((t) => !validSet.has(t))) {
+        return res.status(400).json({ ok: false, error: "Une équipe n'appartient pas à cette entreprise (ou est archivée)" });
+      }
+    }
+
+    // Réconciliation (scopée company + user) : on ajoute le manquant, on retire le surplus
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from('team_members').select('team_id').eq('company_id', companyId).eq('user_id', userId);
+    if (exErr) throw exErr;
+    const existingSet = new Set((existing || []).map((r) => r.team_id));
+    const toAdd = teamIds.filter((t) => !existingSet.has(t));
+    const toRemove = [...existingSet].filter((t) => !teamIds.includes(t));
+
+    if (toAdd.length) {
+      const rows = toAdd.map((t) => ({ team_id: t, user_id: userId, company_id: companyId, created_by: req.user.id }));
+      const { error: insErr } = await supabaseAdmin.from('team_members').insert(rows);
+      if (insErr) throw insErr;
+    }
+    if (toRemove.length) {
+      const { error: delErr } = await supabaseAdmin
+        .from('team_members').delete().eq('company_id', companyId).eq('user_id', userId).in('team_id', toRemove);
+      if (delErr) throw delErr;
+    }
+
+    if (toAdd.length || toRemove.length) {
+      logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'team_access_set',
+        detail: 'Accès équipe modifié (admin) — +' + toAdd.length + ' / -' + toRemove.length });
+    }
+    return res.json({ ok: true, teams: teamIds });
+  } catch (e) {
+    log.error('❌ /api/admin/companies/:id/member-teams:', e?.message);
+    return res.status(500).json({ ok: false, error: "Erreur lors de la mise à jour des accès" });
+  }
+});
+
+
+// ✅ [ADMIN] Retirer un membre (archiver) d'une entreprise — coupe sessions + accès équipe.
+app.post('/api/admin/companies/:id/members/:userId/remove', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const companyId = String(req.params.id || '');
+    const userId = String(req.params.userId || '');
+    if (!/^[0-9a-f-]{36}$/i.test(companyId) || !/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'Identifiant invalide' });
+    }
+    const { data: target, error: tErr } = await supabaseAdmin
+      .from('profiles').select('user_id, company_id, role, archived_at').eq('user_id', userId).maybeSingle();
+    if (tErr) throw tErr;
+    if (!target || target.company_id !== companyId || target.role !== 'membre') {
+      return res.status(404).json({ ok: false, error: 'Membre introuvable dans cette entreprise' });
+    }
+    if (target.archived_at) return res.json({ ok: true, already: true });
+
+    const nowIso = new Date().toISOString();
+    const { error: archErr } = await supabaseAdmin
+      .from('profiles').update({ archived_at: nowIso, updated_at: nowIso }).eq('user_id', userId);
+    if (archErr) throw archErr;
+    await supabaseAdmin.from('token_sessions').update({ is_active: false, revoked_at: nowIso }).eq('user_id', userId).eq('is_active', true);
+    await supabaseAdmin.from('team_members').delete().eq('user_id', userId);
+
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'member_removed', detail: 'Accès membre retiré (archivé) — admin' });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error('❌ admin member remove:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur lors du retrait' });
+  }
+});
+
+// ✅ [ADMIN] Réactiver un membre archivé d'une entreprise (respecte la limite de membres actifs).
+app.post('/api/admin/companies/:id/members/:userId/reactivate', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const companyId = String(req.params.id || '');
+    const userId = String(req.params.userId || '');
+    if (!/^[0-9a-f-]{36}$/i.test(companyId) || !/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'Identifiant invalide' });
+    }
+    const { data: target, error: tErr } = await supabaseAdmin
+      .from('profiles').select('user_id, company_id, role, archived_at').eq('user_id', userId).maybeSingle();
+    if (tErr) throw tErr;
+    if (!target || target.company_id !== companyId || target.role !== 'membre') {
+      return res.status(404).json({ ok: false, error: 'Membre introuvable dans cette entreprise' });
+    }
+    if (!target.archived_at) return res.json({ ok: true, already: true });
+
+    const { count: activeCount, error: cErr } = await supabaseAdmin
+      .from('profiles').select('user_id', { count: 'exact', head: true })
+      .eq('company_id', companyId).eq('role', 'membre').is('archived_at', null);
+    if (cErr) throw cErr;
+    if ((activeCount || 0) >= MAX_TEAM_MEMBERS) {
+      return res.status(409).json({ ok: false, error: `Limite atteinte (${MAX_TEAM_MEMBERS} membres actifs). Retirez d'abord un membre actif.` });
+    }
+    const { error: updErr } = await supabaseAdmin
+      .from('profiles').update({ archived_at: null, updated_at: new Date().toISOString() }).eq('user_id', userId);
+    if (updErr) throw updErr;
+
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'member_reactivated', detail: 'Membre réactivé — admin' });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error('❌ admin member reactivate:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur lors de la réactivation' });
+  }
+});
+
+// ✅ [ADMIN] Renvoyer une invitation à un membre (compte créé mais mot de passe non encore défini).
+app.post('/api/admin/companies/:id/members/:userId/resend-invite', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const companyId = String(req.params.id || '');
+    const userId = String(req.params.userId || '');
+    if (!/^[0-9a-f-]{36}$/i.test(companyId) || !/^[0-9a-f-]{36}$/i.test(userId)) {
+      return res.status(400).json({ ok: false, error: 'Identifiant invalide' });
+    }
+    const { data: target, error: tErr } = await supabaseAdmin
+      .from('profiles').select('user_id, company_id, role, archived_at, first_name').eq('user_id', userId).maybeSingle();
+    if (tErr) throw tErr;
+    if (!target || target.company_id !== companyId || target.role !== 'membre') {
+      return res.status(404).json({ ok: false, error: 'Membre introuvable dans cette entreprise' });
+    }
+    if (target.archived_at) return res.status(400).json({ ok: false, error: "Membre archivé — réactivez-le d'abord" });
+
+    const { data: au, error: auErr } = await supabaseAdmin.auth.admin.getUserById(userId);
+    if (auErr || !au?.user?.email) return res.status(404).json({ ok: false, error: 'Compte introuvable' });
+    const email = au.user.email;
+    if (au.user.user_metadata?.password_initialized) {
+      return res.status(400).json({ ok: false, error: 'Ce membre a déjà activé son compte (aucune invitation à renvoyer)' });
+    }
+
+    const FRONT = process.env.FRONTEND_URL || (IS_PROD ? 'https://integora.fr' : 'http://localhost:3000');
+    const { data: linkData, error: linkErr } = await supabaseAdmin.auth.admin.generateLink({
+      type: 'recovery', email, options: { redirectTo: `${FRONT}/create-password.html` },
+    });
+    if (linkErr || !linkData?.properties?.action_link) {
+      log.error('❌ admin resend-invite generateLink:', safeError(linkErr));
+      return res.status(500).json({ ok: false, error: 'Erreur lors de la génération du lien' });
+    }
+    const link = linkData.properties.action_link;
+    const prenom = target.first_name ? ' ' + escapeHtml(target.first_name) : '';
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#1a1a1a;font-size:15px;line-height:1.6;">
+        <h2 style="font-size:18px;margin:0 0 12px;">Votre accès INTEGORA</h2>
+        <p>Bonjour${prenom}, vous avez été invité(e) à rejoindre INTEGORA. Cliquez ci-dessous pour créer votre mot de passe et activer votre accès.</p>
+        <p style="margin:22px 0;"><a href="${link}" style="display:inline-block;background:#4a90e2;color:#fff;text-decoration:none;padding:12px 26px;border-radius:8px;font-weight:700;">Créer mon mot de passe</a></p>
+        <p style="font-size:12px;color:#64748b;">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br>${link}</p>
+      </div>`;
+    await sendResendEmail({ to: email, subject: 'Votre accès INTEGORA — créez votre mot de passe', html });
+
+    logAdminAction({ targetUserId: userId, adminEmail: req.user?.email, action: 'invite_resent', detail: 'Invitation renvoyée (admin)' });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error('❌ admin resend-invite:', e?.message);
+    return res.status(500).json({ ok: false, error: "Erreur lors du renvoi de l'invitation" });
+  }
+});
+
+// ✅ [ADMIN] Inviter un nouveau membre dans une entreprise (crée le compte + email d'invitation Supabase).
+app.post('/api/admin/companies/:id/invite', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const companyId = String(req.params.id || '');
+    if (!/^[0-9a-f-]{36}$/i.test(companyId)) return res.status(400).json({ ok: false, error: 'Entreprise invalide' });
+
+    const { data: company, error: cErr } = await supabaseAdmin
+      .from('companies').select('id, display_name, legal_name').eq('id', companyId).maybeSingle();
+    if (cErr) throw cErr;
+    if (!company) return res.status(404).json({ ok: false, error: 'Entreprise introuvable' });
+
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ ok: false, error: 'Email invalide' });
+    const firstName = String(req.body?.first_name || '').trim().slice(0, 50) || null;
+    const lastName = String(req.body?.last_name || '').trim().slice(0, 50) || null;
+    let teamIds = Array.isArray(req.body?.team_ids) ? [...new Set(req.body.team_ids.map((x) => String(x)))] : [];
+    for (const tid of teamIds) if (!/^[0-9a-f-]{36}$/i.test(tid)) return res.status(400).json({ ok: false, error: 'Équipe invalide' });
+
+    // Limite de membres actifs (comme côté client)
+    const { count: activeCount, error: cntErr } = await supabaseAdmin
+      .from('profiles').select('user_id', { count: 'exact', head: true })
+      .eq('company_id', companyId).eq('role', 'membre').is('archived_at', null);
+    if (cntErr) throw cntErr;
+    if ((activeCount || 0) >= MAX_TEAM_MEMBERS) {
+      return res.status(409).json({ ok: false, error: `Limite atteinte (${MAX_TEAM_MEMBERS} membres actifs).` });
+    }
+
+    // Équipes ciblées : doivent appartenir à CETTE entreprise (actives)
+    if (teamIds.length) {
+      const { data: vt, error: vErr } = await supabaseAdmin
+        .from('teams').select('id').eq('company_id', companyId).is('archived_at', null).in('id', teamIds);
+      if (vErr) throw vErr;
+      const vset = new Set((vt || []).map((t) => t.id));
+      if (teamIds.some((t) => !vset.has(t))) return res.status(400).json({ ok: false, error: "Une équipe n'appartient pas à cette entreprise" });
+    }
+
+    const FRONT = process.env.FRONTEND_URL || (IS_PROD ? 'https://integora.fr' : 'http://localhost:3000');
+    const companyName = company.display_name || company.legal_name || '';
+    const { data: inviteData, error: inviteErr } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+      redirectTo: `${FRONT}/create-password.html`,
+      data: { first_name: firstName, last_name: lastName, company_name: companyName, role: 'membre', company_id: companyId, invited_by: req.user.id },
+    });
+    if (inviteErr) {
+      if (String(inviteErr.message || '').toLowerCase().includes('already been registered')) {
+        return res.status(409).json({ ok: false, error: 'Cet email a déjà un compte Integora' });
+      }
+      log.error('❌ admin invite inviteUserByEmail:', safeError(inviteErr));
+      return res.status(500).json({ ok: false, error: "Erreur lors de l'invitation" });
+    }
+    const newUserId = inviteData?.user?.id || null;
+    if (!newUserId) return res.status(500).json({ ok: false, error: 'Compte non créé' });
+
+    const { error: profErr } = await supabaseAdmin.from('profiles').upsert({
+      user_id: newUserId, first_name: firstName, last_name: lastName, company_id: companyId, role: 'membre', updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_id' });
+    if (profErr) {
+      log.error('❌ admin invite profile:', safeError(profErr));
+      await supabaseAdmin.auth.admin.deleteUser(newUserId).catch(() => { });
+      return res.status(500).json({ ok: false, error: 'Erreur création du profil membre' });
+    }
+
+    if (teamIds.length) {
+      const rows = teamIds.map((t) => ({ team_id: t, user_id: newUserId, company_id: companyId, created_by: req.user.id }));
+      const { error: tmErr } = await supabaseAdmin.from('team_members').insert(rows);
+      if (tmErr) log.warn('⚠️ admin invite team_members:', safeError(tmErr));
+    }
+
+    logAdminAction({ targetUserId: newUserId, adminEmail: req.user?.email, action: 'member_invited',
+      detail: 'Membre invité (admin)' + (teamIds.length ? ' — ' + teamIds.length + ' équipe(s)' : '') });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error('❌ admin invite:', e?.message);
+    return res.status(500).json({ ok: false, error: "Erreur lors de l'invitation" });
+  }
+});
+
+// ✅ [ADMIN] Renommer une équipe d'une entreprise.
+app.post('/api/admin/companies/:id/teams/:teamId/rename', authenticateToken, requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const companyId = String(req.params.id || '');
+    const teamId = String(req.params.teamId || '');
+    if (!/^[0-9a-f-]{36}$/i.test(companyId) || !/^[0-9a-f-]{36}$/i.test(teamId)) {
+      return res.status(400).json({ ok: false, error: 'Identifiant invalide' });
+    }
+    const name = String(req.body?.name || '').trim().slice(0, 80);
+    if (!name) return res.status(400).json({ ok: false, error: "Nom d'équipe requis" });
+
+    const { data: team, error: tErr } = await supabaseAdmin
+      .from('teams').select('id, company_id').eq('id', teamId).maybeSingle();
+    if (tErr) throw tErr;
+    if (!team || team.company_id !== companyId) return res.status(404).json({ ok: false, error: 'Équipe introuvable dans cette entreprise' });
+
+    const { error: updErr } = await supabaseAdmin
+      .from('teams').update({ name, updated_at: new Date().toISOString() }).eq('id', teamId);
+    if (updErr) throw updErr;
+
+    logAdminAction({ targetUserId: null, adminEmail: req.user?.email, action: 'team_renamed', detail: 'Équipe renommée (admin) : ' + name });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error('❌ admin team rename:', e?.message);
+    return res.status(500).json({ ok: false, error: 'Erreur lors du renommage' });
   }
 });
 
@@ -6916,6 +7645,7 @@ app.post("/api/team/invite", authenticateToken, async (req, res) => {
       return res.status(500).json({ error: "Erreur création du profil membre" });
     }
 
+    logTechAction({ companyId: me.company_id, teamId: null, actorUserId: me.id, action: 'team_invite' });
     return res.json({
       ok: true,
       member: { user_id: newUserId, email, first_name: firstName, last_name: lastName, status: "invited" },
@@ -7065,6 +7795,9 @@ app.post("/api/team/members/:userId/teams", authenticateToken, async (req, res) 
       if (delErr) { log.error("❌ member teams delete:", safeError(delErr)); return res.status(500).json({ error: "Erreur de synchronisation" }); }
     }
 
+    if (toAdd.length || toRemove.length) {
+      logTechAction({ companyId: me.company_id, teamId: null, actorUserId: me.id, action: 'team_access_set' });
+    }
     return res.json({ ok: true, teams: teamIds });
   } catch (e) {
     log.error("❌ /api/team/members/:userId/teams:", safeError(e));
@@ -7131,6 +7864,7 @@ app.delete("/api/team/members/:userId", authenticateToken, async (req, res) => {
       .eq("user_id", targetId);
     if (tmErr) log.warn("⚠️ team/archive team_members:", safeError(tmErr));
 
+    logTechAction({ companyId: me.company_id, teamId: null, actorUserId: me.id, action: 'member_removed' });
     return res.json({ ok: true });
   } catch (e) {
     log.error("❌ DELETE /api/team/members:", safeError(e));
@@ -7195,6 +7929,7 @@ app.post("/api/team/members/:userId/reactivate", authenticateToken, async (req, 
       return res.status(500).json({ error: "Erreur lors de la réactivation" });
     }
 
+    logTechAction({ companyId: me.company_id, teamId: null, actorUserId: me.id, action: 'member_reactivated' });
     return res.json({ ok: true });
   } catch (e) {
     log.error("❌ /api/team/members/:id/reactivate:", safeError(e));
@@ -8252,6 +8987,7 @@ app.patch("/api/teams/:id", authenticateToken, async (req, res) => {
       log.error("❌ teams rename error:", safeError(error));
       return res.status(500).json({ error: "Erreur lors du renommage" });
     }
+    logTechAction({ companyId: me.company_id, teamId: teamId, actorUserId: me.id, action: 'team_renamed' });
     return res.json({ ok: true, team: updated });
   } catch (e) {
     log.error("❌ /api/teams PATCH:", safeError(e));
@@ -9599,16 +10335,24 @@ app.post("/api/cron/expiration-reminders", async (req, res) => {
 
     // ✅ MÉNAGE QUOTIDIEN — exécuté EN PREMIER, avant les éventuels return anticipés ci-dessous,
     //    pour qu'il tourne CHAQUE nuit, qu'il y ait des rappels à envoyer ou non.
-    //    (a) Purge RGPD : activity_log > 13 mois · token_sessions expirées > 30 j · pending_signups > 30 j
+    //    (a) Purge RGPD : activity_log > 13 mois · admin_audit_log > 12 mois · pilotage_tech_log > 6 mois · token_sessions expirées > 30 j · pending_signups > 30 j
     //    (b) Auto-close des contact_tickets ouverts > 30 j (support_tickets reste manuel).
     const purged = {};
     try {
       const ms = Date.now();
       const cutActivity = new Date(ms - 395 * 86400000).toISOString(); // 13 mois (norme CNIL mesure d'audience)
+      const cutAudit = new Date(ms - 365 * 86400000).toISOString();    // 12 mois (journal d'audit admin)
+      const cutTech = new Date(ms - 180 * 86400000).toISOString();     // 6 mois (journal technique d'entreprise)
       const cut30 = new Date(ms - 30 * 86400000).toISOString();
 
       const pa = await supabaseAdmin.from('activity_log').delete({ count: 'exact' }).lt('created_at', cutActivity);
       if (!pa.error) purged.activity_log = pa.count || 0; else log.warn('⚠️ Purge activity_log:', safeError(pa.error));
+
+      const paa = await supabaseAdmin.from('admin_audit_log').delete({ count: 'exact' }).lt('created_at', cutAudit);
+      if (!paa.error) purged.admin_audit_log = paa.count || 0; else log.warn('⚠️ Purge admin_audit_log:', safeError(paa.error));
+
+      const pt = await supabaseAdmin.from('pilotage_tech_log').delete({ count: 'exact' }).lt('created_at', cutTech);
+      if (!pt.error) purged.pilotage_tech_log = pt.count || 0; else log.warn('⚠️ Purge pilotage_tech_log:', safeError(pt.error));
 
       const ps = await supabaseAdmin.from('token_sessions').delete({ count: 'exact' }).lt('expires_at', cut30);
       if (!ps.error) purged.token_sessions = ps.count || 0; else log.warn('⚠️ Purge token_sessions:', safeError(ps.error));
